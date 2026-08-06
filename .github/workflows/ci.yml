@@ -50,6 +50,26 @@ jobs:
       - name: miri (mock prim backend)
         run: cargo +nightly miri test -p rusty_alloc
 
+  # wasm is a shipped target, so it gets a gate that EXECUTES rather than one
+  # that only compiles: `cargo test` cannot run wasm32-unknown-unknown, so the
+  # self-test is instantiated in a real VM under node.
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: check core for wasm32
+        run: cargo check -p rusty_alloc --target wasm32-unknown-unknown
+      - name: build wasm self-test
+        run: cargo build -p rusty_alloc-wasm --target wasm32-unknown-unknown --release
+      - name: run self-test inside a WebAssembly VM
+        run: node bench/wasm-selftest.mjs target/wasm32-unknown-unknown/release/rusty_alloc_wasm.wasm
+
   oracle:
     runs-on: ubuntu-latest
     steps:
@@ -58,6 +78,12 @@ jobs:
           submodules: recursive
       - name: build oracle arms
         run: bash oracle/build.sh
+      # OS-NAMESPACED output: oracle/build.sh writes to out/<uname>/<arm> because
+      # this repo is shared between Windows and WSL and a mixed-OS cmake cache in
+      # one directory corrupts both builds.
       - name: oracle version gate
         run: |
-          test -f oracle/out/mi/libmimalloc.so* || ls oracle/out/mi
+          set -e
+          out="oracle/out/$(uname -s | tr '[:upper:]' '[:lower:]')/mi"
+          ls -la "$out"
+          test -e "$out/libmimalloc.so"
