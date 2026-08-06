@@ -18,9 +18,9 @@ version = "0.1.0-alpha.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/remade-with-rust/rusty_alloc"
-# Part of the remade-with-rust portfolio — the org page is the front door, so
-# every crate points at it rather than only at its own repo.
-homepage = "https://github.com/remade-with-rust"
+# Portfolio convention (matches rusty_h264): homepage is Mata Network, the
+# parent org, not the GitHub org.
+homepage = "https://www.mata.network/"
 authors = ["remade-with-rust"]
 keywords = ["allocator", "malloc", "mimalloc", "memory", "no-std"]
 categories = ["memory-management", "no-std", "development-tools"]

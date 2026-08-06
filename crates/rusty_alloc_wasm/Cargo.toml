@@ -1,5 +1,5 @@
 [package]
-name = "rusty_alloc_wasm"
+name = "rusty_alloc-wasm"
 description = "wasm32 self-test: exercises the allocator inside a WebAssembly VM"
 version.workspace = true
 edition.workspace = true

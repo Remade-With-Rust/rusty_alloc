@@ -1,6 +1,7 @@
 [package]
 name = "rusty_alloc"
-description = "Pure-Rust remake of mimalloc v2.4.5 — allocator core"
+description = "Allocator core of the rusty_alloc pure-Rust remake of mimalloc v2.4.5: segments, free-list-sharded pages, lock-free cross-thread frees, first-class heaps, arenas and a mi_*-compatible surface. Detects double frees. MIT."
+documentation = "https://docs.rs/rusty_alloc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

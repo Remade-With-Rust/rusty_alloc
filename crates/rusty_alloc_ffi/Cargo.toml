@@ -1,5 +1,5 @@
 [package]
-name = "rusty_alloc_ffi"
+name = "rusty_alloc-ffi"
 description = "mi_*-compatible C ABI over rusty_alloc (cdylib + staticlib)"
 version.workspace = true
 edition.workspace = true

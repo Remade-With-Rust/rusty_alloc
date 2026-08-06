@@ -6,7 +6,7 @@ set -uo pipefail
 cd "$(cd "$(dirname "$0")/.." && pwd)" || exit 1
 export CARGO_TARGET_DIR="$HOME/ra_target"
 echo "== build"
-if ! cargo build --release -p rusty_alloc_override 2>&1 | tail -6; then
+if ! cargo build --release -p rusty_alloc-override 2>&1 | tail -6; then
   echo "BUILD FAILED"
   exit 1
 fi

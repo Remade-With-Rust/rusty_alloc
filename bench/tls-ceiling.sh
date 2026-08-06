@@ -20,7 +20,7 @@ cd "$root"
 
 echo "building initial-exec variant..."
 RUSTFLAGS='-Z tls-model=initial-exec' CARGO_TARGET_DIR="$HOME/ra_ie" \
-  cargo +nightly build --release -p rusty_alloc_override 2>&1 | grep -E '^error' | head -5
+  cargo +nightly build --release -p rusty_alloc-override 2>&1 | grep -E '^error' | head -5
 
 IE="$HOME/ra_ie/release/librusty_alloc_override.so"
 GD="$HOME/ra_target/release/librusty_alloc_override.so"

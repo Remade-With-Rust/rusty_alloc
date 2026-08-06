@@ -1,5 +1,5 @@
 [package]
-name = "rusty_alloc_bench"
+name = "rusty_alloc-bench"
 description = "Tier-B native harness + allocation-trace record/replay + G1/G2 gates"
 version.workspace = true
 edition.workspace = true
@@ -17,7 +17,7 @@ path = "src/main.rs"
 rusty_alloc = { path = "../rusty_alloc" }
 
 [dev-dependencies]
-rusty_alloc_api = { path = "../rusty_alloc_api" }
+rusty_alloc-api = { path = "../rusty_alloc_api" }
 libloading = "0.8"
 
 [lints]

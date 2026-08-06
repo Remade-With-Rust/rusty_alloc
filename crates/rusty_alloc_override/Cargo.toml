@@ -1,5 +1,5 @@
 [package]
-name = "rusty_alloc_override"
+name = "rusty_alloc-override"
 description = "malloc/free interposition cdylib (LD_PRELOAD arm for the 1:1 corpus)"
 version.workspace = true
 edition.workspace = true
@@ -15,7 +15,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 rusty_alloc = { path = "../rusty_alloc" }
-rusty_alloc_ffi = { path = "../rusty_alloc_ffi" }
+rusty_alloc-ffi = { path = "../rusty_alloc_ffi" }
 
 [lints]
 workspace = true
