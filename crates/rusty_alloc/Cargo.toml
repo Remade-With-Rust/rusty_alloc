@@ -1,0 +1,40 @@
+[package]
+name = "rusty_alloc"
+description = "Pure-Rust remake of mimalloc v2.4.5 — allocator core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+[features]
+default = []
+# Full invariant checking: list walks, canaries, double-free detection (our `dmi`).
+debug_checks = []
+# Feature-gated rdtsc path profiler (§7.5 of the plan). OFF = byte-identical build.
+profile = []
+# Hardened build: guard pages, encrypted free lists, guarded-object sampling (our `smi`). M8.
+secure = []
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Performance",
+    "Win32_System_ProcessStatus",
+    "Win32_Security_Cryptography",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", default-features = false }
+
+[dev-dependencies]
+loom = "0.7"
+
+[lints]
+workspace = true

@@ -1,0 +1,63 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4          # submodules NOT needed for the Rust gates
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy (all features)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: check (no features)
+        run: cargo check --workspace --all-targets
+      - name: test (all features)
+        run: cargo test --workspace --all-features
+
+  # The compile-gate rule: both tier-1 targets checked even where they don't run.
+  cross-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: check windows target from linux
+        run: cargo check --workspace --target x86_64-pc-windows-msvc
+
+  # G4: the os-layer logic must stay UB-free under miri against the mock prim.
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - name: miri (mock prim backend)
+        run: cargo +nightly miri test -p rusty_alloc
+
+  oracle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: build oracle arms
+        run: bash oracle/build.sh
+      - name: oracle version gate
+        run: |
+          test -f oracle/out/mi/libmimalloc.so* || ls oracle/out/mi

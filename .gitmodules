@@ -1,0 +1,6 @@
+[submodule "oracle/mimalloc"]
+	path = oracle/mimalloc
+	url = https://github.com/microsoft/mimalloc
+[submodule "corpus/mimalloc-bench"]
+	path = corpus/mimalloc-bench
+	url = https://github.com/daanx/mimalloc-bench

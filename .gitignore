@@ -1,0 +1,6 @@
+/target
+Cargo.lock
+/oracle/out/
+/corpus/run/results/
+*.ratrace
+.DS_Store

@@ -1,0 +1,25 @@
+[package]
+name = "rusty_alloc_ffi"
+description = "mi_*-compatible C ABI over rusty_alloc (cdylib + staticlib)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Not published for 0.1.0-alpha: the C ABI ships as a built cdylib/staticlib,
+# and publishing a crate whose whole purpose is a native artifact adds a
+# maintenance surface we are not ready to commit to. Revisit for 0.1.0.
+publish = false
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+rusty_alloc = { path = "../rusty_alloc" }
+
+[features]
+debug_checks = ["rusty_alloc/debug_checks"]
+secure = ["rusty_alloc/secure"]
+
+[lints]
+workspace = true

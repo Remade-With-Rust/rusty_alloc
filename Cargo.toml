@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rusty_alloc",
+    "crates/rusty_alloc_api",
+    "crates/rusty_alloc_ffi",
+    "crates/rusty_alloc_override",
+    "crates/rusty_alloc_bench",
+    "crates/rusty_alloc_wasm",
+]
+
+[workspace.package]
+# ALPHA on purpose. The allocator is complete and gated; the performance
+# EVIDENCE is not. Wall-clock, the full mimalloc-bench corpus, RSS and aarch64
+# are all unmeasured — see README "What is and isn't measured". The pre-release
+# tag is what keeps those caveats visible instead of buried.
+version = "0.1.0-alpha.1"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/remade-with-rust/rusty_alloc"
+authors = ["remade-with-rust"]
+keywords = ["allocator", "malloc", "mimalloc", "memory", "no-std"]
+categories = ["memory-management", "no-std", "development-tools"]
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+debug = true            # symbols for profiling; strip at distribution, not here
+
+[profile.bench-dist]    # distribution-shaped profile for A/B honesty checks
+inherits = "release"
+debug = false

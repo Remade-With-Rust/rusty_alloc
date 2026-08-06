@@ -1,0 +1,21 @@
+[package]
+name = "rusty_alloc_override"
+description = "malloc/free interposition cdylib (LD_PRELOAD arm for the 1:1 corpus)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Not published: this is the LD_PRELOAD arm used to run the 1:1 corpus, not a
+# library anyone depends on. It ships as a built artifact, if at all.
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rusty_alloc = { path = "../rusty_alloc" }
+rusty_alloc_ffi = { path = "../rusty_alloc_ffi" }
+
+[lints]
+workspace = true

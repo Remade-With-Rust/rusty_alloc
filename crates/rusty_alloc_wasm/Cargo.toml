@@ -1,0 +1,20 @@
+[package]
+name = "rusty_alloc_wasm"
+description = "wasm32 self-test: exercises the allocator inside a WebAssembly VM"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Not published: a test fixture whose only job is to be instantiated by
+# bench/wasm-selftest.mjs.
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rusty_alloc = { path = "../rusty_alloc" }
+
+[lints]
+workspace = true
