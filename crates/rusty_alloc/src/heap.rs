@@ -796,6 +796,13 @@ impl Heap {
         unsafe {
             let bin = (*pg).bin as usize;
             let q: *mut PageQueue = &raw mut self.pages[bin];
+            // NOTE (RSS investigation, 2026-08-06): deferring this retire —
+            // keeping the emptied page queued so the next round reuses the SAME
+            // memory instead of first-fitting a span elsewhere — was tried and
+            // measured NO CHANGE to peak RSS (62.8 vs 62.6 MiB). Span re-carve
+            // churn is real (504 pages retired and re-carved per round) but it
+            // is NOT the +18% gap. Reverted; do not re-try without a new
+            // mechanism.
             if !((*q).first == pg && (*q).last == pg) {
                 queue_remove(q, pg);
                 self.update_direct(bin);

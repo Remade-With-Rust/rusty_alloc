@@ -77,6 +77,72 @@ The deterministic evidence here is strong and independent of this box:
   **byte-identical counters** proving the same work is performed either way.
 - Nothing was added; the Page struct did not grow.
 
+## RSS INVESTIGATION — mechanism confirmed, our retention NOT implicated (2026-08-06)
+
+**External measurement (FFAI/Diana, their harness, their null arm):** speed at
+exact parity (1.015x wall, CPU 1.000x), **peak RSS 91.4 MB vs mimalloc's 77.5 MB
+= +17.9%**, null arm 77.4 so the gap is real. First independent numbers the
+project has ever had, and they land on the gap the audit called most likely to
+surprise us — we have no RSS gate at all.
+
+### The instrument failure that came first
+
+`bench/rss.sh` initially had NO NULL ARM. It returned 62.6, 62.8 and **51.6
+MiB for the same binary** — an 11 MiB swing that silently invalidated three
+conclusions drawn from it. Cause: **perl randomises its hash seed per process**,
+so every run allocated a different pattern. Pinning `PERL_HASH_SEED=0` collapsed
+the spread to **0.2 MiB**.
+
+**Everything measured before that fix was retracted**, including a confident
+"purging is the cause" claim. The rule this project already applies to time
+applies to memory: *no null arm, no result.*
+
+### What is now established
+
+| probe | result |
+|---|---|
+| single thread, perl cycling | rusty_alloc **51.8** vs mimalloc 52.9 — we are BETTER |
+| thread sweep 1 -> 28 | RSS scales LINEARLY with threads for both; at 28, ours **122.8** vs **228.2 MiB** |
+| size sweep 32 KiB -> 4 MiB | −44% at every size |
+| alignment 0 / 32 / 64 / 4096 B | −44% at every alignment |
+
+**Per-thread heap retention IS the dominant RSS term** — confirmed
+independently, and it matches FFAI's `scaling.rs` finding (28 heaps retaining
+174 MiB against 26.3 MiB live). But **on every synthetic form of that mechanism
+we retain roughly HALF of mimalloc**, so our retention is not yet implicated in
+their +17.9%.
+
+### Not reproduced, and what is left
+
+Nothing synthetic reproduced the gap. Untested, in order of suspicion:
+1. **Mixed lifetimes** — model weights held for the session while activations
+   cycle. Every probe here frees everything each round, so none of them
+   exercises fragmentation.
+2. **Thread lifecycle churn** — probes use long-lived concurrent threads;
+   candle's pool may create/destroy, routing through abandonment/adoption.
+3. **Rust `dealloc` passing a `Layout`** (size AND align) where C `free` passes
+   only a pointer.
+
+**Next step is not more guessing:** run FFAI's own `scaling.rs` with
+rusty_alloc as the arm. It already produced the 174-vs-26.3 number, so it
+measures per-thread retention under Diana's real behaviour — exactly what these
+probes failed to synthesise.
+
+### Also refuted here (both on the FIXED instrument)
+
+- **Purging** (`purge_delay: -1`, off by default) recovers ~2 MiB of ~10
+  single-threaded and **nothing** multi-threaded (122.8 vs 122.4). It is worth
+  enabling but it is not the gap.
+- **Deferred retire** — keeping emptied pages queued so the next round reuses
+  the same memory instead of first-fitting elsewhere. Span re-carve churn is
+  REAL (504 pages retired and re-carved per round, 3,050 carves for a ~530-page
+  working set, segment count flat) but changing it moved RSS not at all.
+  Reverted.
+
+New probes, all reproducible: `bench/rss.sh` (null arm + pinned seed),
+`bench/rss-threads.{c,sh}`, `bench/rss-sizes.sh`,
+`crates/rusty_alloc/tests/rss_churn.rs`.
+
 ## P0 FIXED in 0.1.0-alpha.2 — use-after-free race (2026-08-06)
 
 **Fix:** `wait_no_remote_in_flight(seg)` — spin until no page of the segment
