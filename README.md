@@ -22,7 +22,7 @@ does not offer.
   implementation as a differential oracle on every change.
 - **Runs on WebAssembly** with no C toolchain and no emscripten.
 
-> **Status: `0.3.0` — a 0.x release. The API is not frozen, and parts of the
+> **Status: `0.3.1` — a 0.x release. The API is not frozen, and parts of the
 > performance evidence are still missing.** See
 > [What is and isn't measured](#what-is-and-isnt-measured) — we count
 > instructions, not seconds, and make no speed claim.
