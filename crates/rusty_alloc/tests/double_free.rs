@@ -28,6 +28,11 @@ fn child_double_free() -> ! {
     std::process::exit(97);
 }
 
+// Miri cannot run this: it needs `current_exe()` (a `readlink`, blocked by
+// Miri's isolation) and a child process, which Miri cannot spawn at all. The
+// detection it covers is plain integer arithmetic — nothing Miri would have
+// checked — so skipping costs no coverage.
+#[cfg_attr(miri, ignore)]
 #[test]
 fn double_free_aborts_instead_of_corrupting() {
     if std::env::var(MARKER).is_ok() {

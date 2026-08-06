@@ -250,7 +250,7 @@ pub fn replay(path: &str, arm: Arm, check: bool) -> Result<(u64, usize), String>
         }
     }
     // Free the tail so arms can be looped.
-    for (_, l) in live.iter() {
+    for l in live.values() {
         // SAFETY: still-live tracked blocks, freed once.
         unsafe { arm_free_aligned(arm, l.ptr as *mut u8, l.size, l.align) };
     }

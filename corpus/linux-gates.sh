@@ -10,6 +10,18 @@ set -uo pipefail
 source ~/.cargo/env 2>/dev/null
 cd /mnt/c/Users/talmo/coding/rusty_alloc || exit 1
 
+# CLIPPY RUNS HERE TOO, and that is not redundant with the Windows gate.
+# Lints are platform-dependent: `c_long` is i64 on LP64 unix and i32 on
+# Windows, so `x as c_long` is "unnecessary" on one target and load-bearing on
+# the other. Running clippy only on Windows let two Linux-only errors reach CI.
+clip=$(CARGO_TARGET_DIR=~/ra_target cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1)
+clip_status=$?
+if [ "$clip_status" -ne 0 ]; then
+  echo "GATE FAILED (clippy on linux, exit $clip_status):"
+  echo "$clip" | grep -E '^error' | head -10
+  exit 1
+fi
+
 out=$(CARGO_TARGET_DIR=~/ra_target cargo test --workspace --all-features 2>&1)
 status=$?
 

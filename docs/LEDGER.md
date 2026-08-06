@@ -77,6 +77,70 @@ The deterministic evidence here is strong and independent of this box:
   **byte-identical counters** proving the same work is performed either way.
 - Nothing was added; the Page struct did not grow.
 
+## P0 OPEN — use-after-free race: segment recycled under an in-flight remote free (2026-08-06)
+
+**Found by CI, minutes after publishing 0.1.0-alpha.1.** Miri's data-race
+detector on `stress_mt::abandon_adopt_reuse_storm`:
+
+```
+Undefined Behavior: Data race detected between
+  (1) atomic store        page.rs:430   thread `abandon_adopt_reuse_storm`
+  (2) non-atomic write    segment.rs:535 thread `unnamed-8`
+  at alloc57912+0x8000060
+```
+
+- **(2)** is `huge_alloc` scrubbing a recycled arena chunk:
+  `write_bytes(seg, 0, size_of::<Segment>())` — which zeroes the whole header,
+  including every page slot's `xthread_free` atomic.
+- **(1)** is `remote_free`'s restore-DELAYED loop doing a
+  `compare_exchange_weak` on `(*page).xthread_free` — **a page inside that very
+  segment**.
+
+So a segment was released, recycled through the arena, and re-tenanted as a
+huge allocation **while another thread was still mid-`remote_free` on one of
+its pages**. That is a use-after-free, and the write that lands on it is a
+`memset` of the whole header.
+
+This is the same FAMILY as the M8 P0 (guard pages recycled while still
+PROT_NONE): a segment reaching an arena while something still references it.
+The four-state protocol has FREEING precisely to stop teardown racing a remote
+free — `page_set_flag` spins it out — so the gap is a teardown path that
+reaches `segment_free` WITHOUT passing that gate. Not yet localised.
+
+### Why the gates missed it
+
+Miri was never run against `stress_mt`. The audit added `corpus/miri-gate.sh`
+with the suite list `alloc_core spans heaps secure prim` — **the multi-threaded
+suite was not in it**, and the audit entry even recorded "Miri clean" on that
+basis. CI runs `cargo +nightly miri test -p rusty_alloc`, which runs
+*everything*, and caught it on the first green-field run. The lesson is exact:
+**a Miri gate that enumerates suites will silently omit the one that matters;
+run the whole target.**
+
+### Status
+
+- **`0.1.0-alpha.1` is published on crates.io with this defect.**
+  Recommendation: **yank** (`cargo yank --version 0.1.0-alpha.1`) for both
+  `rusty_alloc` and `rusty_alloc-api`. Yanking blocks new dependents while
+  leaving existing builds working; it is reversible.
+- Reproduce: `cargo +nightly miri test -p rusty_alloc --test stress_mt`
+  (isolation ON, i.e. no `-Zmiri-disable-isolation`).
+- Blast radius: multithreaded programs that abandon threads AND allocate huge
+  blocks. Single-threaded use is unaffected.
+- Fix will need the loom model that built the protocol, not a point patch.
+
+### CI fixes landed alongside (all real, all pre-existing)
+
+1. **Clippy never ran on Linux.** `c_long` is `i64` on LP64 unix and `i32` on
+   Windows, so four `as c_long` casts are "unnecessary" on Linux and
+   load-bearing on Windows. `corpus/linux-gates.sh` now runs clippy too —
+   running it only on Windows was a genuine hole.
+2. **`double_free.rs` cannot run under Miri** — `current_exe()` needs
+   `readlink`, blocked by isolation, and Miri cannot spawn the child anyway.
+   Now `#[cfg_attr(miri, ignore)]`.
+3. **Stale oracle path** in `ci.yml` (`out/mi` vs the OS-namespaced
+   `out/linux/mi`), plus a wasm job that executes rather than only compiles.
+
 ## RELEASE PREP — 0.1.0-alpha.1 (2026-08-06)
 
 ### Double free: silent corruption -> clean abort
