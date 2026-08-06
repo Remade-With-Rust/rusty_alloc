@@ -126,7 +126,8 @@ impl Drop for Heap {
 // the rusty_alloc core, which returns blocks satisfying the layout's size and
 // alignment (natural bins for align ≤ 8; the aligned path otherwise) and
 // accepts any such block back in `free` regardless of which thread frees it
-// (M2: one global locked heap).
+// (M4: per-thread heaps, no lock — `free` routes by the segment's owner and
+// hands cross-thread blocks to the loom-modeled remote protocol).
 unsafe impl GlobalAlloc for RustyAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if layout.align() <= 8 {

@@ -77,6 +77,37 @@ The deterministic evidence here is strong and independent of this box:
   **byte-identical counters** proving the same work is performed either way.
 - Nothing was added; the Page struct did not grow.
 
+## collect(force) ACTUALLY DOES SOMETHING — reported by FFAI (2026-08-06)
+
+FFAI reported two things against 0.3.0. Both were real.
+
+**1. Stale M2 comments.** `rusty_alloc_api/src/lib.rs:129` said
+*"(M2: one global locked heap)"* and `heap.rs:3` said *"M2: ONE global heap
+behind a lock"* — describing an architecture removed in M4. Anyone reading
+either would conclude `free` serialises on a global lock. Corrected.
+
+**2. `collect` ignored `force` — the signature was literally `_force: bool`.**
+So `mi_collect(true)` was a per-heap page sweep and nothing else: it never
+reclaimed an abandoned segment. That is a large part of why a caller's "trim"
+measures ~0% — there was nothing in the forced path to reclaim WITH. `force`
+now adopts every orphan first, so the bin sweep retires their dead pages in the
+same pass.
+
+### The purge half CRASHED and was reverted
+
+A forced collect should also return pages to the OS, so the first version
+purged every free span. **It crashed the test suite with an access violation
+(0xC0000005).** Cause: `span_free` purges only spans of
+`len >= MEDIUM_PAGE_SLICES`, so purging smaller ones reaches spans whose reuse
+path does not re-commit them — the M8 defect exactly (Windows `MEM_DECOMMIT`
+faults on touch; Linux `MADV_DONTNEED` does not, which is why this class keeps
+being Windows-first). Reverted. A forced purge needs the recommit path audited
+before it can ship.
+
+Kept: reclaim-on-force. Gates green — Windows tests + clippy, Linux GATE
+PASSED, churn 3/3, wasm, and speed unchanged (lua 0.9883, perl 1.0060,
+sqlite 1.0037).
+
 ## RSS TAIL — abandoned segments; two fixes, IMPLEMENTED not yet VALIDATED (2026-08-06)
 
 **FFAI, N=5, one program, trim the only variable:**

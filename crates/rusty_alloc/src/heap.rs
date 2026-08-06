@@ -1,7 +1,8 @@
 //! The heap: per-bin page queues, the small-size direct table, the generic
 //! (heartbeat) allocation path, and free (mirrors `heap.c` + the hot parts of
-//! `alloc.c`/`page.c`). M2: ONE global heap behind a lock (crate::alloc);
-//! per-thread heaps + lock removal are M4.
+//! `alloc.c`/`page.c`). Since M4 there is NO global lock: every thread owns its
+//! own heap, `free` routes by the segment's owner id, and cross-thread frees go
+//! through the loom-modeled 4-state protocol in `page.rs`.
 
 use core::ptr;
 use core::sync::atomic::Ordering;
@@ -612,9 +613,35 @@ impl Heap {
     ///
     /// # Safety
     /// Caller must be this heap's owning thread.
-    pub unsafe fn collect(&mut self, _force: bool) {
+    pub unsafe fn collect(&mut self, force: bool) {
         // SAFETY: owner thread per contract.
         unsafe {
+            // `force` RECLAIMS ABANDONED SEGMENTS. It used to be ignored
+            // (`_force`), which made `mi_collect(true)` a per-heap page sweep
+            // and nothing more — it never took back an orphan — and that is a
+            // large part of why a caller's "trim" can measure ~0%.
+            //
+            // Orphans are adopted FIRST so the bin sweep below retires their
+            // dead pages in the same pass.
+            //
+            // NOT ALSO PURGING HERE, and that was measured: purging every free
+            // span on force crashed the test suite with an access violation
+            // (0xC0000005). `span_free` only purges spans of
+            // `len >= MEDIUM_PAGE_SLICES`, so purging smaller ones reaches
+            // spans whose reuse path does not re-commit them — the M8 defect
+            // (Windows MEM_DECOMMIT faults on touch where Linux MADV_DONTNEED
+            // does not). A forced purge needs the recommit path audited first.
+            if force {
+                // Bounded only as a stall guard; the list is normally short.
+                const MAX_RECLAIM: usize = 1024;
+                for _ in 0..MAX_RECLAIM {
+                    let aseg = crate::init::abandoned_pop();
+                    if aseg.is_null() {
+                        break;
+                    }
+                    self.adopt_segment(aseg);
+                }
+            }
             self.process_delayed();
             let mut bin = 1;
             while bin <= MAX_NORMAL_BIN {
