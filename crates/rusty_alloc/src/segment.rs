@@ -161,6 +161,44 @@ pub unsafe fn page_index(seg: *mut Segment, page: *mut Page) -> usize {
     (page.addr() - base.addr()) / core::mem::size_of::<Page>()
 }
 
+/// Spin until no page of `seg` has a remote free IN FLIGHT.
+///
+/// **This closes a use-after-free.** `remote_free` claims `XFLAG_FREEING`
+/// BEFORE pushing a block onto the owner's delayed list and holds it until it
+/// restores `XFLAG_DELAYED` afterwards. The owner, draining that very push,
+/// can free the block, retire the page, empty the segment and release it to an
+/// arena — where the next tenant `memset`s the whole header, including the
+/// `xthread_free` atomic the remote is about to CAS. Miri caught exactly that:
+/// an atomic store in `remote_free` racing `huge_alloc`'s header scrub.
+///
+/// The window is bounded, which is why a barrier suffices rather than an epoch
+/// scheme: before the remote sets FREEING it has not pushed yet, so the owner
+/// cannot have drained it, so `used > 0` and no retire is possible. Every
+/// dangerous instant therefore has FREEING observably set.
+///
+/// Cost is a 512-slot scan, paid only when a segment is actually released.
+///
+/// # Safety
+/// `seg` must be a live segment header.
+unsafe fn wait_no_remote_in_flight(seg: *mut Segment) {
+    use crate::page::{XFLAG_FREEING, XMASK};
+    // SAFETY: the page table is inside the live header; atomics only.
+    unsafe {
+        let base: *mut Page = (&raw mut (*seg).pages).cast();
+        for i in 0..SLICES_PER_SEGMENT {
+            let pg = base.add(i);
+            while (*pg)
+                .xthread_free
+                .load(core::sync::atomic::Ordering::Acquire)
+                & XMASK
+                == XFLAG_FREEING
+            {
+                core::hint::spin_loop();
+            }
+        }
+    }
+}
+
 /// Reserve a Normal segment — from an arena when one qualifies (respecting a
 /// heap's `arena_id` restriction), else eagerly-committed fresh OS memory —
 /// and register it in the segment map.
@@ -206,6 +244,8 @@ pub fn segment_alloc(arena_id: i32) -> Result<*mut Segment, PrimError> {
 /// `seg` must be a live Normal segment with `used_pages == 0` and no live
 /// blocks or references into it.
 pub unsafe fn segment_free(seg: *mut Segment) -> Result<(), PrimError> {
+    // SAFETY: seg is live per the contract; this only reads atomics.
+    unsafe { wait_no_remote_in_flight(seg) };
     segment_map::unregister(seg);
     // SAFETY: seg is live and empty per the contract.
     unsafe {
@@ -587,6 +627,11 @@ pub fn huge_alloc(
 pub unsafe fn huge_free(seg: *mut Segment) -> Result<(), PrimError> {
     // SAFETY: per contract; reconstruct the OsBlock we allocated with.
     unsafe {
+        // SAME BARRIER AS `segment_free`, and this is the path that actually
+        // raced: a huge segment recycles through `chunk_free_n` WITHOUT going
+        // through `segment_free`, so guarding only there left the hole open.
+        // Every route by which memory can reach an arena needs it.
+        wait_no_remote_in_flight(seg);
         segment_map::unregister_range(seg.addr(), (*seg).total_size);
         // Arena-backed huge blocks recycle their contiguous chunks — but the
         // memory must be handed back in a USABLE state: lift any guard-page

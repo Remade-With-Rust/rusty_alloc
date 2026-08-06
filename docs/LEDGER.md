@@ -77,7 +77,35 @@ The deterministic evidence here is strong and independent of this box:
   **byte-identical counters** proving the same work is performed either way.
 - Nothing was added; the Page struct did not grow.
 
-## P0 OPEN — use-after-free race: segment recycled under an in-flight remote free (2026-08-06)
+## P0 FIXED in 0.1.0-alpha.2 — use-after-free race (2026-08-06)
+
+**Fix:** `wait_no_remote_in_flight(seg)` — spin until no page of the segment
+has `XFLAG_FREEING` set — called on **every** path by which memory can reach an
+arena.
+
+The first attempt guarded only `segment_free` and **Miri still failed,
+identically**. That refutation was the useful part: it proved the racing path
+was elsewhere. `huge_free` recycles a huge segment through `chunk_free_n`
+WITHOUT passing through `segment_free`, so guarding one choke point left the
+real hole open. Both are guarded now.
+
+Why a barrier is sufficient rather than an epoch scheme: before a remote sets
+FREEING it has not yet pushed to the delayed list, so the owner cannot have
+drained it, so `used > 0` and no retire is possible. Every dangerous instant
+therefore has FREEING observably set.
+
+Verified: `cargo +nightly miri test -p rusty_alloc` (isolation ON, the whole
+target) exits 0 — `stress_mt::abandon_adopt_reuse_storm` included, which is the
+test that caught it.
+
+**LESSON — the one that matters most here:** the audit's `corpus/miri-gate.sh`
+ENUMERATED suites (`alloc_core spans heaps secure prim`) and therefore silently
+omitted `stress_mt`, the only multi-threaded one. It then recorded "Miri clean"
+on that basis. CI ran the whole target and found a use-after-free on the first
+green-field run. **Never let a gate enumerate what it should sweep.**
+
+### Original diagnosis (kept for the record)
+
 
 **Found by CI, minutes after publishing 0.1.0-alpha.1.** Miri's data-race
 detector on `stress_mt::abandon_adopt_reuse_storm`:

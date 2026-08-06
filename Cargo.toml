@@ -14,7 +14,7 @@ members = [
 # EVIDENCE is not. Wall-clock, the full mimalloc-bench corpus, RSS and aarch64
 # are all unmeasured — see README "What is and isn't measured". The pre-release
 # tag is what keeps those caveats visible instead of buried.
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/remade-with-rust/rusty_alloc"
