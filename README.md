@@ -2,10 +2,14 @@
 
 A pure-Rust remake of [mimalloc](https://github.com/microsoft/mimalloc) — the
 v2.4.5 architecture (32 MiB segments, free-list-sharded pages, lock-free
-cross-thread frees), rebuilt from the design rather than transliterated from the
-C. Built under the [remade-with-rust](https://github.com/remade-with-rust)
-principles: memory safety first, no C in the product, general primitives,
-**measured, not vibed**.
+cross-thread frees), rebuilt from the design rather than transliterated from
+the C.
+
+Part of the **[remade-with-rust](https://github.com/remade-with-rust)**
+portfolio, and built to its principles: memory safety first, no C in the
+product, general primitives over one-off fixes, and **measured, not vibed** —
+which is why the performance section below spends as much space on what we
+*haven't* established as on what we have.
 
 > **Status: `0.1.0-alpha.1`.** The allocator is complete and gated. The
 > performance *evidence* is not. Read
