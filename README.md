@@ -22,8 +22,8 @@ does not offer.
   implementation as a differential oracle on every change.
 - **Runs on WebAssembly** with no C toolchain and no emscripten.
 
-> **Status: `0.1.0-alpha.1`.** The allocator is complete and gated. The
-> performance *evidence* is not. See
+> **Status: `0.3.0` — a 0.x release. The API is not frozen, and parts of the
+> performance evidence are still missing.** See
 > [What is and isn't measured](#what-is-and-isnt-measured) — we count
 > instructions, not seconds, and make no speed claim.
 
@@ -109,7 +109,7 @@ sampling.
 
 ```toml
 [dependencies]
-rusty_alloc-api = "0.1.0-alpha.1"
+rusty_alloc-api = "0.3"
 ```
 
 | crate | docs | what |

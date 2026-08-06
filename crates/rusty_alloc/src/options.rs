@@ -66,7 +66,10 @@ const DEFAULTS: [i64; OPTION_COUNT] = [
     0,  // reserve_huge_os_pages
     -1, // reserve_huge_os_pages_at
     0,  // reserve_os_memory (KiB)
-    0, 0, 0, 0,       // deprecated / abandoned_page_purge(0)
+    // abandoned_page_purge defaults ON (upstream does the same). An abandoned
+    // segment has no owner to reuse its pages, so holding them resident buys
+    // nothing and costs 32 MiB a time — the RSS tail measured against mimalloc.
+    0, 0, 0, 1,       // deprecated x3 / abandoned_page_purge(1)
     1,       // eager_commit_delay
     -1,      // purge_delay: v1 ships purging OPT-IN (see LEDGER M8 open defect)
     0,       // use_numa_nodes

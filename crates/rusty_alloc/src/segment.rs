@@ -522,6 +522,51 @@ pub unsafe fn span_free(seg: *mut Segment, page: *mut Page) -> bool {
     }
 }
 
+/// Purge every FREE span of `seg` — used when a dying thread abandons it.
+///
+/// An abandoned segment is orphaned until some other thread happens to adopt
+/// it, and until then it holds every page it ever touched RESIDENT. Measured:
+/// 25 orphans accumulated across 8 waves of thread churn and a full 2048-block
+/// allocation burst adopted only 4 of them. At 32 MiB each, that is the RSS
+/// tail FFAI saw — max 403 MB against mimalloc's 134, with a 4.4x run-to-run
+/// spread because whether anything adopts is pure scheduling.
+///
+/// Deliberately NOT gated on `purge_delay`. That option governs a LIVE heap's
+/// own free spans, where the pages are likely to be reused shortly and a
+/// syscall would be wasted. An abandoned segment has no owner to reuse them —
+/// holding them costs memory for an unbounded time and buys nothing. Upstream
+/// draws the same distinction with `abandoned_page_purge`.
+///
+/// Each purged span is marked so reuse re-commits it (skipping that is an
+/// access violation on Windows), exactly as `span_free` does.
+///
+/// # Safety
+/// `seg` must be a live Normal segment whose free-span list is stable — i.e.
+/// the caller still owns it, which is true right up to the abandon publish.
+pub unsafe fn purge_free_spans(seg: *mut Segment) {
+    // SAFETY: caller still owns the segment; free spans have no live blocks.
+    unsafe {
+        let decommits = crate::options::is_enabled(5); // purge_decommits
+        let mut s = (*seg).free_spans;
+        while !s.is_null() {
+            let next = (*s).next;
+            if !(*s).purged {
+                let idx = page_index(seg, s);
+                let len = (*s).slice_count as usize;
+                if len > 0 {
+                    let area = page_area(seg, idx);
+                    let bytes = len * SEGMENT_SLICE_SIZE;
+                    if os::purge(area, bytes, decommits).is_ok() {
+                        (*s).purged = true;
+                        (*seg).purged_any = true;
+                    }
+                }
+            }
+            s = next;
+        }
+    }
+}
+
 /// Re-commit a span that was purged while free (no-op otherwise).
 ///
 /// # Safety

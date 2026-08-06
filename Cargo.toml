@@ -10,11 +10,12 @@ members = [
 ]
 
 [workspace.package]
-# ALPHA on purpose. The allocator is complete and gated; the performance
-# EVIDENCE is not. Wall-clock, the full mimalloc-bench corpus, RSS and aarch64
-# are all unmeasured — see README "What is and isn't measured". The pre-release
-# tag is what keeps those caveats visible instead of buried.
-version = "0.1.0-alpha.2"
+# 0.x: the API is not frozen. The allocator is complete and gated; parts of the
+# performance EVIDENCE are not — the full mimalloc-bench corpus, RSS and
+# aarch64 remain unmeasured, and the README says so under "What is and isn't
+# measured". Those caveats used to ride on an `-alpha` tag; on a plain 0.x
+# release they live in the README, so keep them there and current.
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/remade-with-rust/rusty_alloc"

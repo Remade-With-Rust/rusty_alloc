@@ -810,6 +810,16 @@ fn abandoned_unlock() {
 
 fn abandoned_push(seg: *mut Segment) {
     let sp = my_subproc();
+    // PURGE BEFORE ORPHANING (`abandoned_page_purge`, on by default). Until
+    // some other thread adopts this segment it has no owner, so every page it
+    // touched stays resident for an unbounded time and nothing can reuse it.
+    // Done here, before publishing to the list, because this is the last
+    // instant the caller still exclusively owns the segment.
+    if crate::options::is_enabled(30) {
+        // SAFETY: still owned by the dying thread; free spans hold no live
+        // blocks, and each purged span is marked so reuse re-commits it.
+        unsafe { crate::segment::purge_free_spans(seg) };
+    }
     abandoned_lock();
     // SAFETY: seg is disowned; its `next` is ours to use as the list link.
     unsafe {

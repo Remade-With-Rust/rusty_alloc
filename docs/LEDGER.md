@@ -77,6 +77,66 @@ The deterministic evidence here is strong and independent of this box:
   **byte-identical counters** proving the same work is performed either way.
 - Nothing was added; the Page struct did not grow.
 
+## RSS TAIL — abandoned segments; two fixes, IMPLEMENTED not yet VALIDATED (2026-08-06)
+
+**FFAI, N=5, one program, trim the only variable:**
+
+| arm | RSS med | RSS min | RSS max | latency |
+|---|---:|---:|---:|---:|
+| mimalloc | 111.1 | 106.7 | 134.2 | 31.97 ms |
+| rusty no-trim | 195.8 | **92.2** | **403.3** | 30.63 ms |
+| rusty trim200 | 195.8 | 91.2 | 402.5 | 30.49 ms |
+
+**The finding is the SPREAD, not the median.** Our MINIMUM (92.2) beats
+mimalloc's (106.7); our max is 3x theirs; spread 4.4x against their 1.26x. A
+retention-policy difference shifts a distribution — it does not stretch one. And
+92->403 MB is roughly ten 32 MiB segments, so something timing-dependent decides
+how many the process holds. Latency is FINE (we are 1.4 ms faster).
+
+Trim reclaiming 0.1 MB (0%) is not a sampling artifact: **trim walks a heap's
+own free spans and cannot see the abandoned list at all**, so it would read 0%
+at any N.
+
+### Localised
+
+`tests/abandon_rss.rs`: 8 waves x 8 threads that allocate spans and exit.
+**25 segments abandoned; a following 2048-block allocation burst adopted 4.**
+At 32 MiB each that is the tail, and whether anything adopts is pure
+scheduling — exactly the shape of a 4.4x run-to-run spread.
+
+### Fix 1 — purge on abandon (`abandoned_page_purge`, now default ON)
+
+The option existed **in the table by name only, defaulted to 0, and nothing
+read it.** So an orphan kept every page it had ever touched, resident,
+indefinitely. `segment::purge_free_spans` now decommits a segment's free spans
+at the last instant the dying thread still owns it. Deliberately NOT gated on
+`purge_delay`: that governs a LIVE heap's spans, which are likely to be reused
+shortly, whereas an orphan has no owner to reuse anything.
+
+### Fix 2 — adopt until satisfied, not twice
+
+`span_from_segments` capped adoption at `tries < 2`, then took a fresh 32 MiB
+segment while orphans sat unclaimed. Now each adopted segment is tried
+immediately and the loop runs until the request is met or the list is empty
+(cap 32, a stall guard rather than a reclaim budget).
+
+### HONEST STATUS: implemented and correctness-gated, NOT validated for RSS
+
+Neither fix is shown to reduce RSS yet, because **no probe here reproduces the
+shape**. The count probe measures orphans, not bytes; `bench/churn.c` has a
+4.9 MiB working set (where we already use 7x LESS than mimalloc); the
+long-lived-thread sweeps never abandon anything. Fix 2 also did not move the
+orphan count, and the reason is instructive: **adoption only triggers on a
+segment MISS**, so a thread with room in its own heap never reaches the
+abandoned list however generous the cap.
+
+Speed is unaffected — lua 0.9908, perl 1.0060, sqlite 1.0037, unchanged, and
+neither fix touches the fast path.
+
+**Validation must come from FFAI's workload**, which is the only thing that has
+reproduced the tail. The A/B is free: `MIMALLOC_ABANDONED_PAGE_PURGE=0` vs `1`
+on the same binary, N=5, comparing max and spread rather than median.
+
 ## RSS INVESTIGATION — mechanism confirmed, our retention NOT implicated (2026-08-06)
 
 **External measurement (FFAI/Diana, their harness, their null arm):** speed at
