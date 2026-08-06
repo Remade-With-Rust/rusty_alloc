@@ -614,6 +614,35 @@ impl Heap {
     /// # Safety
     /// Caller must be this heap's owning thread.
     pub unsafe fn collect(&mut self, force: bool) {
+        // SAFETY: forwarded contract. `force` reclaims, which is what
+        // `mi_collect(true)` means for a LIVE heap.
+        unsafe { self.collect_inner(force, force) }
+    }
+
+    /// Collect WITHOUT reclaiming orphans — for a heap that is being torn down.
+    ///
+    /// **This exists because reclaiming during teardown segfaulted 0.3.1.**
+    /// `thread_done` and `heap_delete` both call a forced collect, and once
+    /// `force` started adopting abandoned segments, a DYING thread would
+    /// swallow every orphan from other dead threads into the heap it was about
+    /// to destroy — re-homing their pages onto a `DelayedList` that is freed
+    /// moments later. Reported by FFAI: 6/8 runs, and reproducible with five
+    /// JPEG decodes.
+    ///
+    /// The tell was that MORE threads made it LESS frequent (1 thread 5/6,
+    /// 16 threads 1/6): with more live heaps, orphans are adopted by a living
+    /// thread first, leaving fewer for a dying one to take.
+    ///
+    /// # Safety
+    /// As [`collect`](Self::collect).
+    pub unsafe fn collect_for_teardown(&mut self) {
+        // SAFETY: forwarded contract.
+        unsafe { self.collect_inner(true, false) }
+    }
+
+    /// # Safety
+    /// Owner thread; `reclaim` only when this heap will REMAIN live.
+    unsafe fn collect_inner(&mut self, force: bool, reclaim: bool) {
         // SAFETY: owner thread per contract.
         unsafe {
             // `force` RECLAIMS ABANDONED SEGMENTS. It used to be ignored
@@ -631,7 +660,9 @@ impl Heap {
             // spans whose reuse path does not re-commit them — the M8 defect
             // (Windows MEM_DECOMMIT faults on touch where Linux MADV_DONTNEED
             // does not). A forced purge needs the recommit path audited first.
-            if force {
+            // `reclaim`, NOT `force`: a teardown collect is forced but must
+            // never adopt (see `collect_for_teardown`).
+            if reclaim {
                 // Bounded only as a stall guard; the list is normally short.
                 const MAX_RECLAIM: usize = 1024;
                 for _ in 0..MAX_RECLAIM {
@@ -642,6 +673,7 @@ impl Heap {
                     self.adopt_segment(aseg);
                 }
             }
+            let _ = force;
             self.process_delayed();
             let mut bin = 1;
             while bin <= MAX_NORMAL_BIN {

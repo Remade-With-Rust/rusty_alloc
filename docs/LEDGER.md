@@ -77,6 +77,66 @@ The deterministic evidence here is strong and independent of this box:
   **byte-identical counters** proving the same work is performed either way.
 - Nothing was added; the Page struct did not grow.
 
+## P0 — 0.3.1 SEGFAULTED: a dying thread adopted orphans (2026-08-06)
+
+**I shipped a segfault.** FFAI bisected it in one pass: 0.3.0 clean 0/8,
+**0.3.1 crashing 6/8**, identical build and workload, allocator version the only
+variable. Reproducible with **five JPEG decodes**, single-threaded.
+
+### Cause — my one functional change in 0.3.1
+
+`collect(force)` began reclaiming abandoned segments. But **both teardown paths
+call a forced collect**:
+
+```
+init.rs:509  thread_done  -> h.collect(true)
+init.rs:597  heap_delete  -> h.collect(true)
+```
+
+So a thread on its way out adopted every orphan from previously-dead threads
+into **the heap it was about to destroy**, re-homing their pages onto a
+`DelayedList` freed moments later. Use-after-free.
+
+### Their data identified it before I read a line of code
+
+The decisive detail: **more threads made it LESS frequent** — 1 thread 5/6,
+2→3/6, 4→4/6, 16→1/6. Backwards for a race, exactly right for "a dying thread
+swallows the orphan pool": with more live heaps, orphans get adopted by a
+LIVING thread first. Everything else follows — every crash needs a thread exit
+(60 detects on a preloaded image: 0/6), PNG is clean because of its thread
+lifecycle not its allocation shape, and buffer size is irrelevant (640x480 and
+1920x1080 both 6/6).
+
+### Fix (0.3.2)
+
+`collect_for_teardown()` — forced collect that does **not** reclaim. Both
+teardown sites use it; `mi_collect(true)` on a LIVE heap still reclaims.
+
+### The regression test DOES NOT reproduce it — do not trust it yet
+
+`tests/teardown_reclaim.rs` passes 4/4 **with the bug deliberately
+reintroduced**. It is not a guard, and it is labelled as such in its own header.
+The missing ingredient is almost certainly CROSS-THREAD frees: every thread in
+it frees its own blocks, so nothing remote is pushing onto the dying heap's
+`DelayedList` — which is what makes a re-homed `xheap` a live target. **The fix
+is reasoned and matches every observation, but it is not test-proven.**
+FFAI's repro is the only thing that has reproduced this.
+
+### Process failures
+
+1. **A caret requirement made this automatic.** FFAI had
+   `rusty_alloc = "0.3.0"`, which silently resolved to 0.3.1 on publish,
+   mid-session, under an already-validated lockfile. They shipped a
+   segfaulting default for several commits without touching a version string.
+2. **Nothing gated `collect(force)`.** Not one test called it, which is exactly
+   why the earlier `_force`-is-ignored bug survived to be found by a reader
+   rather than a gate. I fixed the ignored parameter and added no test for it.
+3. **The teardown call sites were never checked.** I searched for who called
+   `collect` when diagnosing FFAI's report, saw both teardown paths, and still
+   changed the shared implementation.
+
+**Recommendation: YANK 0.3.1.**
+
 ## collect(force) ACTUALLY DOES SOMETHING — reported by FFAI (2026-08-06)
 
 FFAI reported two things against 0.3.0. Both were real.

@@ -506,7 +506,9 @@ pub unsafe fn thread_done(hb: *mut HeapBox) {
     unsafe {
         let h = &mut *(*hb).heap.get();
         // Retire everything that is already dead (also drains delayed once).
-        h.collect(true);
+        // TEARDOWN variant: must NOT adopt orphans into a heap we are about to
+        // destroy — that was the 0.3.1 segfault.
+        h.collect_for_teardown();
         // Walk remaining segments: transition pages to NEVER, disown, publish.
         let mut seg = h.segments;
         h.segments = ptr::null_mut();
@@ -594,7 +596,8 @@ pub unsafe fn heap_delete(hb: *mut HeapBox) {
         debug_assert_eq!((*hb).owner_tid, thread_id());
         let h = &mut *(*hb).heap.get();
         let bh = &mut *(*backing).heap.get();
-        h.collect(true);
+        // Teardown: this heap is being deleted, so it must not adopt orphans.
+        h.collect_for_teardown();
         let mut seg = h.segments;
         h.segments = ptr::null_mut();
         while !seg.is_null() {
