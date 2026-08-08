@@ -59,6 +59,14 @@ The null arm is **1.17%** — wider than either effect. The honest reading is
 **"at parity, below measurement resolution"**. Reproduce on a quiet box with
 `N=31 bash bench/wallclock.sh`.
 
+**Scope that claim to these workloads.** A 0.4.0 re-run against the same
+mimalloc oracle, but on a pure allocation-CHURN microbenchmark (all arms
+`LD_PRELOAD`ed into one neutral C binary, instructions retired), reads
+**1.1342 × mimalloc** — 13.4% behind — while still being **0.67 ×** glibc.
+Real programs dilute allocator cost among everything else they do; a loop that
+does almost nothing but `malloc`/`free` does not. "At parity" is measured on
+lua/perl/sqlite and should not be read as a general property.
+
 **Not measured, and therefore not claimed:**
 
 - The full mimalloc-bench corpus. Three workloads, not the suite — the

@@ -24,9 +24,31 @@ from instructions retired, which has no noise floor:
 
 2,112 instructions in 230 M. Expected: the fixes add predictable early returns
 on the adopt/retire COLD paths and touch the malloc/free fast path not at all.
-Parity with mimalloc is preserved transitively — the fast path does identical
-work to the version that measured 0.99–1.01 against mimalloc — though that arm
-was not independently re-run here.
+
+**The mimalloc arm, re-run directly** (oracle rebuilt from the vendored
+submodule; all four arms LD_PRELOADed into the SAME neutral C churn binary, so
+the allocator is the only variable):
+
+| arm | instructions retired | vs mimalloc |
+|---|---:|---:|
+| glibc | 160,220,039 | 1.6835 |
+| mimalloc v2.4.5 | 95,170,830 | 1.0000 |
+| rusty_alloc 0.3.2 (pristine) | 107,943,033 | 1.1342 |
+| **rusty_alloc 0.4.0 (fixed)** | **107,943,063** | **1.1342** |
+
+**fixed / pristine = 1.00000** — thirty instructions in 108 million. That is the
+definitive answer to "did seven fixes cost anything": no, and it is a count, not
+an estimate.
+
+**A caveat this measurement adds, and it is not flattering.** On this
+allocation-CHURN microbenchmark rusty_alloc is **13.4% behind mimalloc** —
+whereas the README's headline arms (lua/perl/sqlite under LD_PRELOAD) read
+0.99–1.01. Both are true and they do not contradict: real programs dilute
+allocator cost among everything else they do, while this workload is almost
+nothing but malloc/free. The honest reading is that **parity is workload-
+dependent, and the "at parity" claim should be read as scoped to the three real
+programs it was measured on** — not as a general property. It also remains 33%
+cheaper than glibc on the same workload.
 
 **A surprising number that was WRONG, kept as a warning.** The first xmalloc
 reading was **4.86×**. Re-run three times per arm it is 203.3 M both ways: the
