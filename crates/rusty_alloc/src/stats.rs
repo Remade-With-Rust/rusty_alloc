@@ -143,17 +143,62 @@ fn unix_process_info() -> (usize, usize, usize, usize, usize, usize, usize, usiz
         let mut ru: libc::rusage = core::mem::zeroed();
         libc::getrusage(libc::RUSAGE_SELF, &mut ru);
         let ms = |tv: libc::timeval| (tv.tv_sec as usize) * 1000 + (tv.tv_usec as usize) / 1000;
-        // Linux ru_maxrss is KiB.
-        let peak_rss = (ru.ru_maxrss as usize) * 1024;
-        let current_rss = std::fs::read_to_string("/proc/self/statm")
-            .ok()
-            .and_then(|s| {
-                s.split_whitespace()
-                    .nth(1)
-                    .and_then(|v| v.parse::<usize>().ok())
-            })
-            .map(|pages| pages * crate::os::page_size())
-            .unwrap_or(0);
+
+        // RSS is the one field with no portable Unix source, and BOTH of the
+        // obvious readings are wrong on Darwin:
+        //
+        //   * `/proc/self/statm` does not exist (no procfs) — current_rss read
+        //     back as 0, which is what `process_info rss` caught;
+        //   * `ru_maxrss` is in BYTES on macOS/BSD but KiB on Linux, so the
+        //     ×1024 below silently over-reports peak RSS by 1024× there. That
+        //     one is the more dangerous of the two: a plausible-looking number
+        //     rather than an obviously-absent one, in the exact field the
+        //     README lists as still unmeasured.
+        //
+        // Darwin gets the mach task info instead, which reports both figures in
+        // bytes from one call.
+        #[cfg(target_vendor = "apple")]
+        // `libc::mach_task_self_` is deprecated in favour of the `mach2` crate.
+        // Taking that dependency to read one port constant would be a poor
+        // trade for an allocator whose selling point is a dependency-free tree;
+        // the symbol is a stable part of libSystem and is not going anywhere.
+        #[allow(deprecated)]
+        let (current_rss, peak_rss) = {
+            let mut info: libc::mach_task_basic_info = core::mem::zeroed();
+            let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
+            // SAFETY: `info` is a valid, correctly-sized out-buffer for the
+            // MACH_TASK_BASIC_INFO flavor and `count` states its length in
+            // natural_t units; mach_task_self_ is the task port for this
+            // process. Fields are read by copy (the struct is repr(packed(4)),
+            // so no reference into it is ever formed).
+            let kr = libc::task_info(
+                libc::mach_task_self_,
+                libc::MACH_TASK_BASIC_INFO as libc::task_flavor_t,
+                (&raw mut info).cast(),
+                &mut count,
+            );
+            if kr == libc::KERN_SUCCESS {
+                (info.resident_size as usize, info.resident_size_max as usize)
+            } else {
+                (0, 0) // report "unknown" rather than a fabricated number
+            }
+        };
+        #[cfg(not(target_vendor = "apple"))]
+        let (current_rss, peak_rss) = {
+            // Linux: ru_maxrss is KiB; current RSS is field 2 of statm, in pages.
+            let peak = (ru.ru_maxrss as usize) * 1024;
+            let current = std::fs::read_to_string("/proc/self/statm")
+                .ok()
+                .and_then(|s| {
+                    s.split_whitespace()
+                        .nth(1)
+                        .and_then(|v| v.parse::<usize>().ok())
+                })
+                .map(|pages| pages * crate::os::page_size())
+                .unwrap_or(0);
+            (current, peak)
+        };
+
         let now = crate::prim::clock_now() / 1_000_000;
         (
             now as usize,

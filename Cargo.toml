@@ -11,11 +11,15 @@ members = [
 
 [workspace.package]
 # 0.x: the API is not frozen. The allocator is complete and gated; parts of the
-# performance EVIDENCE are not — the full mimalloc-bench corpus, RSS and
-# aarch64 remain unmeasured, and the README says so under "What is and isn't
-# measured". Those caveats used to ride on an `-alpha` tag; on a plain 0.x
-# release they live in the README, so keep them there and current.
-version = "0.3.2"
+# performance EVIDENCE are not — the full mimalloc-bench corpus is still
+# unmeasured, and RSS has two data points rather than a sweep. The README says
+# so under "What is and isn't measured"; keep it there and current.
+#
+# 0.4.0, not 0.3.3: aarch64's first real execution turned up seven defects, and
+# fixing them CHANGED PUBLIC API — `Heap::adopt_segment` now returns `bool`
+# (ignoring it was the use-after-free) and `HeapBox` gained a `subproc` field.
+# Under 0.x semver a breaking change bumps the minor.
+version = "0.4.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/remade-with-rust/rusty_alloc"

@@ -123,10 +123,51 @@ pub(super) unsafe fn commit(ptr_: *mut u8, size: usize) -> Result<bool, PrimErro
 }
 
 pub(super) unsafe fn decommit(ptr_: *mut u8, size: usize) -> Result<bool, PrimError> {
-    // SAFETY: caller guarantees the range lies in a live mapping; DONTNEED
-    // drops the pages, next touch faults in zeros — stays accessible.
-    let r = unsafe { libc::madvise(ptr_.cast(), size, libc::MADV_DONTNEED) };
-    if r == 0 { Ok(false) } else { Err(errno()) }
+    // DARWIN IS NOT LINUX HERE. `MADV_DONTNEED` is only advisory for PRIVATE
+    // ANONYMOUS memory on macOS/BSD: it neither frees the physical pages nor
+    // zeroes them. Using it there breaks decommit in both directions —
+    //
+    //   * the pages stay RESIDENT, so purge never actually returns memory to
+    //     the OS and RSS only ever grows in a long-running process (this is the
+    //     abandonment path, which is on by default, so it was live);
+    //   * and the range keeps its old CONTENTS, violating the documented
+    //     "contents are lost" contract. Nothing trusts that yet — `free_is_zero`
+    //     is conservatively cleared on purge — but it is a landmine for anything
+    //     that later does.
+    //
+    // Re-mapping is the portable-on-Darwin decommit: MAP_FIXED over a range we
+    // already own atomically drops the old physical pages and installs fresh
+    // zero-fill-on-demand ones. The range stays readable/writable and needs no
+    // recommit, which is exactly the Linux MADV_DONTNEED contract, so callers
+    // see identical semantics on both.
+    #[cfg(target_vendor = "apple")]
+    {
+        // SAFETY: caller guarantees `[ptr_, ptr_+size)` is a page-aligned range
+        // inside a live mapping WE own, so replacing it cannot clobber another
+        // subsystem's memory. MAP_FIXED is what makes the replacement atomic:
+        // the range is never unmapped, so a concurrent reader cannot fault.
+        let p = unsafe {
+            libc::mmap(
+                ptr_.cast(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
+                -1,
+                0,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            return Err(errno());
+        }
+        return Ok(false);
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        // SAFETY: caller guarantees the range lies in a live mapping; DONTNEED
+        // drops the pages, next touch faults in zeros — stays accessible.
+        let r = unsafe { libc::madvise(ptr_.cast(), size, libc::MADV_DONTNEED) };
+        if r == 0 { Ok(false) } else { Err(errno()) }
+    }
 }
 
 pub(super) unsafe fn reset(ptr_: *mut u8, size: usize) -> Result<(), PrimError> {

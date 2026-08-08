@@ -4,6 +4,242 @@ One entry per milestone/brick: what landed, the numbers with their method lines,
 what was reverted and **which kind** of revert (measured-worse vs within-noise).
 Newest first.
 
+## 0.4.0 — the three unmeasured things, measured (2026-08-08)
+
+Perf, RSS and the `secure` feature had all been *recommended* without numbers.
+All three measured before cutting 0.4.0. Method throughout: deterministic
+COUNTS wherever a count exists (callgrind instructions retired, RSS bytes), and
+where a duration was unavoidable, ABBA interleaving with a **null arm**.
+
+**1. Did the seven fixes cost performance? No — and this one is exact.**
+Wall/CPU time in Docker could not resolve it (null arm read **1.0253** on means:
+the environment's floor is ~2.5%, wider than any effect). So the verdict comes
+from instructions retired, which has no noise floor:
+
+| kernel | pristine 0.3.2 | fixed | ratio |
+|---|---:|---:|---:|
+| malloc-small (single-threaded, fully repeatable) | 229,924,005 | 229,921,893 | **0.99999** |
+| larson-4t | 129.6–130.9 M | 129.7–130.9 M | ranges overlap |
+| xmalloc-4p | 203.3 M | 203.3 M | **1.0000** |
+
+2,112 instructions in 230 M. Expected: the fixes add predictable early returns
+on the adopt/retire COLD paths and touch the malloc/free fast path not at all.
+Parity with mimalloc is preserved transitively — the fast path does identical
+work to the version that measured 0.99–1.01 against mimalloc — though that arm
+was not independently re-run here.
+
+**A surprising number that was WRONG, kept as a warning.** The first xmalloc
+reading was **4.86×**. Re-run three times per arm it is 203.3 M both ways: the
+outlier was a one-off scheduling artifact under callgrind. Work parity was
+confirmed independently (both arms print `blocks=600000`, same seed). Re-verify
+a surprising number before acting on it.
+
+**2. RSS — one clear win, one open question.**
+
+The decommit fix, measured directly (reserve 512 MiB, commit, touch every page,
+decommit, read RSS):
+
+| decommit impl | returned to OS | contents after |
+|---|---:|---|
+| pristine `MADV_DONTNEED` | **6.4%** (27.4 of 427.9 MiB) | `165` — STALE, contract violated |
+| fixed `mmap MAP_FIXED` | **100.1%** (457.8 of 457.3 MiB) | `0` — zeroed, contract honoured |
+
+Soaks (daemon-shaped: thread waves that exit holding live blocks, forcing
+abandonment, against a bounded live set):
+
+- **purge ENABLED** (`purge_delay = 0`), 6 min: RSS flat at **9.4 MiB**, slope
+  **−0.02 MiB/min**, peak 14.8. Clean.
+- **shipped default** (`purge_delay = -1`, purging opt-in), 25 min, 299 samples:
+  ~650 MiB RSS against a ~175 MiB mean live set, drifting **+1.45 ± 0.70
+  MiB/min** (least-squares, 95% CI) over the full run. The drift DECELERATES —
+  first half +2.42 ± 2.06, second half **+1.19 ± 1.87, no longer
+  distinguishable from zero** — and RSS does not track the live set
+  (corr = **+0.034**), so this is retention approaching a plateau, or a slow
+  leak, and **25 minutes cannot separate those two**. NOT claimed as settled.
+  The naive two-endpoint slope this harness printed first (+2.69) is not a
+  sound estimator on data with 307 MiB peak-to-peak oscillation; the regression
+  above supersedes it.
+
+Actionable consequence: **long-lived services should set `purge_delay >= 0`**
+rather than rely on the opt-in default. That is the configuration with flat,
+measured RSS.
+
+**3. `secure` — works, and costs 4–7%.** Full suite green with
+`--features secure`; `stress_mt` 30/30 in release. Cost, instructions retired:
+
+| kernel | default | secure | ratio |
+|---|---:|---:|---:|
+| malloc-small | 229,921,829 | 245,439,205 | **1.0675×** |
+| larson-4t | 130,150,515 | 136,816,187 | 1.0512× |
+| xmalloc-4p | 203,333,568 | 211,720,930 | 1.0412× |
+
+Throughput on the alloc-heaviest kernel: 84.0 → 73.6 Mops/s. A real but modest
+price for guard pages + encrypted free lists on anything facing untrusted input.
+
+**Also executed for the first time this round:** `wasm32-unknown-unknown` via
+`bench/wasm-selftest.mjs` in a Node VM — **PASSED** (linear memory grew
+2.06 → 64.00 MiB). The platform table said "tested in a VM self-test" on faith;
+it has now actually been run.
+
+## The abandon/adopt UAF family — `stress_mt` CLOSED, suite fully green (2026-08-08)
+
+The open P0 from the entry below is fixed. **It was not a weak-memory-ordering
+bug, and it was not aarch64-specific** — that hypothesis (recorded below, from
+the fact that the same source passed 19/20 under Rosetta's TSO) was WRONG. It is
+a family of three plain use-after-frees on the abandon → adopt → reuse path,
+present on every platform. x86-64 survived them because the just-`munmap`ped
+region there usually stayed mapped; native aarch64 unmaps a 32 MiB segment for
+real and faults on the next touch. The correction matters: **these are latent
+memory-safety bugs on x86-64 Linux and Windows too**, and the x86-64 arm of the
+gate below improves as well.
+
+**The shape, in one sentence: three functions can RELEASE the segment they were
+handed, and each returned `()` — so every caller kept using the pointer.**
+
+1. **`span_from_segments` used a segment that `adopt_segment` had released.**
+   `adopt_segment` frees `seg` when it arrives empty and an empty one is already
+   cached, or when a Huge segment's block had already died — then the caller read
+   `(*aseg).used_pages` and called `span_alloc(aseg, …)`. Proof before fixing: a
+   probe that `_exit(42)`s when the just-adopted pointer is the one adoption
+   freed **fired in 19 of 20 runs, with SIGSEGV dropping to 0**.
+2. **`adopt_segment` used a segment its own `retire_span` had released.** The
+   tail's dead-large-span retire can empty the segment and release it; the very
+   next line reads `(*seg).used_pages`. This was the residual crash — lldb put it
+   in `adopt_segment` itself, at that read.
+3. **`retire_span` freed a segment it had failed to unlink.** `remove_segment`
+   ended in a bare `debug_assert!(false, "segment not in heap list")`, which is
+   **compiled out in release**: the caller fell through and `segment_free`d a
+   segment still linked in another list, leaving a dangling `h.segments` head
+   that later crashed `thread_done`'s walk. A probe that `_exit(43)`s on the
+   not-found branch fired in **4 of 30 runs**.
+
+**Fix: put the outcome in the type, not in a comment.** `adopt_segment`,
+`retire_span` and `remove_segment` now return `bool` and are `#[must_use]` with
+a message naming the consequence. That is what makes this class non-recurring —
+adding `#[must_use]` immediately surfaced all four remaining `retire_span` call
+sites for audit (all four proved terminal and are annotated as such). Callers
+that legitimately ignore it now say why in one line.
+
+One premise checked rather than assumed while fixing: releasing a segment cannot
+strand queued pages, because `used_pages` counts CARVED spans and a page is only
+queued while carved — so `used_pages == 0` implies none of its pages are in a bin
+queue. An earlier "park it instead of releasing" attempt was built on the
+opposite assumption, measured no better (36/40), and was reverted rather than
+kept as a belt-and-braces change.
+
+**Gate, all on aarch64-apple-darwin unless noted, exit-code classified:**
+
+| arm | `stress_mt` |
+|---|---|
+| pristine 0.3.2 | 0 / 20 |
+| + the 4 platform fixes (entry below) | 17 / 30 ABBA |
+| **+ this UAF family fix** | **30 / 30 ABBA · 100/100 release soak · 40/40 debug** |
+| x86-64 (Rosetta), before | 19 / 20 |
+| **x86-64 (Rosetta), after** | **30 / 30** |
+
+`cargo test --workspace` is now **fully green on aarch64-apple-darwin — no
+failures, no ignores beyond the pre-existing doctest** — and green on
+x86_64-apple-darwin; wasm32 still builds. The `#[global_allocator]` smoke app
+(Vec/String/HashMap/BTreeMap churn, 40 MiB allocations, cross-thread frees,
+8-thread waves) passes 30/30.
+
+`stress_mt` IS the regression test for this family: it failed 65–100% of runs
+before and is now 100/100, so a reintroduction shows up immediately.
+
+## aarch64-apple-darwin FIRST EXECUTION — 4 bugs fixed, 1 still open (2026-08-08)
+
+The README's platform table said aarch64 "compiles; **never executed**". It was
+executed, on macOS 26 / Apple Silicon (16 KiB pages), rustc 1.95.0. **Four
+defects, two of them memory-safety class. Baseline 0.3.2 could not run a
+realistic `#[global_allocator]` workload on this platform at all.**
+
+Method for every rate below: the built binary run N times by a script that
+classifies by EXIT CODE (0 pass / 101 panic / 134 SIGABRT / 139 SIGSEGV / 137
+killed-at-timeout), arms interleaved ABBA so machine-load drift hits both
+equally, binaries fingerprinted by sha256 before each arm — a stale binary
+produced one bogus reading before that check was added.
+
+**P0 — `thread_id()` read the wrong register (memory-safety).** The aarch64 arm
+read `tpidr_el0`, which is the thread pointer on Linux/Android/BSD but NOT on
+Darwin: Apple puts the thread pointer in `tpidrRO_el0` and uses `tpidr_el0` for
+the CPU/cluster id. Measured directly: `tpidr_el0` returned small non-pointer
+values (0x1002, 0x2005…), took **5 distinct values within ONE thread** over 3M
+reads as it migrated cores, and **8 live threads produced only 5 distinct values
+— distinct threads collided**. `thread_id()` is the ownership identity behind
+`segment.thread_id`, so a collision routes one thread's `free` down the owner
+(unsynchronised) path into another thread's segment. Fixed to
+`tpidrro_el0 & !0b111` (Apple documents the low 3 bits as the CPU number — which
+is exactly the observed drift). New standing gate `tests/thread_identity.rs`
+asserts stability-within-thread and uniqueness-across-live-threads; verified to
+FAIL against the old register before being accepted.
+
+**P1 — subprocess isolation silently lost at teardown.** `abandoned_push` read
+`my_subproc()` from a Rust `thread_local!` while running inside the
+`pthread_key_create` destructor. Destruction order between a platform TLS
+destructor and Rust's own TLS is unspecified everywhere, and is observably wrong
+here: it read back 0, so a thread tagged into subproc N abandoned its segments
+into the MAIN subproc. Probe: `ABANDONED_COUNT` was 1 (the abandon fired
+correctly) but the segment sat on list 0, not list 1. Fixed by mirroring the tag
+onto `HeapBox::subproc` — the box is alive for all of teardown because it is the
+value passed *to* the destructor — and passing it into `abandoned_push`. Now
+correct on every target rather than accidentally correct on one.
+
+**P2 — `decommit` never returned memory to the OS.** `MADV_DONTNEED` is only
+advisory for private anonymous memory on Darwin: it neither frees the physical
+pages nor zeroes them, so purge was a no-op and RSS only ever grew (the
+abandonment purge path is on by default, so this was live). It also violated the
+documented "contents are lost" contract — caught by `prim.rs` reading back 42.
+Nothing trusted that yet (`free_is_zero` is conservatively cleared on purge) so
+it was not a disclosure bug, but it was a landmine. Fixed with a `MAP_FIXED`
+anonymous re-map over our own range, which drops the physical pages and installs
+zero-fill-on-demand ones, matching the Linux contract exactly.
+
+**P3 — `process_info` RSS wrong on Darwin, in both directions.** `current_rss`
+read `/proc/self/statm` (no procfs on macOS → 0), and `ru_maxrss` was scaled
+×1024 as KiB when macOS/BSD report it in BYTES — a plausible-looking number
+1024× too large, in the exact field the README lists as unmeasured. Both replaced
+with one `task_info(MACH_TASK_BASIC_INFO)` call, which reports `resident_size`
+and `resident_size_max` in bytes.
+
+**Result.** Whole suite green on this platform except `stress_mt`. Realistic
+`#[global_allocator]` workload (Vec/String/HashMap/BTreeMap churn, 40 MiB
+allocations, cross-thread frees, 8-thread waves), ABBA-interleaved, n=20/arm:
+
+| arm | pass |
+|---|---|
+| pristine 0.3.2 | **1 / 20** (19 × SIGSEGV, dies at the cross-thread-free stage) |
+| with these four fixes | **20 / 20** |
+
+**[CLOSED by the entry above — and the diagnosis below was WRONG: it is a plain
+use-after-free family, present on every platform, not a weak-memory bug.]**
+
+**STILL OPEN (P0-class, aarch64-native only).** `stress_mt`'s abandon → adopt →
+reuse storm still crashes: release 7/20 pass, 11 × SIGSEGV, 1 × SIGABRT, 1 hang.
+Consistent crash site `Heap::span_from_segments`, EXC_BAD_ACCESS on addresses
+sharing a low offset with differing high bits (a walk off a stale/unmapped
+segment), plus `debug_assert!(false, "segment not in heap list")` at heap.rs:524
+and :977. Two experiments narrow it:
+
+- **Not the thread-pointer path.** Forcing apple-aarch64 onto the safe
+  `pthread_self` cached-TLS id leaves the rate unchanged (7/20 pass), so P0's fix
+  is necessary but not sufficient — the remaining bug is elsewhere.
+- **It passes under Rosetta.** The same source built for `x86_64-apple-darwin`
+  passes **19/20**. Rosetta emulates x86 **TSO**, which is the signature of a
+  WEAK-MEMORY-ORDERING bug in the lock-free abandon/adopt protocol — invisible on
+  every platform tested so far (x86-64 Linux and Windows are both TSO), and only
+  ever visible on genuinely weakly-ordered hardware. The alternative hypothesis,
+  a 16 KiB-page geometry assumption, is NOT excluded: Rosetta also uses 4 KiB
+  pages, so that variable moved too.
+
+Note `tests/loom_xthread.rs` models the delayed-free/abandon PROTOCOL but not the
+segment adopt path or the heap segment list, which is where the crash sits —
+extending the model there is the obvious next probe.
+
+**Also fixed: a test that hardcoded a 4 KiB page.** `bins::known_size_classes`
+asserted `good_size(65537) == 69632`. Above `MEDIUM_OBJ_SIZE_MAX` good_size is
+page-rounded, so the correct value is 81920 on a 16 KiB-page host. Split into a
+property test deriving the expectation from `os::page_size()`.
+
 ## M9b — the free fast path, folded to one flags byte (2026-08-05)
 
 Continuing the M9 win. The probe had already priced `prim::thread_id()`; the

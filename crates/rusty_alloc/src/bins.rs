@@ -84,6 +84,11 @@ mod tests {
     fn known_size_classes() {
         // Spot values from the mimalloc paper / types.h (G2 pins the full range
         // against the oracle binary; these catch formula regressions offline).
+        //
+        // Every entry here must be BIN geometry — pure arithmetic, identical on
+        // every target. Sizes above MEDIUM_OBJ_SIZE_MAX are page-rounded and so
+        // depend on the runtime page size; they belong in
+        // `good_size_above_binned_range_is_page_rounded`, not in this table.
         for (size, good) in [
             (1, 8),
             (8, 8),
@@ -105,10 +110,33 @@ mod tests {
             (1025, 1280),
             (4097, 5120),
             (65536, 65536), // last binned size
-            (65537, 69632), // page-rounded above the binned range
-            (131072, 131072),
         ] {
             assert_eq!(good_size(size), good, "good_size({size})");
+        }
+    }
+
+    #[test]
+    fn good_size_above_binned_range_is_page_rounded() {
+        // Above MEDIUM_OBJ_SIZE_MAX, good_size rounds to whole OS pages, so the
+        // expected value is a function of the RUNTIME page size — 4 KiB on
+        // x86-64 Linux/Windows, but 16 KiB on Apple Silicon (and on any
+        // CONFIG_ARM64_16K_PAGES kernel). Assert the property, never a literal:
+        // a hardcoded 4 KiB expectation here fails on aarch64-apple-darwin.
+        let ps = crate::os::page_size();
+        assert!(ps.is_power_of_two() && ps >= 4096, "implausible page size {ps}");
+
+        for size in [
+            MEDIUM_OBJ_SIZE_MAX + 1,
+            MEDIUM_OBJ_SIZE_MAX + ps - 1,
+            2 * MEDIUM_OBJ_SIZE_MAX,
+            1024 * 1024 + 1,
+        ] {
+            let g = good_size(size);
+            assert_eq!(g, crate::os::page_align_up(size), "good_size({size})");
+            assert!(g >= size, "good_size({size}) = {g} < size");
+            assert_eq!(g % ps, 0, "good_size({size}) = {g} is not page-aligned");
+            assert!(g - size < ps, "good_size({size}) = {g} over-rounded");
+            assert_eq!(good_size(g), g, "good_size not idempotent at {g}");
         }
     }
 

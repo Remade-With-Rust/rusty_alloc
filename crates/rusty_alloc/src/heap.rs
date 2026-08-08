@@ -400,7 +400,12 @@ impl Heap {
                 if aseg.is_null() {
                     break;
                 }
-                self.adopt_segment(aseg);
+                if !self.adopt_segment(aseg) {
+                    // Adoption RELEASED it (arrived empty, or a dead huge
+                    // block). `aseg` is unmapped — the request is unmet, so
+                    // keep draining the abandoned list rather than touching it.
+                    continue;
+                }
                 let was_empty = (*aseg).used_pages == 0;
                 let (p, fresh) = span_alloc(aseg, slices);
                 if !p.is_null() {
@@ -670,7 +675,9 @@ impl Heap {
                     if aseg.is_null() {
                         break;
                     }
-                    self.adopt_segment(aseg);
+                    // Result ignored deliberately: `aseg` is never touched
+                    // again on this path, so release-during-adoption is fine.
+                    let _ = self.adopt_segment(aseg);
                 }
             }
             let _ = force;
@@ -686,7 +693,10 @@ impl Heap {
                         queue_remove(q, p);
                         self.update_direct(bin);
                         let seg = segment_of(p.cast::<u8>());
-                        self.retire_span(seg, p);
+                        // `seg` is not touched again; `next` is a QUEUED page,
+                        // and a released segment has no queued pages (release
+                        // requires used_pages == 0).
+                        let _ = self.retire_span(seg, p);
                     }
                     p = next;
                 }
@@ -699,10 +709,23 @@ impl Heap {
     /// retire the already-dead ones (called with the segment OFF the global
     /// abandoned list, thread_id already set to us by the caller).
     ///
+    /// **Returns `false` when `seg` was RELEASED during adoption** — it is
+    /// unmapped, and the caller must not touch the pointer again. Adoption
+    /// releases in two cases: a Huge segment whose block had already died, and
+    /// a Normal segment that arrives empty when this heap already caches an
+    /// empty one. Both are common in an abandon/adopt storm.
+    ///
+    /// This is `#[must_use]` because ignoring it is a use-after-free, not a
+    /// missed optimisation: `span_from_segments` did exactly that and read
+    /// `(*seg).used_pages` off a freshly-`munmap`ped 32 MiB region. It survived
+    /// on x86-64 only because the address space there tended to stay mapped;
+    /// on aarch64-apple-darwin it faults immediately (19 of 20 stress runs).
+    ///
     /// # Safety
     /// `seg` must be a Normal segment popped from the abandoned list, owned
     /// by nobody; calling thread becomes the owner.
-    pub unsafe fn adopt_segment(&mut self, seg: *mut Segment) {
+    #[must_use = "returns false when the segment was released — using it then is a use-after-free"]
+    pub unsafe fn adopt_segment(&mut self, seg: *mut Segment) -> bool {
         // SAFETY: we are the sole owner as of now; walking spans follows the
         // segment invariants (every span start is marked).
         unsafe {
@@ -717,11 +740,11 @@ impl Heap {
                 if (*pg).used == 0 {
                     let _ = huge_free(seg);
                     self.stats.segments_freed += 1;
-                } else {
-                    (*seg).next = self.huge_segments;
-                    self.huge_segments = seg;
+                    return false; // RELEASED — `seg` is unmapped from here
                 }
-                return;
+                (*seg).next = self.huge_segments;
+                self.huge_segments = seg;
+                return true;
             }
             (*seg).next = self.segments;
             self.segments = seg;
@@ -774,7 +797,13 @@ impl Heap {
                     && (*slot).bin as usize == BIN_HUGE
                     && (*slot).used == 0
                 {
-                    self.retire_span(seg, slot);
+                    // Retiring this span can empty the segment and RELEASE it —
+                    // in which case `seg` is unmapped and the `used_pages` read
+                    // below would fault. This was the residual aarch64 crash:
+                    // EXC_BAD_ACCESS in adopt_segment's own tail.
+                    if !self.retire_span(seg, slot) {
+                        return false; // RELEASED during adoption
+                    }
                     break; // layout changed: leave the rest to later collects
                 }
                 idx += len;
@@ -782,12 +811,17 @@ impl Heap {
             if (*seg).used_pages == 0 {
                 if self.empty_segments == 0 {
                     self.empty_segments = 1;
-                } else {
-                    self.remove_segment(seg);
+                } else if self.remove_segment(seg) {
+                    // Releasing here is sound: `used_pages` counts CARVED spans
+                    // and a page is only queued while carved, so `used_pages ==
+                    // 0` implies none of this segment's pages are still in our
+                    // bin queues. Release only what we actually unlinked.
                     let _ = segment::segment_free(seg);
                     self.stats.segments_freed += 1;
+                    return false; // RELEASED — `seg` is unmapped from here
                 }
             }
+            true
         }
     }
 
@@ -868,7 +902,7 @@ impl Heap {
             if !((*q).first == pg && (*q).last == pg) {
                 queue_remove(q, pg);
                 self.update_direct(bin);
-                self.retire_span(seg, pg);
+                let _ = self.retire_span(seg, pg); // `seg` unused after
             }
         }
     }
@@ -901,7 +935,7 @@ impl Heap {
                     self.stat_free();
                     if (*pg).bin as usize == BIN_HUGE {
                         // Large single-block span: retire immediately.
-                        self.retire_span(seg, pg);
+                        let _ = self.retire_span(seg, pg); // returns below
                         return;
                     }
                     page_push_local(pg, p.cast());
@@ -923,7 +957,7 @@ impl Heap {
                         if !((*q).first == pg && (*q).last == pg) {
                             queue_remove(q, pg);
                             self.update_direct(bin);
-                            self.retire_span(seg, pg);
+                            let _ = self.retire_span(seg, pg); // `seg` unused after
                         }
                     }
                 }
@@ -933,10 +967,16 @@ impl Heap {
 
     /// Return a span to its segment; release the segment when it empties.
     ///
+    /// **Returns `false` when the SEGMENT was released** — `seg` is unmapped and
+    /// the caller must not touch it again. Retiring the last span of a segment
+    /// is the normal way a segment dies, so this is a routine outcome, not an
+    /// error path.
+    ///
     /// # Safety
     /// Heap lock held; `pg` is an unqueued span-start of `seg` with no live
     /// blocks.
-    unsafe fn retire_span(&mut self, seg: *mut Segment, pg: *mut Page) {
+    #[must_use = "false means the segment was released — touching it then is a use-after-free"]
+    unsafe fn retire_span(&mut self, seg: *mut Segment, pg: *mut Page) -> bool {
         // SAFETY: forwarded contract.
         unsafe {
             // span_free coalesces, then purges the merged span (the RSS
@@ -950,31 +990,47 @@ impl Heap {
                     // Park one empty segment for reuse (stays in the list —
                     // span_from_segments will find its full free span).
                     self.empty_segments = 1;
-                } else {
-                    self.remove_segment(seg);
+                } else if self.remove_segment(seg) {
+                    // Release ONLY what we actually unlinked. If it was not in
+                    // our list it belongs to someone else (or was already
+                    // released) and freeing it would dangle their pointer; the
+                    // rightful owner will retire it.
                     let _ = segment::segment_free(seg);
                     self.stats.segments_freed += 1;
+                    return false; // RELEASED — `seg` is unmapped from here
                 }
             }
+            true
         }
     }
 
-    /// Unlink `seg` from the heap's segment list.
+    /// Unlink `seg` from the heap's segment list. **Returns whether it was
+    /// actually found and unlinked.**
+    ///
+    /// A `false` here means `seg` is not ours — so it must NOT be released.
+    /// This used to be a bare `debug_assert!(false, …)`, which is compiled out
+    /// in release: the caller then fell through and `segment_free`d a segment
+    /// that was still linked in some list, leaving a dangling pointer behind
+    /// (the residual aarch64 crash in `thread_done`'s walk). Returning the fact
+    /// makes "release only what we unlinked" enforceable at each call site
+    /// instead of assumed.
     ///
     /// # Safety
-    /// Heap lock held; `seg` is in the list.
-    unsafe fn remove_segment(&mut self, seg: *mut Segment) {
+    /// Heap lock held.
+    #[must_use = "false means the segment is not ours — releasing it corrupts another list"]
+    unsafe fn remove_segment(&mut self, seg: *mut Segment) -> bool {
         // SAFETY: list owned by this heap under the lock.
         unsafe {
             let mut cur = &raw mut self.segments;
             while !(*cur).is_null() {
                 if *cur == seg {
                     *cur = (*seg).next;
-                    return;
+                    return true;
                 }
                 cur = &raw mut (**cur).next;
             }
             debug_assert!(false, "segment not in heap list");
+            false
         }
     }
 

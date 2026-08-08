@@ -39,6 +39,21 @@ pub struct HeapBox {
     pub next_box: AtomicPtr<HeapBox>,
     /// Owning thread id (heaps allocate only from their creating thread).
     pub owner_tid: usize,
+    /// The subprocess this heap's segments are abandoned into.
+    ///
+    /// Mirrored from the `SUBPROC` thread-local so that TEARDOWN never has to
+    /// read it. `thread_done` runs from a platform TLS destructor
+    /// (`pthread_key_create` / `FlsAlloc`), and the destruction order between
+    /// *that* callback and Rust's own `thread_local!` storage is unspecified on
+    /// every platform. On aarch64-apple-darwin it is observably wrong:
+    /// `my_subproc()` reads back 0 inside `thread_done`, so a tagged thread's
+    /// segments landed in the MAIN subprocess and `mi_subproc_*` isolation was
+    /// silently lost — the abandon fired correctly, only its destination was
+    /// wrong. The heap box is our own mapping and is alive for the whole of
+    /// teardown (it is the value passed *to* the destructor), so reading the tag
+    /// from here is correct on every target instead of accidentally correct on
+    /// one.
+    pub subproc: AtomicUsize,
     /// Heap tag (`mi_heap_new_ex`; reported by the block visitor).
     pub tag: i32,
     /// Whether `mi_heap_destroy` may drop live blocks (else it delegates to
@@ -299,15 +314,51 @@ pub fn thread_id() -> usize {
         }
         teb
     }
-    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    // AArch64 splits by OS: the register holding the thread pointer is NOT the
+    // same one on Darwin as everywhere else.
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple"), not(miri)))]
     {
         let tp: usize;
-        // SAFETY: tpidr_el0 is the AArch64 thread pointer; read-only.
+        // SAFETY: on the standard AArch64 ABI (Linux, Android, BSD) tpidr_el0
+        // IS the thread pointer; read-only.
         unsafe {
             core::arch::asm!("mrs {}, tpidr_el0", out(reg) tp,
-                             options(nostack, preserves_flags));
+                             options(nostack, preserves_flags, readonly));
         }
         tp
+    }
+    #[cfg(all(target_arch = "aarch64", target_vendor = "apple", not(miri)))]
+    {
+        let tp: usize;
+        // SAFETY: read-only system-register read.
+        //
+        // DARWIN IS NOT THE STANDARD AArch64 ABI. Apple puts the thread pointer
+        // in tpidrRO_el0 and uses tpidr_el0 for the CPU/cluster id. Reading
+        // tpidr_el0 here — as every other AArch64 target correctly does — was a
+        // memory-safety bug, measured on macOS 26 / M-series:
+        //
+        //   * tpidr_el0 returns small values (0x1002, 0x2005, …), not pointers;
+        //   * it CHANGES under a single thread as that thread migrates between
+        //     cores (5 distinct values over 3M reads on the main thread);
+        //   * and 8 live threads produced only 5 distinct values — DIFFERENT
+        //     THREADS COLLIDED.
+        //
+        // thread_id() is the allocator's ownership identity: `segment.thread_id`
+        // decides whether a free takes the local (unsynchronised) path or the
+        // remote one. Colliding ids let one thread free into another thread's
+        // segment through the owner path, racing non-atomic page state — heap
+        // corruption, not merely a lost optimisation. A drifting id separately
+        // makes a thread stop recognising its own segments.
+        //
+        // tpidrro_el0 is the real thread pointer: stable within a thread and
+        // unique across live threads (it is `pthread_self() + 0xe0`). Apple
+        // documents the LOW 3 BITS as the current CPU number, so they must be
+        // masked off — that is precisely the drift observed above.
+        unsafe {
+            core::arch::asm!("mrs {}, tpidrro_el0", out(reg) tp,
+                             options(nostack, preserves_flags, readonly));
+        }
+        tp & !0b111
     }
     // Every other target: the cached-TLS path (still far cheaper than asking
     // the OS on each call).
@@ -383,6 +434,9 @@ pub fn create_heap(tag: i32, allow_destroy: bool, arena_id: i32) -> *mut HeapBox
                 delayed: DelayedList::new(),
                 next_box: AtomicPtr::new(ptr::null_mut()),
                 owner_tid: thread_id(),
+                // Captured HERE, on the live creating thread, where the
+                // thread-local is unambiguously valid.
+                subproc: AtomicUsize::new(my_subproc()),
                 tag,
                 allow_destroy,
                 heap: UnsafeCell::new(Heap::new()),
@@ -504,6 +558,13 @@ unsafe extern "C" fn thread_done_cb(v: *mut c_void) {
 pub unsafe fn thread_done(hb: *mut HeapBox) {
     // SAFETY: per contract we are the owner; sequencing per the model.
     unsafe {
+        // Read the subprocess tag from the BOX, not from `my_subproc()`. We are
+        // inside a platform TLS destructor and Rust's `thread_local!` storage
+        // may already be torn down — on aarch64-apple-darwin it reads back 0,
+        // which silently dropped every tagged thread's segments into the main
+        // subprocess. Clamped because a corrupt tag must not index out of
+        // bounds on the teardown path.
+        let sp = (*hb).subproc.load(Ordering::Acquire).min(MAX_SUBPROCS - 1);
         let h = &mut *(*hb).heap.get();
         // Retire everything that is already dead (also drains delayed once).
         // TEARDOWN variant: must NOT adopt orphans into a heap we are about to
@@ -531,7 +592,7 @@ pub unsafe fn thread_done(hb: *mut HeapBox) {
                 h.stats.segments_freed += 1;
             } else {
                 (*seg).thread_id.store(0, Ordering::Release);
-                abandoned_push(seg);
+                abandoned_push(seg, sp);
             }
             seg = next;
         }
@@ -550,7 +611,7 @@ pub unsafe fn thread_done(hb: *mut HeapBox) {
                 page_set_flag(pg, XFLAG_NEVER);
                 (*pg).xheap.store(0, Ordering::Release);
                 (*hseg).thread_id.store(0, Ordering::Release);
-                abandoned_push(hseg);
+                abandoned_push(hseg, sp);
             }
             hseg = next;
         }
@@ -602,7 +663,9 @@ pub unsafe fn heap_delete(hb: *mut HeapBox) {
         h.segments = ptr::null_mut();
         while !seg.is_null() {
             let next = (*seg).next;
-            bh.adopt_segment(seg); // re-homes queues + xheap (tid already ours)
+            // `next` is read BEFORE adopting and `seg` is not touched after, so
+            // a release during adoption is safe here.
+            let _ = bh.adopt_segment(seg); // re-homes queues + xheap (tid ours)
             seg = next;
         }
         let mut hseg = h.huge_segments;
@@ -767,6 +830,18 @@ pub fn subproc_delete(id: usize) {
 pub fn subproc_add_current_thread(id: usize) {
     assert!(id < MAX_SUBPROCS);
     SUBPROC.with(|c| c.set(id));
+    // Mirror onto this thread's backing heap so TEARDOWN can read the tag
+    // without touching the thread-local (see `HeapBox::subproc`). Tagging
+    // before the first allocation is the common order and is covered by
+    // `create_heap` reading `my_subproc()`; this covers tagging AFTER the heap
+    // already exists. Deliberately does NOT bootstrap a heap — a thread that
+    // tags itself and never allocates should not be given one.
+    let hb = BACKING_PTR.with(|c| c.get());
+    if !hb.is_null() {
+        // SAFETY: hb is this thread's own live backing box; `subproc` is
+        // atomic, so the teardown read needs no other synchronisation.
+        unsafe { (*hb).subproc.store(id, Ordering::Release) };
+    }
 }
 
 fn my_subproc() -> usize {
@@ -811,8 +886,13 @@ fn abandoned_unlock() {
     ABANDONED_LOCK.store(false, Ordering::Release);
 }
 
-fn abandoned_push(seg: *mut Segment) {
-    let sp = my_subproc();
+/// Publish `seg` to subprocess `sp`'s abandoned list.
+///
+/// `sp` is passed in rather than read from `my_subproc()`: every caller is on
+/// the teardown path, where the `SUBPROC` thread-local may already be gone (see
+/// `HeapBox::subproc`). The owning heap box carries the tag instead.
+fn abandoned_push(seg: *mut Segment, sp: usize) {
+    debug_assert!(sp < MAX_SUBPROCS);
     // PURGE BEFORE ORPHANING (`abandoned_page_purge`, on by default). Until
     // some other thread adopts this segment it has no owner, so every page it
     // touched stays resident for an unbounded time and nothing can reuse it.

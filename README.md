@@ -64,8 +64,32 @@ The null arm is **1.17%** — wider than either effect. The honest reading is
 - The full mimalloc-bench corpus. Three workloads, not the suite — the
   project's own v1 gate (geomean within 10%, no bench >25% behind, RSS within
   15%) is **not yet demonstrated**.
-- RSS. No systematic footprint sweep.
-- aarch64. Code paths exist and compile; they have never been executed.
+- RSS. No systematic footprint sweep. Three things *were* measured in 0.4.0 on
+  aarch64-apple-darwin, and one of them is a caveat, not a win:
+  - The decommit primitive now returns **100.1%** of touched pages to the OS
+    (it returned **6.4%** before the fix — `MADV_DONTNEED` is advisory-only for
+    anonymous memory on Darwin).
+  - **With purging enabled** (`purge_delay = 0`), a 6-minute thread-churn soak
+    held RSS flat at **9.4 MiB**, slope −0.02 MiB/min.
+  - **With the shipped default** (`purge_delay = -1`, purging OPT-IN), a
+    25-minute soak against a *bounded* live set (~175 MiB mean) sat at ~650 MiB
+    RSS and drifted **+1.45 ± 0.70 MiB/min** over the full run. The drift
+    decelerates (first half +2.42, second half +1.19 ± 1.87 — no longer
+    distinguishable from zero) and RSS does not track the live set
+    (corr = +0.03), which is consistent with retention approaching a plateau
+    rather than an unbounded leak — but **25 minutes cannot tell those two
+    apart**, and this is not claimed to be settled.
+- Long-running behaviour beyond ~25 minutes. Multi-day fragmentation is unknown.
+  Long-lived services should set `purge_delay >= 0` rather than rely on the
+  opt-in default.
+
+**aarch64 is now executed** (0.4.0). It was not, through 0.3.2, and that first
+execution cost seven defects — two of them memory-safety class, including a
+`thread_id()` that read the wrong system register on Darwin and let distinct
+threads collide onto one ownership id. See the 2026-08-08 entries in
+[docs/LEDGER.md](docs/LEDGER.md). Three of the seven were platform-independent
+use-after-frees that x86-64 had been surviving by luck, so **0.3.2 and earlier
+should be treated as unsound on every target**, not merely on aarch64.
 
 There is no "faster than mimalloc" claim anywhere in this repository, because
 the evidence for one does not exist yet.
@@ -172,9 +196,10 @@ being flat or slower**, which is most of them.
 | target | status |
 |---|---|
 | x86-64 Linux | tested; the LD_PRELOAD and measurement path |
-| x86-64 Windows | tested |
-| aarch64 | compiles; **never executed** |
-| wasm32-unknown-unknown | tested in a VM self-test |
+| x86-64 Windows | compiles; last executed before the 0.4.0 fixes |
+| aarch64 macOS (Apple Silicon, 16 KiB pages) | **tested** — full suite, 100/100 stress soak, `#[global_allocator]` app |
+| aarch64 Linux | **tested** — full suite, 40/40 stress soak |
+| wasm32-unknown-unknown | **executed** — `bench/wasm-selftest.mjs` passes in a Node VM; not exercised in a browser |
 
 ## License
 
