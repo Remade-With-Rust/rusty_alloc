@@ -22,8 +22,10 @@ does not offer.
   implementation as a differential oracle on every change.
 - **Runs on WebAssembly** with no C toolchain and no emscripten.
 
-> **Status: `0.3.2` — a 0.x release. The API is not frozen, and parts of the
-> performance evidence are still missing.** See
+> **Status: `0.4.0` — a 0.x release. The API is not frozen, and parts of the
+> performance evidence are still missing.** 0.4.0 fixed three
+> platform-independent use-after-frees, so **0.3.2 and earlier should be treated
+> as unsound on every target** — upgrade rather than pin. See
 > [What is and isn't measured](#what-is-and-isnt-measured) — we count
 > instructions, not seconds, and make no speed claim.
 
@@ -195,7 +197,10 @@ bash bench/opscan.sh                 # per-operation scan vs mimalloc
 
 Every change runs Windows + Linux suites (all features), `clippy -D warnings`,
 Miri, a 640-thread churn probe, a wasm VM self-test, and a deterministic
-instruction A/B against the C oracle. [`docs/LEDGER.md`](docs/LEDGER.md)
+instruction A/B against the C oracle. The 0.4.0 release gates additionally ran
+the full workspace green on `aarch64-apple-darwin`, `x86_64-apple-darwin`,
+`aarch64-unknown-linux-gnu` and `x86_64-unknown-linux-gnu`, with a 100/100
+`stress_mt` release soak (0.3.2 managed 0/20). [`docs/LEDGER.md`](docs/LEDGER.md)
 records what each milestone measured — **including the changes reverted for
 being flat or slower**, which is most of them.
 
@@ -204,10 +209,35 @@ being flat or slower**, which is most of them.
 | target | status |
 |---|---|
 | x86-64 Linux | tested; the LD_PRELOAD and measurement path |
-| x86-64 Windows | compiles; last executed before the 0.4.0 fixes |
+| x86-64 Windows | **tested on 0.4.0** — full suite green; 640-thread create/teardown churn clean; exercised as `#[global_allocator]` by six shipping codec projects (see below) |
 | aarch64 macOS (Apple Silicon, 16 KiB pages) | **tested** — full suite, 100/100 stress soak, `#[global_allocator]` app |
 | aarch64 Linux | **tested** — full suite, 40/40 stress soak |
 | wasm32-unknown-unknown | **executed** — `bench/wasm-selftest.mjs` passes in a Node VM; not exercised in a browser |
+
+### The x86-64 Windows evidence (0.4.0)
+
+The 0.4.0 gates ran on Darwin and Linux; Windows was validated separately,
+downstream, on the projects that consume it as `#[global_allocator]`. Every
+result below is **byte-identical output before and after the allocator swap**,
+not merely "it ran":
+
+| project | gate |
+|---|---|
+| [`rusty_av2d`](https://crates.io/crates/rusty_av2d) | 45/45 AV2 conformance clips byte-identical vs AOM's `avmdec`, + 111 tests |
+| `rusty_av1d` | 12/12 test-vector md5s unchanged; identical at 1/2/4/8 threads; 10/10 clean process exits |
+| `rusty_av1e` | encoder bitstream FNV `c54bb3b1b3ccbad1` unchanged |
+| `remade_ffmpeg_rs` | workspace suites + a 30,000-input fuzz across 16 decoders, zero panics |
+| `rusty-opus` / `rusty_png` / `rusty_jpeg` | 48 / 61 / 48 tests |
+
+Plus a targeted probe for the one 0.4.0 change that reaches Windows — the
+subproc tag moving off Rust `thread_local!` storage, because destruction order
+against a platform TLS destructor (`FlsAlloc` here) is unspecified: 16 threads ×
+40 rounds of mixed-size-class churn, 640 create/teardown cycles, clean.
+
+**Note for anyone running the suite:** use a debug build. The allocation
+counters behind `alloc::stats()` are `#[cfg(debug_assertions)]`, so
+`churn_sweep_randomized` — which asserts on them — fails under
+`cargo test --release` on every platform, not just Windows.
 
 ## License
 

@@ -5,9 +5,17 @@ v2.4.5 architecture (32 MiB segments, free-list-sharded pages, lock-free
 cross-thread frees), rebuilt from the design rather than transliterated from
 the C.
 
-**Status: `0.3.2` — a 0.x release.** The API is not frozen; the performance
+**Status: `0.4.0` — a 0.x release.** The API is not frozen; the performance
 evidence is not yet complete. Read [What is and isn't
 measured](#what-is-and-isnt-measured) before depending on it.
+
+> **Upgrade from 0.3.x.** 0.4.0 fixed three platform-independent
+> use-after-frees on the abandon → adopt → reuse path, which x86-64 had been
+> surviving by luck. **Treat 0.3.2 and earlier as unsound on every target.**
+
+Executed and green on `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
+`aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-pc-windows-msvc`, and
+`wasm32-unknown-unknown` (Node VM self-test).
 
 ## What it is
 

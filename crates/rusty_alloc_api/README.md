@@ -3,10 +3,13 @@
 The safe Rust surface over [`rusty_alloc`](https://crates.io/crates/rusty_alloc),
 a pure-Rust remake of mimalloc.
 
-**Status: `0.3.2` — a 0.x release.** See the
+**Status: `0.4.0` — a 0.x release.** See the
 [`rusty_alloc`](https://crates.io/crates/rusty_alloc) crate page for exactly
 what has and has not been measured — in particular, there is no wall-clock
 evidence yet and therefore no speed claim.
+
+> **Upgrade from 0.3.x.** 0.4.0 fixed three platform-independent
+> use-after-frees; treat 0.3.2 and earlier as unsound on every target.
 
 ## What it gives you
 
