@@ -10,16 +10,18 @@ members = [
 ]
 
 [workspace.package]
-# 0.x: the API is not frozen. The allocator is complete and gated; parts of the
-# performance EVIDENCE are not — the full mimalloc-bench corpus is still
-# unmeasured, and RSS has two data points rather than a sweep. The README says
-# so under "What is and isn't measured"; keep it there and current.
+# 0.x: the API is not frozen. The allocator is complete and gated; the
+# wall-clock half of the performance evidence still needs a quiet box. The
+# README says so under "What is and isn't measured"; keep it there and current.
 #
-# 0.4.0, not 0.3.3: aarch64's first real execution turned up seven defects, and
-# fixing them CHANGED PUBLIC API — `Heap::adopt_segment` now returns `bool`
-# (ignoring it was the use-after-free) and `HeapBox` gained a `subproc` field.
-# Under 0.x semver a breaking change bumps the minor.
-version = "0.4.0"
+# 0.7.0: the 2026-08-19 fast-path campaign (docs/LEDGER.md). Every operation
+# of the per-op scan and all three real-program arms now measure at-or-below
+# mimalloc on instructions retired; the full mimalloc-bench corpus and the
+# 10-program real-world sweep run clean (correctness). Public API changed
+# under 0.x rules: `page_push_local` returns the post-decrement count,
+# `Heap::malloc_generic` is crate-visible, and the TLS slot's empty state is
+# a sentinel rather than null.
+version = "0.7.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/remade-with-rust/rusty_alloc"

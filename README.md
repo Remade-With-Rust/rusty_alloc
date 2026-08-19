@@ -13,116 +13,87 @@ does not offer.
 
 ## ⚡ The headline
 
-- **Parity with mimalloc on instructions retired**, and ~16% fewer than glibc,
-  on real programs under `LD_PRELOAD`.
+- **At-or-below mimalloc on instructions retired** — on real programs under
+  `LD_PRELOAD` *and* on every operation of the per-op scan — and ~17% fewer
+  than glibc.
 - **A double free aborts instead of corrupting.** Upstream mimalloc accepts it
   silently in release builds; we detect it on both the local and the
-  cross-thread path and abort, for a measured ~0.4%.
+  cross-thread path and abort.
 - **~150 of mimalloc's ~157 `mi_*` entry points**, gated against the C
   implementation as a differential oracle on every change.
 - **Runs on WebAssembly** with no C toolchain and no emscripten.
 
-> **Status: `0.4.0` — a 0.x release. The API is not frozen, and parts of the
-> performance evidence are still missing.** 0.4.0 fixed three
-> platform-independent use-after-frees, so **0.3.2 and earlier should be treated
-> as unsound on every target** — upgrade rather than pin. See
-> [What is and isn't measured](#what-is-and-isnt-measured) — we count
-> instructions, not seconds, and make no speed claim.
+> **Status: `0.7.0` — a 0.x release; the API is not frozen.**
+> Upgrading from 0.3.x or earlier is mandatory, not optional: 0.4.0 fixed
+> three platform-independent use-after-frees, so **treat 0.3.2 and earlier as
+> unsound on every target.**
 
-## Performance (this machine, deterministic)
+## Performance (deterministic instruction counts)
 
-Instructions retired under callgrind, x86-64 Linux, real programs via
-`LD_PRELOAD`. Repeats to 4–6 significant figures.
+Instructions retired under callgrind, x86-64 Linux, `LD_PRELOAD`, repeats to
+4–6 significant figures. Real programs:
 
 | workload | vs mimalloc | vs glibc |
 |---|---:|---:|
-| lua | **0.99** | 0.84 |
-| perl | **1.01** | 0.83 |
-| sqlite | **1.00** | 1.00 |
+| lua | **0.98** | 0.83 |
+| perl | **1.00** | 0.82 |
+| sqlite | **1.00** | 0.99 |
 
-**Method.** `bench/icount-arms.sh`. Instruction counts, not wall-clock — chosen
-deliberately, because this machine's timing noise floor is wider than the
-effect (see below). Counts are immune to scheduler, thermal and load artifacts;
-they are also *not* a measure of time.
+Per-operation (`bench/opscan.sh`, one neutral C driver, all arms preloaded —
+**all 13 operations measure at-or-below mimalloc**):
 
-### What is and isn't measured
+| op | ra/mi | op | ra/mi |
+|---|---:|---|---:|
+| small / med | 0.70 | batch lifo/fifo | 0.99 |
+| big / large | 0.77 | aligned | 0.87 |
+| realloc | 0.78 | mixed | 0.89 |
+| huge | 0.01 | calloc | 0.94 |
 
-**Wall-clock: measured, and it cannot resolve the difference.**
-`bench/wallclock.sh` runs pinned, ABBA-interleaved, N=31, microsecond timer,
-with a **null arm** — the same allocator compared against itself:
+**These are counts, not seconds.** Wall-clock cannot be resolved on the
+development machine (the null arm — the same allocator against itself — reads
+±1.2%, wider than the effect), so no wall-clock speed claim is made anywhere
+in this repository. Reproduce with `bash bench/icount-arms.sh` and
+`bash bench/opscan.sh`.
 
-| arm | median ratio |
-|---|---:|
-| **null (rusty_alloc vs ITSELF)** | **1.0117** |
-| perl, rusty_alloc vs mimalloc | 1.0009 |
-| sqlite, rusty_alloc vs mimalloc | 1.0091 |
+**RSS:** long-lived services should set `purge_delay >= 0` — that is the
+configuration with flat, measured RSS (a 6-minute thread-churn soak held
+9.4 MiB, slope −0.02 MiB/min). The shipped default leaves purging opt-in.
 
-The null arm is **1.17%** — wider than either effect. The honest reading is
-**"at parity, below measurement resolution"**. Reproduce on a quiet box with
-`N=31 bash bench/wallclock.sh`.
+## Correctness evidence
 
-**Scope that claim to these workloads.** A 0.4.0 re-run against the same
-mimalloc oracle, but on a pure allocation-CHURN microbenchmark (all arms
-`LD_PRELOAD`ed into one neutral C binary, instructions retired), reads
-**1.1342 × mimalloc** — 13.4% behind — while still being **0.67 ×** glibc.
-Real programs dilute allocator cost among everything else they do; a loop that
-does almost nothing but `malloc`/`free` does not. "At parity" is measured on
-lua/perl/sqlite and should not be read as a general property.
+Every change runs Windows + Linux suites (all features), `clippy -D warnings`,
+Miri over the whole target, a 640-thread churn probe, a wasm VM self-test, and
+deterministic instruction A/Bs against the C oracle. On top of that, 0.7.0 was
+validated against real workloads:
 
-**Not measured, and therefore not claimed:**
+- **Real programs, byte-identical output:** jq, sqlite3, python3, git, xz,
+  zstd, lua and perl each produce bit-for-bit identical output under
+  rusty_alloc, mimalloc and glibc — 144/144 runs across three interleaved
+  passes (`corpus/realworld.sh`).
+- **The full mimalloc-bench corpus runs clean:** 19/19 benchmark
+  configurations — including the 8–16-thread storms (larson, mstress, rptest,
+  xmalloc-test, sh6/sh8bench) — complete under rusty_alloc
+  (`corpus/sweep-all.sh`).
+- **Release `stress_mt` soak 30/30**; Miri-clean including the multithreaded
+  abandon/adopt storm.
+- Tested on x86-64 and aarch64 Linux, aarch64 and x86-64 macOS, x86-64
+  Windows, and executed on `wasm32-unknown-unknown`; consumed as
+  `#[global_allocator]` by shipping codec projects with byte-identical output
+  before and after the allocator swap.
 
-- The full mimalloc-bench corpus. Three workloads, not the suite — the
-  project's own v1 gate (geomean within 10%, no bench >25% behind, RSS within
-  15%) is **not yet demonstrated**.
-- RSS. No systematic footprint sweep. Three things *were* measured in 0.4.0 on
-  aarch64-apple-darwin, and one of them is a caveat, not a win:
-  - The decommit primitive now returns **100.1%** of touched pages to the OS
-    (it returned **6.4%** before the fix — `MADV_DONTNEED` is advisory-only for
-    anonymous memory on Darwin).
-  - **With purging enabled** (`purge_delay = 0`), a 6-minute thread-churn soak
-    held RSS flat at **9.4 MiB**, slope −0.02 MiB/min.
-  - **With the shipped default** (`purge_delay = -1`, purging OPT-IN), a
-    25-minute soak against a *bounded* live set (~175 MiB mean) sat at ~650 MiB
-    RSS and drifted **+1.45 ± 0.70 MiB/min** over the full run. The drift
-    decelerates (first half +2.42, second half +1.19 ± 1.87 — no longer
-    distinguishable from zero) and RSS does not track the live set
-    (corr = +0.03), which is consistent with retention approaching a plateau
-    rather than an unbounded leak — but **25 minutes cannot tell those two
-    apart**, and this is not claimed to be settled.
-- Long-running behaviour beyond ~25 minutes. Multi-day fragmentation is unknown.
-  Long-lived services should set `purge_delay >= 0` rather than rely on the
-  opt-in default.
-
-**aarch64 is now executed** (0.4.0). It was not, through 0.3.2, and that first
-execution cost seven defects — two of them memory-safety class, including a
-`thread_id()` that read the wrong system register on Darwin and let distinct
-threads collide onto one ownership id. See the 2026-08-08 entries in
-[docs/LEDGER.md](docs/LEDGER.md). Three of the seven were platform-independent
-use-after-frees that x86-64 had been surviving by luck, so **0.3.2 and earlier
-should be treated as unsound on every target**, not merely on aarch64.
-
-There is no "faster than mimalloc" claim anywhere in this repository, because
-the evidence for one does not exist yet.
+[`docs/LEDGER.md`](docs/LEDGER.md) records what every milestone measured —
+including the changes reverted for being flat or slower.
 
 ## What is this?
 
-A reimplementation, not a binding. There are excellent mimalloc *bindings* for
-Rust; this is not one of them. Every line of the allocator is Rust, the C
-mimalloc in this repository is a development-only differential oracle, and it
-is never a dependency and never published.
+A reimplementation, not a binding. Every line of the allocator is Rust; the C
+mimalloc in this repository is a development-only differential oracle, never a
+dependency, never published.
 
 `unsafe` is confined to the places an allocator genuinely needs it — the OS
 primitive layer, page and segment metadata, and the lock-free cross-thread
 protocol — with a stated invariant on every block, `unsafe_op_in_unsafe_fn`
 denied and `undocumented_unsafe_blocks` denied workspace-wide.
-
-## The Remade With Rust ecosystem
-
-| project | what |
-|---|---|
-| [rusty_alloc](https://github.com/remade-with-rust/rusty_alloc) | this — pure-Rust general-purpose allocator |
-| [rusty_h264](https://github.com/remade-with-rust/rusty_h264) | pure-Rust H.264 encoder and decoder |
-| [Mata Network](https://www.mata.network/) | the parent organisation |
 
 ## Features
 
@@ -132,27 +103,23 @@ abandonment and adoption, first-class heaps, arenas, huge allocations, aligned
 allocation with interior-pointer recovery, and the full realloc family.
 
 **Safety** — double-free detection on both the owner and cross-thread paths;
-Miri-clean; a 640-thread churn probe; `debug_checks` for full invariant
-validation; `secure` for guard pages, encrypted free lists and guarded-object
-sampling.
+Miri-clean; `debug_checks` for full invariant validation; `secure` for guard
+pages, encrypted free lists and guarded-object sampling (measured cost 4–7%).
 
-**Portability** — x86-64 and aarch64, Linux and Windows, plus
+**Portability** — x86-64 and aarch64, Linux, macOS and Windows, plus
 `wasm32-unknown-unknown` via `memory.grow`.
 
 ## Install
 
 ```toml
 [dependencies]
-rusty_alloc-api = "0.3"
+rusty_alloc-api = "0.7"
 ```
 
 | crate | docs | what |
 |---|---|---|
 | [`rusty_alloc`](https://crates.io/crates/rusty_alloc) | [docs.rs](https://docs.rs/rusty_alloc) | allocator core |
 | [`rusty_alloc-api`](https://crates.io/crates/rusty_alloc-api) | [docs.rs](https://docs.rs/rusty_alloc-api) | safe Rust surface — start here |
-
-The FFI, LD_PRELOAD override, bench and wasm crates are `publish = false`:
-harnesses, fixtures and native artifacts, not libraries.
 
 ## Quick start
 
@@ -180,7 +147,6 @@ crates/rusty_alloc_wasm       wasm self-test fixture
 oracle/mimalloc               C mimalloc @ v2.4.5 — dev-only oracle
 corpus/mimalloc-bench         the 1:1 benchmark corpus
 docs/LEDGER.md                one entry per milestone: numbers, method, reverts
-docs/plans/rusty_alloc_v1.md  plan of record — API inventory, gate ladder
 ```
 
 ## Benchmarking
@@ -189,55 +155,14 @@ docs/plans/rusty_alloc_v1.md  plan of record — API inventory, gate ladder
 git submodule update --init oracle/mimalloc corpus/mimalloc-bench
 bash oracle/build.sh                 # build the C oracle arms
 bash bench/icount-arms.sh            # deterministic instruction A/B
-N=31 bash bench/wallclock.sh         # wall-clock, with a null arm
 bash bench/opscan.sh                 # per-operation scan vs mimalloc
+bash corpus/sweep-all.sh             # full-corpus correctness sweep
+bash corpus/realworld.sh             # real programs, checksummed, 3 arms
 ```
 
-## Gates
-
-Every change runs Windows + Linux suites (all features), `clippy -D warnings`,
-Miri, a 640-thread churn probe, a wasm VM self-test, and a deterministic
-instruction A/B against the C oracle. The 0.4.0 release gates additionally ran
-the full workspace green on `aarch64-apple-darwin`, `x86_64-apple-darwin`,
-`aarch64-unknown-linux-gnu` and `x86_64-unknown-linux-gnu`, with a 100/100
-`stress_mt` release soak (0.3.2 managed 0/20). [`docs/LEDGER.md`](docs/LEDGER.md)
-records what each milestone measured — **including the changes reverted for
-being flat or slower**, which is most of them.
-
-## Platform support
-
-| target | status |
-|---|---|
-| x86-64 Linux | tested; the LD_PRELOAD and measurement path |
-| x86-64 Windows | **tested on 0.4.0** — full suite green; 640-thread create/teardown churn clean; exercised as `#[global_allocator]` by six shipping codec projects (see below) |
-| aarch64 macOS (Apple Silicon, 16 KiB pages) | **tested** — full suite, 100/100 stress soak, `#[global_allocator]` app |
-| aarch64 Linux | **tested** — full suite, 40/40 stress soak |
-| wasm32-unknown-unknown | **executed** — `bench/wasm-selftest.mjs` passes in a Node VM; not exercised in a browser |
-
-### The x86-64 Windows evidence (0.4.0)
-
-The 0.4.0 gates ran on Darwin and Linux; Windows was validated separately,
-downstream, on the projects that consume it as `#[global_allocator]`. Every
-result below is **byte-identical output before and after the allocator swap**,
-not merely "it ran":
-
-| project | gate |
-|---|---|
-| [`rusty_av2d`](https://crates.io/crates/rusty_av2d) | 45/45 AV2 conformance clips byte-identical vs AOM's `avmdec`, + 111 tests |
-| `rusty_av1d` | 12/12 test-vector md5s unchanged; identical at 1/2/4/8 threads; 10/10 clean process exits |
-| `rusty_av1e` | encoder bitstream FNV `c54bb3b1b3ccbad1` unchanged |
-| `remade_ffmpeg_rs` | workspace suites + a 30,000-input fuzz across 16 decoders, zero panics |
-| `rusty-opus` / `rusty_png` / `rusty_jpeg` | 48 / 61 / 48 tests |
-
-Plus a targeted probe for the one 0.4.0 change that reaches Windows — the
-subproc tag moving off Rust `thread_local!` storage, because destruction order
-against a platform TLS destructor (`FlsAlloc` here) is unspecified: 16 threads ×
-40 rounds of mixed-size-class churn, 640 create/teardown cycles, clean.
-
-**Note for anyone running the suite:** use a debug build. The allocation
-counters behind `alloc::stats()` are `#[cfg(debug_assertions)]`, so
-`churn_sweep_randomized` — which asserts on them — fails under
-`cargo test --release` on every platform, not just Windows.
+Note for anyone running the test suite: use a debug build — the allocation
+counters behind `alloc::stats()` are `#[cfg(debug_assertions)]`, matching
+upstream's `MI_STAT` rule.
 
 ## License
 

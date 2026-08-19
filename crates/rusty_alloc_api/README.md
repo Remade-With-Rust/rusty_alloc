@@ -1,15 +1,17 @@
-# rusty_alloc_api
+# rusty_alloc-api
 
 The safe Rust surface over [`rusty_alloc`](https://crates.io/crates/rusty_alloc),
-a pure-Rust remake of mimalloc.
+a pure-Rust remake of mimalloc that measures at-or-below mimalloc on
+instructions retired — on real programs and on every operation of the per-op
+scan — while detecting double frees that upstream silently accepts.
 
-**Status: `0.4.0` — a 0.x release.** See the
-[`rusty_alloc`](https://crates.io/crates/rusty_alloc) crate page for exactly
-what has and has not been measured — in particular, there is no wall-clock
-evidence yet and therefore no speed claim.
+**Status: `0.7.0` — a 0.x release.** See the
+[`rusty_alloc`](https://crates.io/crates/rusty_alloc) crate page for the
+performance evidence and its scope (instruction counts, not wall-clock).
 
-> **Upgrade from 0.3.x.** 0.4.0 fixed three platform-independent
-> use-after-frees; treat 0.3.2 and earlier as unsound on every target.
+> **Upgrade from 0.3.x or earlier — mandatory.** 0.4.0 fixed three
+> platform-independent use-after-frees; treat 0.3.2 and earlier as unsound on
+> every target.
 
 ## What it gives you
 

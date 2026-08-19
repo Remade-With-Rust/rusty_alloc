@@ -3,71 +3,65 @@
 A pure-Rust remake of [mimalloc](https://github.com/microsoft/mimalloc) — the
 v2.4.5 architecture (32 MiB segments, free-list-sharded pages, lock-free
 cross-thread frees), rebuilt from the design rather than transliterated from
-the C.
+the C. No C anywhere in the product; the C mimalloc is a development-only
+differential oracle and is never a dependency.
 
-**Status: `0.4.0` — a 0.x release.** The API is not frozen; the performance
-evidence is not yet complete. Read [What is and isn't
-measured](#what-is-and-isnt-measured) before depending on it.
+**Status: `0.7.0` — a 0.x release; the API is not frozen.**
 
-> **Upgrade from 0.3.x.** 0.4.0 fixed three platform-independent
-> use-after-frees on the abandon → adopt → reuse path, which x86-64 had been
-> surviving by luck. **Treat 0.3.2 and earlier as unsound on every target.**
+> **Upgrade from 0.3.x or earlier — mandatory.** 0.4.0 fixed three
+> platform-independent use-after-frees on the abandon → adopt → reuse path.
+> **Treat 0.3.2 and earlier as unsound on every target.**
 
-Executed and green on `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
-`aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-pc-windows-msvc`, and
-`wasm32-unknown-unknown` (Node VM self-test).
+Tested on x86-64/aarch64 Linux, aarch64/x86-64 macOS and x86-64 Windows;
+executed on `wasm32-unknown-unknown` (Node VM self-test, no emscripten).
 
 ## What it is
 
-- **~150 of mimalloc's ~157 `mi_*` entry points**, semantics-for-semantics.
-- **Safe by default where it counts.** A double free is *detected and aborted*,
-  not silently accepted. Upstream mimalloc does not detect this in release
-  builds; we chose to, at a measured cost of ~0.4% on perl and ~0.2% on sqlite.
-  Handing the same block to two owners is the failure this project exists to
-  prevent, so paying for the check is the point.
-- **No C anywhere in the product.** The C mimalloc in this repository is a
-  development-only differential oracle; it is never a dependency and is never
-  published.
-- **Runs on WebAssembly** (`wasm32-unknown-unknown`) via `memory.grow`, with no
-  C toolchain and no emscripten.
+- **~150 of mimalloc's ~157 `mi_*` entry points**, semantics-for-semantics,
+  gated against the C implementation as a differential oracle.
+- **A double free is detected and aborted**, on both the owner and
+  cross-thread paths. Upstream mimalloc accepts it silently in release builds;
+  handing the same block to two owners is the failure this project exists to
+  prevent.
+- **Runs on WebAssembly** via `memory.grow`, with no C toolchain.
 
-## What is and isn't measured
+## Performance (instruction counts, not seconds)
 
-**Measured**, deterministically, via callgrind instructions retired on x86-64
-Linux under `LD_PRELOAD`:
+Measured deterministically via callgrind instructions retired, x86-64 Linux,
+`LD_PRELOAD`:
 
 | workload | vs mimalloc | vs glibc |
 |---|---:|---:|
-| lua | 0.99 | 0.84 |
-| perl | 1.01 | 0.83 |
-| sqlite | 1.00 | 1.00 |
+| lua | **0.98** | 0.83 |
+| perl | **1.00** | 0.82 |
+| sqlite | **1.00** | 0.99 |
 
-That is parity with mimalloc and roughly 16% fewer instructions than glibc.
+The per-operation scan (small/med/big/large/huge, calloc, realloc, aligned,
+usable, batch and mixed working-set ops) measures **at-or-below mimalloc on
+all 13 operations**. Wall-clock time is deliberately not claimed: the
+measurement box cannot resolve it above its own noise floor, and instructions
+are not seconds.
 
-**NOT measured, and therefore not claimed:**
-
-- **Wall-clock time.** Every number above counts instructions. Instructions and
-  time are not the same thing, and we have not established that this build is
-  *faster* in seconds.
-- **The full mimalloc-bench corpus.** Three workloads, not the suite.
-- **RSS.** No systematic memory-footprint sweep.
-- **aarch64.** Code paths exist and compile; they have never been executed.
-
-There is no "faster than mimalloc" claim here, because the evidence for one
-does not exist yet.
+Correctness on real software: jq, sqlite3, python3, git, xz, zstd, lua and
+perl produce **byte-identical output** under rusty_alloc, mimalloc and glibc;
+the full mimalloc-bench corpus (19 configurations, including the 8–16-thread
+storms) runs clean; Miri is clean over the whole target.
 
 ## Usage
 
 This crate is the allocator core. For the ergonomic Rust surface
 (`GlobalAlloc`, first-class `Heap`, the `Allocator` trait), use
-[`rusty_alloc_api`](https://crates.io/crates/rusty_alloc_api).
+[`rusty_alloc-api`](https://crates.io/crates/rusty_alloc-api).
+
+Long-lived services should set `purge_delay >= 0` — the configuration with
+flat, measured RSS. The shipped default leaves purging opt-in.
 
 ## Features
 
 | feature | what |
 |---|---|
 | `debug_checks` | full invariant validation: list walks, span tiling, page canaries |
-| `secure` | guard pages, encrypted free lists, guarded-object sampling |
+| `secure` | guard pages, encrypted free lists, guarded-object sampling (measured cost 4–7%) |
 | `profile` | feature-gated path profiler |
 
 Statistics counters follow upstream's `MI_STAT` rule: present in debug builds,
