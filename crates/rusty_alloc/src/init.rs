@@ -65,6 +65,46 @@ pub struct HeapBox {
 
 const _: () = assert!(core::mem::offset_of!(HeapBox, delayed) == 0);
 
+/// Wrapper so the empty sentinel box can be a `static`.
+#[repr(transparent)]
+pub struct EmptyHeapBox(HeapBox);
+
+// SAFETY: the sentinel is never written and never escapes to remote threads:
+// no page ever stores its `delayed` address in `xheap` (pages are re-homed
+// only by REAL heaps), its `owner_tid` of 0 matches no live thread, and every
+// reader goes through raw-pointer READS — `heap_box_fast` documents that no
+// `&mut` may ever be formed to it. It exists purely so the malloc fast path
+// has a valid heap to read before this thread has created one.
+unsafe impl Sync for EmptyHeapBox {}
+
+/// The "no heap yet" sentinel: every `direct` slot holds the empty PAGE
+/// sentinel, so a fresh thread's first malloc falls through to the generic
+/// path — which detects this box and performs the real thread init — without
+/// the fast path ever testing for it. This is upstream's `_mi_heap_empty`
+/// trick, and the exact design our own [`crate::page::EMPTY_PAGE`] already
+/// uses one level down: replace a null-test on the hot path with a sentinel
+/// whose data routes the miss to the slow path for free.
+///
+/// `export_name` (not mangled) because the x86-64 Linux TLS slot's `.tdata`
+/// initializer below names it in assembly; `.hidden` there keeps it out of
+/// the cdylib's export table.
+#[unsafe(export_name = "__ra_empty_heap_box")]
+pub static EMPTY_HEAP_BOX: EmptyHeapBox = EmptyHeapBox(HeapBox {
+    delayed: DelayedList::new(),
+    next_box: AtomicPtr::new(ptr::null_mut()),
+    owner_tid: 0,
+    subproc: AtomicUsize::new(0),
+    tag: 0,
+    allow_destroy: false,
+    heap: UnsafeCell::new(Heap::new()),
+});
+
+/// Pointer to the shared empty heap box.
+#[inline]
+pub const fn empty_heap_box_ptr() -> *mut HeapBox {
+    &raw const EMPTY_HEAP_BOX.0 as *mut HeapBox
+}
+
 /// Recover the owning HeapBox from a page's `xheap` value (the container-of
 /// trick over the offset-0 delayed list).
 ///
@@ -146,8 +186,9 @@ fn heaps_unregister(hb: *mut HeapBox) {
 ///
 /// **Why this is sound where a thread-pointer-keyed side table is not.** The
 /// storage IS the thread's own TLS block. Every thread gets a fresh block
-/// initialised from the (all-zero) `.tbss` image when it is created, so a
-/// recycled TCB cannot hand a new thread a dead thread's heap — the staleness
+/// initialised from the `.tdata` template (the empty-heap sentinel) when it
+/// is created, so a recycled TCB cannot hand a new thread a dead thread's
+/// heap — the staleness
 /// question that made the keyed-cache design a P0 risk simply does not arise
 /// here. What initial-exec costs instead is a LOAD-TIME constraint: it needs a
 /// slot in the static TLS block, so a `dlopen` long after startup could fail
@@ -158,19 +199,26 @@ fn heaps_unregister(hb: *mut HeapBox) {
 mod heap_tls {
     use super::HeapBox;
 
-    // An 8-byte thread-local slot. `.tbss` is the zero-initialised TLS
-    // section, so this reads as null on every new thread — which is exactly
-    // the "not yet created" state `heap_box` tests for. `.hidden` makes the
-    // symbol non-preemptible, which is what permits the initial-exec
-    // (GOTTPOFF) relocation instead of a general-dynamic call.
+    // An 8-byte thread-local slot. `.tdata` (not `.tbss`): the slot is
+    // INITIALISED to the empty-heap sentinel, so every new thread reads a
+    // valid heap pointer from its very first malloc and the fast path needs
+    // no "not yet created" test at all — the sentinel's empty direct table
+    // routes the first allocation to the generic path, which performs the
+    // real init there (upstream's `_mi_heap_empty` design). The loader
+    // relocates the `.quad` in the TLS template once at load time; every
+    // thread's block is then copied from that template. `.hidden` makes both
+    // symbols non-preemptible, which is what permits the initial-exec
+    // (GOTTPOFF) relocation instead of a general-dynamic call, and keeps the
+    // sentinel out of the cdylib's export table.
     core::arch::global_asm!(
-        ".section .tbss,\"awT\",@nobits",
+        ".section .tdata,\"awT\",@progbits",
         ".globl __ra_tls_heap",
         ".hidden __ra_tls_heap",
+        ".hidden __ra_empty_heap_box",
         ".type __ra_tls_heap,@object",
         ".p2align 3",
         "__ra_tls_heap:",
-        ".zero 8",
+        ".quad __ra_empty_heap_box",
         ".size __ra_tls_heap,8",
         ".text",
     );
@@ -238,12 +286,13 @@ mod heap_tls {
 mod heap_tls {
     use super::HeapBox;
     use core::cell::Cell;
-    use core::ptr;
 
     std::thread_local! {
         /// Fast-path heap pointer. Const-init + !Drop ⇒ plain TLS access, no
-        /// lazy-init branch beyond the null check, no allocation ever.
-        static HEAP_PTR: Cell<*mut HeapBox> = const { Cell::new(ptr::null_mut()) };
+        /// lazy-init branch, no allocation ever. Initialised to the
+        /// empty-heap SENTINEL (never null) so the malloc fast path can read
+        /// through it unconditionally; see `EMPTY_HEAP_BOX`.
+        static HEAP_PTR: Cell<*mut HeapBox> = const { Cell::new(super::empty_heap_box_ptr()) };
     }
 
     #[inline(always)]
@@ -411,7 +460,31 @@ pub fn for_each_heap(f: &mut dyn FnMut(&crate::heap::Heap)) {
 #[inline]
 pub fn heap_box() -> *mut HeapBox {
     let hb = heap_tls::get();
-    if !hb.is_null() {
+    if hb != empty_heap_box_ptr() {
+        hb
+    } else {
+        init_thread_heap()
+    }
+}
+
+/// This thread's heap box WITHOUT the created-yet test — may return the
+/// shared empty sentinel. For the malloc fast path only.
+///
+/// # Safety (for callers)
+/// The returned box may be [`EMPTY_HEAP_BOX`], which is shared between every
+/// uninitialised thread: callers must perform RAW-POINTER READS ONLY and must
+/// never form a `&mut` (or write) through it. Route any miss to
+/// [`ensure_heap`] before mutating anything.
+#[inline]
+pub fn heap_box_fast() -> *mut HeapBox {
+    heap_tls::get()
+}
+
+/// Upgrade a possibly-sentinel box from [`heap_box_fast`] to this thread's
+/// real, initialised heap box.
+#[inline]
+pub fn ensure_heap(hb: *mut HeapBox) -> *mut HeapBox {
+    if hb != empty_heap_box_ptr() {
         hb
     } else {
         init_thread_heap()
@@ -638,7 +711,9 @@ pub unsafe fn thread_done(hb: *mut HeapBox) {
         };
         let _ = os::free(blockdesc);
     }
-    heap_tls::set(ptr::null_mut());
+    // Back to the SENTINEL, not null — the slot is never null, so a
+    // post-teardown malloc re-enters the generic path and re-initialises.
+    heap_tls::set(empty_heap_box_ptr());
 }
 
 /// `mi_heap_delete`: free the heap structure, MIGRATING its live pages and

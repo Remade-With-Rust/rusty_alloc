@@ -61,10 +61,63 @@ fn my_heap() -> *mut Heap {
 
 /// Allocate `size` bytes (8-byte aligned; 16-multiple bins are 16-aligned).
 /// `malloc(0)` returns a valid unique pointer.
+///
+/// The fast path here reads through RAW POINTERS only and takes ONE branch
+/// beyond the size class test. The TLS slot is never null — an uninitialised
+/// thread holds the shared empty-heap SENTINEL, whose direct table of empty
+/// pages routes the first allocation to [`malloc_slow`] exactly as an
+/// exhausted real page does — so the "is this thread initialised?" test is
+/// gone from the hot path entirely, and no `&mut` is ever formed on a heap
+/// that might be the shared sentinel. The miss is a tail call, so the fast
+/// path also needs no callee-saved registers.
 #[inline]
 pub fn malloc(size: usize) -> *mut u8 {
-    // SAFETY: exclusive &mut scope on the calling thread's own heap.
-    unsafe { (*my_heap()).malloc(size).0 }
+    let hb = init::heap_box_fast();
+    // SAFETY: raw reads only — `hb` may be the shared immortal sentinel (see
+    // `heap_box_fast`), which must never see a `&mut` or a write. `direct`
+    // entries always point at a live page of this thread's heap or at the
+    // immortal empty-page sentinel, and `page_pop` on the sentinel returns
+    // null before its first store.
+    unsafe {
+        if size <= SMALL_SIZE_MAX {
+            let w = crate::types::wsize_from_size(size);
+            let h = (*hb).heap.get();
+            let p = (*h).direct[w];
+            let b = crate::page::page_pop(p);
+            if !b.is_null() {
+                #[cfg(debug_assertions)]
+                {
+                    // Raw-pointer RMW: `b` is non-null, so `h` is this
+                    // thread's REAL heap (the sentinel never yields a block).
+                    (*h).stats.allocs += 1;
+                }
+                return b;
+            }
+        }
+        malloc_slow(hb, size)
+    }
+}
+
+/// Everything `malloc`'s fast path could not serve: an uninitialised thread
+/// (the sentinel box), a dry fast list, or a non-small size. Cold and
+/// out-of-line so the fast path carries no register setup for it; `&mut Heap`
+/// is formed only HERE, after the sentinel has been replaced by the thread's
+/// real heap.
+///
+/// # Safety
+/// `hb` must be the calling thread's TLS box: its real heap box, or the
+/// shared sentinel.
+#[cold]
+#[inline(never)]
+unsafe fn malloc_slow(hb: *mut init::HeapBox, size: usize) -> *mut u8 {
+    let hb = init::ensure_heap(hb);
+    // SAFETY: `hb` is now this thread's live, initialised box — exclusive
+    // &mut scope on the calling thread's own heap. Straight to the generic
+    // path: the fast list was dry (or the size non-small) a moment ago on
+    // this same thread, so re-running the fast path here could only repeat
+    // the miss — `mixed` measured +0.68 Ir/op for that repeat before this
+    // went direct.
+    unsafe { (*(*hb).heap.get()).malloc_generic(size).0 }
 }
 
 /// Allocate `size` zeroed bytes.
@@ -340,6 +393,22 @@ pub unsafe fn recalloc_aligned_at(
 /// sqlite 1.0029 -> 1.0033. Three attempts, three refutations — treat this as
 /// settled and do not try it a fourth time without a NEW mechanism.
 pub unsafe fn free(p: *mut u8) {
+    // SAFETY: forwarded contract.
+    unsafe { free_inline(p) }
+}
+
+/// The body of [`free`], for the ONE caller that should carry it inline: the
+/// LD_PRELOAD override's exported `free`, which otherwise pays a GOT-indirect
+/// `jmp` thunk on every call. This is NOT the thrice-refuted "#[inline] on
+/// `free`" — that inlined the body into every internal caller (realloc and
+/// friends) and lost to the register pressure it created there. Internal
+/// callers keep calling the outlined [`free`] above; only an export that IS
+/// `free` and does nothing else should use this.
+///
+/// # Safety
+/// As [`free`].
+#[inline(always)]
+pub unsafe fn free_inline(p: *mut u8) {
     if p.is_null() {
         return;
     }
@@ -350,6 +419,12 @@ pub unsafe fn free(p: *mut u8) {
     // thread has several first-class heaps. tid gates local vs remote.
     unsafe {
         let owner_tid = (*seg).thread_id.load(core::sync::atomic::Ordering::Acquire);
+        // The thread id is read BEFORE the page resolution on purpose: read
+        // after it, LLVM assigned the id to the register holding the just-
+        // computed page pointer, and every later page access had to be
+        // re-derived as `slot + (-slice_offset)` — a `neg` plus two-register
+        // addressing on the whole fast path.
+        let local = owner_tid == init::thread_id();
         // ONE page resolution, then ONE flags byte answers every question the
         // free path used to ask with separate loads (M9 brick #3): huge-vs-
         // normal segment, single-block span, interior (aligned-at) pointer.
@@ -357,7 +432,6 @@ pub unsafe fn free(p: *mut u8) {
         // offset back to slot 1.
         let pg = page_of(seg, p);
         let flags = (*pg).flags;
-        let local = owner_tid == init::thread_id();
         // ONE test decides the whole shape of the free (upstream's
         // `page->flags.full_aligned == 0`). A clear byte means: binned page in
         // a Normal segment, queued, exact pointer — so the general path's
@@ -388,14 +462,20 @@ pub unsafe fn free(p: *mut u8) {
                 // need the owning heap are the stats counter — which, like
                 // upstream's `MI_STAT`, exists only in debug builds — and
                 // retiring a page that just emptied, which is rare. So the
-                // shipped fast path is push + decrement + one zero test.
-                crate::page::page_push_local(pg, p.cast::<Block>());
+                // shipped fast path is push + decrement + ONE branch: both
+                // cold outcomes of the decrement — 0 (page emptied, retire)
+                // and negative (double free, abort) — share a single `<= 0`
+                // test on its flags, and the shared handler is reached by a
+                // tail jump. With no `call` left in the function, the fast
+                // path needs no stack adjustment at all (the M16 lesson,
+                // applied to the alignment push this time).
+                let used_now = crate::page::page_push_local(pg, p.cast::<Block>());
                 #[cfg(debug_assertions)]
                 {
                     (*owner_heap(pg)).stats.frees += 1;
                 }
-                if (*pg).used == 0 {
-                    retire_page_cold(pg);
+                if (used_now as i32) <= 0 {
+                    return retire_or_abort(pg);
                 }
             } else {
                 remote_free(pg, p.cast::<Block>());
@@ -406,20 +486,37 @@ pub unsafe fn free(p: *mut u8) {
     }
 }
 
-/// Cold tail of a fast-path free whose page just emptied: find the owning heap
-/// and retire the span.
+/// Cold tail of a fast-path free whose decrement went non-positive: 0 means
+/// the page just emptied (retire it), negative means the count wrapped — a
+/// DOUBLE FREE — and the process aborts. Folding both into one function keeps
+/// the hot path to a single rarely-taken branch AND removes the last `call`
+/// from `free`'s body, which is what lets LLVM drop the alignment push from
+/// the prologue (a `jmp` needs no aligned stack; a `call` does).
 ///
-/// Takes ONLY `pg` and re-derives the segment, for the same reason
-/// [`free_general`] takes only `p`. Passing `seg` in would keep it LIVE across
-/// the whole fast path — it is otherwise dead the moment `page_of` is done with
-/// it — just to serve the rare branch that actually needs it. Re-deriving costs
-/// one mask here; keeping it alive costs a register everywhere.
+/// Takes ONLY `pg` (+ the already-computed count) and re-derives the segment,
+/// for the same reason [`free_general`] takes only `p`. Passing `seg` in would
+/// keep it LIVE across the whole fast path — it is otherwise dead the moment
+/// `page_of` is done with it — just to serve the rare branch that actually
+/// needs it. Re-deriving costs one mask here; keeping it alive costs a
+/// register everywhere.
+///
+/// Re-reads `(*pg).used` here rather than taking it as an argument: passing
+/// the value in would give it a use beyond the hot path's compare, which is
+/// exactly what stops LLVM folding the decrement into a memory-destination
+/// `dec` whose own flags feed the branch. The field still holds the
+/// post-decrement value (owner-thread field, nothing ran in between), so the
+/// cold reload observes the same number.
 ///
 /// # Safety
-/// `pg` must be a queued, now-empty binned page owned by the calling thread.
+/// `pg` must be a queued binned page owned by the calling thread on which
+/// `page_push_local` just returned a non-positive count.
 #[cold]
 #[inline(never)]
-unsafe fn retire_page_cold(pg: *mut Page) {
+unsafe fn retire_or_abort(pg: *mut Page) {
+    // SAFETY: owner-thread page field, per the contract.
+    if (unsafe { (*pg).used } as i32) < 0 {
+        crate::page::double_free_abort();
+    }
     // SAFETY: forwarded contract; `pg` points into its own segment's header,
     // so masking it recovers that segment exactly as it would from a block.
     unsafe {

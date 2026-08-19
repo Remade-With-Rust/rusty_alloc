@@ -4,7 +4,147 @@ One entry per milestone/brick: what landed, the numbers with their method lines,
 what was reverted and **which kind** of revert (measured-worse vs within-noise).
 Newest first.
 
-## 0.4.0 — the three unmeasured things, measured (2026-08-08)
+## The batch gap CLOSED — every opscan op now at-or-ahead of mimalloc (2026-08-19)
+
+The 0.4.0 re-baseline (fresh oracle + fresh override build, sha256-matched to
+the shipped 0.4.0 artifact) put the whole remaining per-op deficit in two
+places: `batch_lifo/fifo` **+9.42 Ir/op (1.158×)** and `aligned` **+25.55
+(1.136×)**. Method throughout: `bench/opscan.sh`'s two-point estimator
+(`(Ir(2N)−Ir(N))/N`, callgrind, LD_PRELOAD into one neutral C driver) — a
+deterministic COUNT, exact to ~0.01 Ir/op, so every keep below is a one-run
+verdict. Five bricks, each disassembly-verified, and the ranking table now has
+an empty "we lose" column:
+
+| op | before | after | mi | ra/mi now |
+|---|---:|---:|---:|---:|
+| batch_lifo | 69.12 | **59.19** | 59.70 | **0.991** |
+| batch_fifo | 69.11 | **59.17** | 59.68 | **0.991** |
+| aligned | 213.44 | **163.25** | 187.89 | **0.869** |
+| small | 86.37 | **77.39** | 111.41 | 0.695 |
+| med | 94.56 | **85.75** | 123.02 | 0.697 |
+| mixed | 147.84 | **140.26** | 157.75 | 0.889 |
+| realloc | 406.05 | **388.03** | 499.82 | 0.776 |
+| calloc | 156.50 | **151.50** | 160.89 | 0.942 |
+| big / large | 177.00 | **171.00** | 222.02 | 0.770 |
+
+**Real programs moved too** (`bench/icount-arms.sh`, deterministic): lua
+0.9882 → **0.9823**, perl 1.0059 → **0.9985**, sqlite 1.0037 → **0.9999** —
+all three at-or-below mimalloc's instruction count for the first time.
+
+**Brick 1 — free: both cold outcomes on ONE branch, reached by a tail jump**
+(batch 69.12 → 67.16). `page_push_local` now RETURNS the post-decrement
+`used`; `alloc::free` tests `(u as i32) <= 0` once — 0 = page emptied
+(retire), negative = double free (abort) — and jumps to a merged
+`retire_or_abort`. With the abort no longer a `call` inside `free`'s body,
+LLVM dropped the `push rax`/`pop rax` stack alignment: the fast path now has
+NO prologue. The detection semantics are unchanged (same wrap test, same
+SIGABRT; the general path in `free_local_at` checks its own return).
+`retire_or_abort` re-reads `(*pg).used` instead of taking it as an argument —
+passing the value in gave it a second use and would block the RMW fold (which
+LLVM then still declined; the load/dec/store stays, priced at 1 Ir).
+
+**Brick 2 — malloc: the empty-heap SENTINEL kills the null test** (batch →
+63.34, small −3.95, med −3.25). The TLS slot moved from `.tbss` (null = not
+initialised) to `.tdata` initialised to a static `EMPTY_HEAP_BOX` whose
+direct table is all empty-page sentinels — upstream's `_mi_heap_empty`, and
+the exact trick our own `EMPTY_PAGE` already plays one level down. A fresh
+thread's first malloc falls through to the generic path like any dry page;
+`malloc` never tests for initialisation at all. The fast path was rewritten
+to RAW-POINTER READS ONLY (`alloc::malloc` no longer forms `&mut` before the
+sentinel is ruled out — two threads taking `&mut` on the shared static would
+be UB, and Miri runs this variant). The miss is a tail call, so `push rbx`
+went with it: exported malloc is now 14 instructions (was 17).
+
+**Brick 3 — malloc_slow goes STRAIGHT to malloc_generic** (mixed 147.03 →
+144.52). The first cut re-ran `Heap::malloc`'s fast path inside the slow
+call; the fast list was dry a moment ago on the same thread, so the repeat
+can only miss. `mixed` (1/3 of its sizes > SMALL_SIZE_MAX) measured the
+repeat at +0.68 Ir/op.
+
+**Brick 4 — free: read the thread id BEFORE `page_of`** (batch 63.20 →
+62.20). Read after it, LLVM assigned the id to the register holding the
+just-computed page pointer and re-derived every later page access as
+`slot + (−slice_offset)`. One statement moved; one instruction saved.
+
+**Brick 5 — the exported `free` IS the body now** (batch 62.20 → **59.19**,
+small −4.00, mixed −4.26). The override's `free` was a GOT-indirect `jmp`
+thunk onto `alloc::free`. A narrowly-scoped `#[inline(always)] free_inline`
+that ONLY the export calls gives the export the body. This is NOT the
+thrice-refuted `#[inline]`-on-`free` — internal callers (realloc family)
+still call the outlined symbol; only the export changed. It paid 3× the
+expected 1 Ir because codegen in the export context (argument register free
+to clobber) also deleted the `neg` and went to one-register addressing —
+**the local free fast path is now 24 instructions vs upstream's measured
+25 Ir/op.** Cost: the remote-free arm is outlined behind one extra `jmp`
+(cross-thread frees only; the MT kernels run in-process and never see it).
+
+**Brick 6 — aligned: peek the block, don't prove the geometry** (aligned
+213.44 → 168.25 in isolation; **163.25 / 0.869×** with bricks 4–5
+compounded — from 1.136× of mimalloc to a win). Ours proved
+alignment via `bins::good_size` and then re-walked `malloc`; upstream tests
+the bin's ACTUAL next free block with one AND (`_zero_aligned_at_fast`) and
+pops it on a hit. Ported as a preamble in `malloc_aligned_at` (offset 0,
+small sizes). Natural fits — the common case — always hit. A block can now
+come from `bin(size)` where the old path picked `bin(asize)`: still
+contract-conformant (aligned, usable ≥ size) and it is upstream's own
+behaviour; `align_storm` + `aligned_at_offsets` hammer exactly this and pass.
+
+**Gates:** Linux 28 suites / 0 failures, default AND `--all-features`;
+clippy `-D warnings` clean; **Windows native 28 suites / 0 failures** (the
+`thread_local!` sentinel variant); `bench/churn.sh` 5/5 (640 threads — the
+probe aimed at exactly what a broken TLS slot would corrupt); **Miri whole
+`-p rusty_alloc` target clean** — 33 tests, 0 UB, `stress_mt` (411 s
+interpreted) and `rss_churn` (200 s) included; the `wasm-gate` self-test
+executed in a Node VM; real-program icount arms above. Counters keep work
+parity (the debug suites assert them). Housekeeping: `thread_identity`'s
+three tests are now `#[cfg_attr(miri, ignore)]` with the reason in-file —
+they verify hardware register reads whose asm is `cfg(not(miri))`, so under
+Miri they interpreted 2M-iteration loops over the FALLBACK path (tens of
+minutes proving nothing the other suites don't); same pattern as
+`double_free.rs`, so the Miri gate keeps sweeping the whole target.
+
+**Not re-tried, per the ledger's own refutations:** `#[inline]` on
+`alloc::free` for internal callers (3×), cold splits with fat signatures,
+`Page` 80 → 64 (the remaining `idx*80` lea chain is ~1 Ir and priced below
+the refactor risk — still true).
+
+### Real-world corpus sweep on the new build (same day) — the G6 CORRECTNESS half, demonstrated
+
+`corpus/sweep-all.sh` is NEW: every built mimalloc-bench binary, standard
+`bench.sh` arguments, ra and mi arms side by side, exit-code classified with
+a timeout guard — the run-everything correctness companion to
+`run-suite.sh`'s four-benchmark timing gate, valid on a loaded box because it
+reads no clock. **19/19 configurations run to completion on rusty_alloc**
+(cfrac · espresso · barnes · larson · larson-sized · mstress · rptest ·
+alloc-test ×1/×8 · sh6bench ·sh8bench · xmalloc-test · cache-thrash ·
+cache-scratch · malloc-large · mleak ×2 · glibc-simple · glibc-thread, 8–16
+threads where MT), cfrac's factorization output byte-compared across arms.
+
+`corpus/realworld.sh`, run THREE full passes (18 runs per program, arms
+interleaved ra/mi/sys + sys/mi/ra per pass): **all 8 deterministic programs
+byte-identical across every run of every arm** — jq, sqlite3, python3, git,
+xz, zstd, lua, perl: one checksum each, 144/144 runs, zero non-zero exits.
+imagemagick: 18 runs → 18 distinct hashes INCLUDING glibc-vs-glibc (embedded
+PNG timestamps — a property of ImageMagick, not an allocator signal; every
+run exited 0). redis: the ONLY failures in the whole sweep, and they are the
+documented mixed-allocator configuration — this redis is BUILT on jemalloc
+(`malloc=jemalloc-5.3.0`, links `libjemalloc.so.2`, verified via
+`info memory`), so preloading ANY replacement corrupts by construction; both
+preloaded arms failed (ours AND the oracle, which contains none of our code)
+while the sys arm passed 3/3. In an earlier single pass our arm happened to
+complete the full benchmark while the oracle segfaulted — scheduling luck
+inside a broken-by-construction process, consistent with the 2026-08-06
+measurement (mi 8/8 crashes, ours 6/8). The script now detects
+jemalloc-linked redis and prints the note inline so this is never
+re-investigated as an allocator defect.
+
+Plus `stress_mt` release soak **30/30** on the new TLS/sentinel code.
+
+**Scope note:** this demonstrates the v1 gate's CORRECTNESS half (every
+corpus program runs, deterministic outputs identical). The PERF half — the
+wall/CPU geomean-within-10% claim — still needs a pinned quiet-box session
+and remains undemonstrated; instruction counts (above) are the standing
+evidence.
 
 Perf, RSS and the `secure` feature had all been *recommended* without numbers.
 All three measured before cutting 0.4.0. Method throughout: deterministic

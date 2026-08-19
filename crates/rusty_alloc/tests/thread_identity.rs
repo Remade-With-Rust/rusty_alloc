@@ -28,7 +28,14 @@ use rusty_alloc::init::thread_id;
 /// pre-fix bug reproduced in well under this on an idle machine.
 const READS: usize = 2_000_000;
 
+// The three tests here verify HARDWARE register reads (fs:0 / gs:0x30 /
+// tpidrro_el0), and those asm paths are `cfg(not(miri))` — under Miri they
+// exercise only the `thread_local!` fallback, at 2M interpreted iterations
+// each (tens of minutes) proving nothing the other suites don't. Like
+// `double_free.rs`, the tests declare their Miri-incompatibility themselves
+// so the Miri gate can keep sweeping the whole target.
 #[test]
+#[cfg_attr(miri, ignore)]
 fn thread_id_is_stable_within_a_thread() {
     let first = thread_id();
     let mut distinct = BTreeSet::new();
@@ -45,6 +52,7 @@ fn thread_id_is_stable_within_a_thread() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn thread_id_is_unique_across_live_threads() {
     const THREADS: usize = 16;
     // A barrier keeps every thread ALIVE simultaneously — ids may legitimately
@@ -83,6 +91,7 @@ fn thread_id_is_unique_across_live_threads() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn thread_id_matches_the_platform_thread_identity() {
     // Cross-check the fast-path register read against the OS's own answer, so a
     // wrong register cannot pass the two tests above by being merely

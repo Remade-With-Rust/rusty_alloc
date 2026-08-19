@@ -103,6 +103,18 @@ print(n,s)" ;;
 my %h; for my $i (1..800000) { $h{"key$i"} = [ $i, "v$i" ]; }
 my $s=0; while (my ($k,$v)=each %h) { $s += $v->[0] } print "$s\n";' ;;
   redis)  echo "== redis"
+          # A redis built ON jemalloc (mem_allocator:jemalloc-5.3.0, links
+          # libjemalloc.so.2) reaches allocator symbols directly, so
+          # LD_PRELOADing ANY replacement — ours or the mimalloc oracle —
+          # produces a MIXED-ALLOCATOR process: blocks allocated by one
+          # allocator, freed by the other. Failures on the preloaded arms of
+          # such a binary are a property of the configuration, not of either
+          # allocator (measured 2026-08-06: mimalloc 8/8 crashes, ours 6/8;
+          # 2026-08-19: both arms fail, sys 3/3 clean). Only the SYS arm is a
+          # verdict here; rebuild redis with MALLOC=libc for a real A/B.
+          if redis-server --version 2>/dev/null | grep -q jemalloc; then
+            echo "  NOTE: this redis is jemalloc-linked — preloaded-arm failures are the known mixed-allocator config, not an allocator defect"
+          fi
           for arm in ra mi sys; do
             pre=""; case "$arm" in ra) pre="$RA";; mi) pre="$MI";; esac
             rm -f /tmp/rw/redis.log

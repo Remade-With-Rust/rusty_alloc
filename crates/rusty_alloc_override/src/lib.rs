@@ -43,8 +43,10 @@ mod unix_override {
     /// libc contract.
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn free(p: *mut c_void) {
-        // SAFETY: forwarded libc contract.
-        unsafe { alloc::free(p.cast()) }
+        // SAFETY: forwarded libc contract. `free_inline` so this export IS
+        // the body instead of a GOT-indirect thunk paid on every free; see
+        // its docs for why the internal callers deliberately do not inline.
+        unsafe { alloc::free_inline(p.cast()) }
     }
 
     /// `posix_memalign`.

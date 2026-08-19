@@ -243,7 +243,7 @@ impl Heap {
     /// The slow path — mimalloc's heartbeat: runs when a fast list is dry, so
     /// deferred work (collect, extend, fresh pages; later: purge, deferred
     /// frees) happens at a regular allocation cadence.
-    fn malloc_generic(&mut self, size: usize) -> (*mut u8, bool) {
+    pub(crate) fn malloc_generic(&mut self, size: usize) -> (*mut u8, bool) {
         self.stats.generic += 1;
         // Guarded objects (secure/guarded builds): sampled allocations get a
         // dedicated segment whose trailing page is PROT_NONE, so an overflow
@@ -547,6 +547,29 @@ impl Heap {
         }
         if align <= 8 && offset == 0 {
             return self.malloc(size);
+        }
+        // Upstream's aligned fast path (`mi_heap_malloc_zero_aligned_at_fast`):
+        // don't PROVE alignment from the bin geometry — peek the bin's next
+        // free block and test its ACTUAL address with one AND. The opscan put
+        // our aligned op 25.5 Ir/op behind mimalloc, and the whole difference
+        // was proving via `good_size` + re-walking `malloc`; the peek costs a
+        // mask on top of the plain malloc fast path and hits whenever the
+        // block happens to satisfy the constraint (always, for natural fits).
+        if offset == 0 && size <= SMALL_SIZE_MAX {
+            let w = crate::types::wsize_from_size(size);
+            let p = self.direct[w];
+            // SAFETY: direct entries point at a live page of this heap or the
+            // immortal empty-page sentinel; reading `free` is the same access
+            // `page_pop` performs.
+            let b = unsafe { (*p).free };
+            if !b.is_null() && b.addr() & (align - 1) == 0 {
+                // SAFETY: as `Heap::malloc` — pop from this thread's own page.
+                let b = unsafe { crate::page::page_pop(p) };
+                debug_assert!(!b.is_null());
+                self.stat_alloc();
+                // SAFETY: p live per above.
+                return (b, unsafe { (*p).free_is_zero });
+            }
         }
         // Natural fit: only sound when the offset keeps block starts aligned.
         if offset.is_multiple_of(align)
@@ -938,7 +961,13 @@ impl Heap {
                         let _ = self.retire_span(seg, pg); // returns below
                         return;
                     }
-                    page_push_local(pg, p.cast());
+                    // The general path keeps the same double-free guarantee as
+                    // the fast path: a negative post-decrement count can only
+                    // be the 0 -> u32::MAX wrap.
+                    let used_now = page_push_local(pg, p.cast());
+                    if (used_now as i32) < 0 {
+                        crate::page::double_free_abort();
+                    }
                     if (*pg).flags & pflags::IN_FULL != 0 {
                         // Un-park: it has space again; back to NORMAL remote
                         // pushes (page is scannable once more).

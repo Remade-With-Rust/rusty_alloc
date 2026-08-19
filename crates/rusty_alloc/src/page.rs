@@ -332,11 +332,22 @@ pub unsafe fn page_pop(page: *mut Page) -> *mut u8 {
 
 /// Push a block on the owner free list (`mi_free` local path).
 ///
+/// Returns the POST-decrement `used` count, and the caller MUST act on it:
+/// a negative reading (as i32) is a double free — the count was already 0 and
+/// wrapped — and the caller aborts via [`double_free_abort`]; 0 means the page
+/// just emptied and is a retire candidate. Returning the value instead of
+/// testing it here lets `alloc::free` fold BOTH cold outcomes into one
+/// rarely-taken branch on the decrement's own flags, where the in-function
+/// test cost a separate load/store plus two hot-path branches. Every
+/// legitimate `used` is far below `i32::MAX` (a span holds at most a few
+/// million blocks), so a negative value can only be the wrap.
+///
 /// # Safety
 /// `page` owned by the calling thread; `block` must be the start of a block
 /// of this page, previously allocated and not yet freed.
 #[inline]
-pub unsafe fn page_push_local(page: *mut Page, block: *mut Block) {
+#[must_use = "a negative return is a double free the caller must abort on"]
+pub unsafe fn page_push_local(page: *mut Page, block: *mut Block) -> u32 {
     // SAFETY: caller already holds a valid page pointer (see fn contract).
     unsafe { debug_validate_page(page, "page_push_local") };
     // SAFETY: caller's contract — block belongs to page and is dead; writing
@@ -344,23 +355,13 @@ pub unsafe fn page_push_local(page: *mut Page, block: *mut Block) {
     unsafe {
         block_set_next(page, block, (*page).local_free);
         (*page).local_free = block;
-        // A double free lands HERE and nowhere else: the page's `used` count is
-        // already 0, so decrementing wraps it to `u32::MAX`. Left unchecked
-        // that is silent heap corruption — the page never retires, and the same
-        // block sits on the free list twice, so a later pair of `malloc` calls
-        // hand the SAME memory to two owners.
-        //
-        // The check is a sign test on the post-decrement value, which is free
-        // in practice: `dec` already sets SF, and every legitimate `used` is far
-        // below `i32::MAX`, so a negative reading can only be the wrap.
-        (*page).used = (*page).used.wrapping_sub(1);
-        if ((*page).used as i32) < 0 {
-            double_free_abort();
-        }
+        let u = (*page).used.wrapping_sub(1);
+        (*page).used = u;
+        u
     }
 }
 
-/// A double free was detected in [`page_push_local`].
+/// A double free was detected on a [`page_push_local`] return value.
 ///
 /// Aborts rather than returning. Continuing would publish the same block on a
 /// free list twice and hand it to two owners — the exact class of bug this
@@ -370,7 +371,7 @@ pub unsafe fn page_push_local(page: *mut Page, block: *mut Block) {
 /// reason).
 #[cold]
 #[inline(never)]
-fn double_free_abort() -> ! {
+pub(crate) fn double_free_abort() -> ! {
     std::process::abort()
 }
 
