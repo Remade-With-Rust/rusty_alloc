@@ -70,16 +70,146 @@ pub struct Block {
     pub next: *mut Block,
 }
 
+/// Modular inverse of an ODD `n` mod 2^64 (Newton–Raphson, 5 doublings).
+///
+/// Used by the `blockmap` feature to turn an address delta into a block index
+/// WITHOUT a division. Block sizes here are not powers of two — the bins run
+/// `5,6,7,8 << k`, giving 24, 40, 80, 96, 112… — so the obvious
+/// `delta / block_size` is a real hardware divide on the allocation hot path,
+/// which costs more than the whole check it would serve.
+///
+/// The trick works because `delta` is always an exact multiple of the block
+/// size for a genuine block. Write `block_size = odd << k`; then
+/// `delta / block_size == (delta >> k) * inverse(odd)` in wrapping 64-bit
+/// arithmetic — one shift and one multiply.
+///
+/// For a delta that is NOT an exact multiple — a corrupted or misaligned
+/// pointer — the result is one of two things, and BOTH are safe, though the
+/// first is not what a first reading suggests:
+///
+/// - offset below `2^k`: the shift discards it, so the result is the index of
+///   the CONTAINING block. For `block_size = 24` (`k = 3`), `4*24 + 1` gives
+///   index 4, not garbage. That is correct behaviour for a liveness map — a
+///   pointer inside block 4 should consult block 4's bit — but it means this
+///   is NOT a free alignment check, which an earlier version of this comment
+///   wrongly claimed. Alignment is `link_is_plausible`'s job.
+/// - any larger non-multiple: a garbage index, which overwhelmingly fails the
+///   `idx < capacity` bound that follows. The chance of a random 64-bit value
+///   landing under a few thousand is about 2^-52.
+#[cfg(feature = "blockmap")]
+#[inline]
+pub(crate) const fn odd_mod_inverse(n: usize) -> usize {
+    debug_assert!(n % 2 == 1);
+    // x = n is correct to 3 bits; each Newton step doubles that: 6, 12, 24,
+    // 48, 96 — so five steps cover 64 bits with room to spare.
+    let mut x = n;
+    let mut i = 0;
+    while i < 5 {
+        x = x.wrapping_mul(2usize.wrapping_sub(n.wrapping_mul(x)));
+        i += 1;
+    }
+    x
+}
+
+/// `blockmap`: bytes of map needed for `blocks` bits, rounded up so the first
+/// block still lands on a `MAX_ALIGN_SIZE` boundary.
+#[cfg(feature = "blockmap")]
+#[inline]
+pub(crate) const fn bitmap_bytes(blocks: usize) -> usize {
+    blocks
+        .div_ceil(8)
+        .next_multiple_of(crate::types::MAX_ALIGN_SIZE)
+}
+
+/// A block was handed out while already live, or freed while already free.
+///
+/// Silent for the same reasons as [`corrupt_free_list_abort`]: formatting a
+/// message from inside the allocator can allocate, and unwinding would cross
+/// `extern "C"` frames.
+#[cold]
+#[inline(never)]
+#[cfg(feature = "blockmap")]
+pub(crate) fn blockmap_abort() -> ! {
+    std::process::abort()
+}
+
+/// `blockmap`: flip `b`'s liveness bit, requiring it to currently be the
+/// opposite of `to_live`.
+///
+/// **This is the check that actually stops R-005.** Encoding and bounds both
+/// try to keep a link from being FORGED; this one detects what a forgery is
+/// FOR — the allocator handing out a block that is already live — and so it
+/// does not care how the link was produced. It carries no key, and the map is
+/// not part of the free list, so unlike the encoding it is not undone by an
+/// attacker with a read primitive.
+///
+/// Owner-only, therefore no atomics: the two callers are the allocation pop
+/// and the local free. Blocks freed by OTHER threads land on `xthread_free`
+/// and have their bit cleared later, by the owner, in [`page_collect`].
+///
+/// # Safety
+/// `page` live and owned by the caller; `b` a block of that page.
+#[cfg(feature = "blockmap")]
+#[inline]
+unsafe fn blockmap_transition(page: *mut Page, b: *const u8, to_live: bool) {
+    // SAFETY: owner-only fields; `b` is a block of this page per the contract.
+    unsafe {
+        let payload = (*page).payload;
+        if payload.is_null() {
+            // Huge/large single-block pages carve no map — nothing to track.
+            return;
+        }
+        let bsize = (*page).block_size;
+        let reserved = (*page).reserved as usize;
+        let delta = b.addr().wrapping_sub(payload.addr());
+        let idx = (delta >> bsize.trailing_zeros()).wrapping_mul((*page).bs_inv);
+        if idx >= reserved {
+            // Either a pointer that is not a block of this page at all, or a
+            // non-multiple delta that produced a garbage index. Both mean the
+            // free list has been steered somewhere it cannot legitimately go.
+            blockmap_abort();
+        }
+        let byte = payload.add(reserved * bsize).add(idx >> 3);
+        let mask = 1u8 << (idx & 7);
+        if (byte.read() & mask != 0) == to_live {
+            // Allocating a block already marked live is the free-list hijack
+            // landing; freeing one already marked free is a double free.
+            blockmap_abort();
+        }
+        byte.write(byte.read() ^ mask);
+    }
+}
+
 /// Could `dec` be a genuine free-list link stored in a block at `b_addr`?
+///
+/// The bound is the SEGMENT, not the page, and that is a measured decision
+/// rather than the tightest statement available.
+///
+/// A page-scoped bound is sound and ~512x tighter (±64 KiB against ±32 MiB),
+/// and it was implemented and tested. It costs **+5 Ir/op** on the small and
+/// batch ops — `secure` goes from +14.99 to +21.97 per allocation, perl from
+/// 1.0160 to 1.0214 — and reformulating it (`slice_count << 16` instead of
+/// `capacity * block_size`) changed the number by literally nothing, so the
+/// cost is the extra load and the wider comparison, not the arithmetic.
+///
+/// It was dropped because of what it does NOT buy. Narrowing from segment to
+/// page removes cross-page redirection, but the attack that matters here is
+/// INTRA-page — R-005's relative forgery, redirecting a link to a neighbouring
+/// block. A page bound is powerless against that. The only defence that covers
+/// it is the `blockmap` liveness map, which is measured at +58 Ir/op and
+/// therefore off by default. Paying 0.5% for a partial narrowing, when the
+/// complete answer is already too expensive to run, is not a good trade.
+///
+/// Segments are SEGMENT_SIZE-aligned and SEGMENT_SIZE is a power of two, so
+/// `(a ^ b) < SEGMENT_SIZE` IS "same segment" in two ALU ops with no memory
+/// access — cheaper than asking the global segment map (an atomic load) and
+/// stronger than it, since the map would accept any segment we own.
 ///
 /// Split out of [`block_next`] so the PREDICATE can be tested exhaustively
 /// in-process (`link_tests` below) while the fault PATH — which aborts, and so
 /// needs a child process — is tested separately in `tests/corruption.rs`.
 /// Testing an abort end-to-end proves the wiring; it cannot enumerate the
 /// boundary cases, and the boundary is where a bounds check earns its keep.
-///
-/// Both conditions are two ALU ops with no memory access, so this stays cheap
-/// enough for the free-list walk it guards.
 ///
 /// Compiled in every configuration (only the CALL SITE is `secure`-gated) and
 /// public so `fuzz_targets/corruption.rs` can differentially check the
@@ -104,7 +234,23 @@ pub unsafe fn block_next(page: *const Page, b: *const Block) -> *mut Block {
         #[cfg(not(feature = "secure"))]
         {
             let _ = page;
-            (*b).next
+            let n = (*b).next;
+            #[cfg(feature = "linkcheck")]
+            {
+                // NULL TERMINATES the list — it is not a link, and checking it
+                // would abort on every list tail. The `secure` arm gets this
+                // for free from its `enc == 0` early return; this arm has no
+                // such return and must say so.
+                // One u16 load and a shift: SEGMENT_SLICE_SIZE is 2^16, so LLVM
+            // turns this constant multiply into `shl 16`. The obvious
+            // `capacity * block_size` is two loads and a real multiply, and
+            // measured +5 Ir/op worse on small/batch.
+            let extent = (*page).slice_count as usize * crate::types::SEGMENT_SLICE_SIZE;
+                if !n.is_null() && !link_is_plausible(n.addr(), b.addr(), extent) {
+                    corrupt_free_list_abort();
+                }
+            }
+            n
         }
         #[cfg(feature = "secure")]
         {
@@ -128,12 +274,13 @@ pub unsafe fn block_next(page: *const Page, b: *const Block) -> *mut Block {
             // it: the map would accept any segment we own, this accepts only
             // the one the link must be in.
             //
-            // Alignment alone — what this checked before — stops accidental
-            // corruption (a stray ASCII overflow fails it 7 times in 8) but
-            // barely inconveniences a deliberate attacker, since every target
-            // worth steering an allocator at is already pointer-aligned. The
-            // segment bound is what removes the out-of-heap targets (GOT
-            // entries, vtables, saved return addresses) from reach.
+            // Alignment alone — what this checked originally — stops
+            // accidental corruption (a stray ASCII overflow fails it 7 times
+            // in 8) but barely inconveniences a deliberate attacker, since
+            // every target worth steering an allocator at is already
+            // pointer-aligned. The bound is what removes out-of-heap targets
+            // (GOT entries, vtables, saved return addresses) from reach.
+            //
             if !link_is_plausible(dec, b.addr()) {
                 corrupt_free_list_abort();
             }
@@ -280,6 +427,23 @@ pub struct Page {
     /// Per-page free-list encoding keys (`secure` builds only; zero elsewhere).
     #[cfg(feature = "secure")]
     pub keys: [usize; 2],
+    /// `blockmap`: first byte of block storage. The liveness map sits just
+    /// past the last block, at `payload + reserved * block_size`.
+    ///
+    /// **Only two fields, and that is a hard constraint, not a preference.**
+    /// `Segment` holds `[Page; SLICES_PER_SEGMENT]` and a const assertion
+    /// requires the whole header to fit in slice 0, so every byte added here
+    /// is multiplied by 512. A first cut also stored the map pointer and the
+    /// shift; together with `secure`'s keys that broke the assertion at
+    /// COMPILE time. Both are cheap to derive — the map from `payload`, the
+    /// shift from `block_size.trailing_zeros()` — so they are.
+    #[cfg(feature = "blockmap")]
+    pub payload: *mut u8,
+    /// `blockmap`: modular inverse of the odd part of `block_size`. This one
+    /// cannot be derived cheaply — the inverse is five multiplies — so it is
+    /// the one value worth the space.
+    #[cfg(feature = "blockmap")]
+    pub bs_inv: usize,
 }
 
 /// `debug_checks` invariant guard (our `dmi` equivalent): a page slot handed
@@ -364,6 +528,12 @@ impl Page {
             heap_tag: 0,
             #[cfg(feature = "secure")]
             keys: [0; 2],
+            // The sentinel's free list is permanently null, so nothing is ever
+            // popped from or pushed to it and the map is never consulted.
+            #[cfg(feature = "blockmap")]
+            payload: ptr::null_mut(),
+            #[cfg(feature = "blockmap")]
+            bs_inv: 1,
         }
     }
 }
@@ -403,6 +573,18 @@ pub unsafe fn page_pop(page: *mut Page) -> *mut u8 {
     // SAFETY: a block on the free list is a valid, free block in this page's
     // area; its first word is the next link.
     unsafe {
+        // BEFORE `block_next`, which dereferences `block` to read its link.
+        // Order is the whole point: if a forged link steered us here, `block`
+        // is an address of the attacker's choosing, and reading from it is a
+        // segfault rather than a controlled abort. Validating first turns
+        // "process died somewhere" into "the allocator refused". The
+        // corruption tests assert on exactly that distinction, and they
+        // caught this the first time it was written the other way round.
+        //
+        // A forged link fails here whatever produced it: recovered keys,
+        // relative forgery, or blind luck.
+        #[cfg(feature = "blockmap")]
+        blockmap_transition(page, block.cast(), true);
         (*page).free = block_next(page, block);
         (*page).used += 1;
     }
@@ -432,6 +614,10 @@ pub unsafe fn page_push_local(page: *mut Page, block: *mut Block) -> u32 {
     // SAFETY: caller's contract — block belongs to page and is dead; writing
     // its first word as the link is the free-list representation.
     unsafe {
+        // Mark free BEFORE linking it in, so a double free is caught before
+        // the block is published on a list twice.
+        #[cfg(feature = "blockmap")]
+        blockmap_transition(page, block.cast(), false);
         block_set_next(page, block, (*page).local_free);
         (*page).local_free = block;
         let u = (*page).used.wrapping_sub(1);
@@ -466,7 +652,7 @@ pub(crate) fn double_free_abort() -> ! {
 /// intact. The signal is the diagnostic; `tests/corruption.rs` reads it.
 #[cold]
 #[inline(never)]
-#[cfg(feature = "secure")]
+#[cfg(any(feature = "secure", feature = "linkcheck"))]
 pub(crate) fn corrupt_free_list_abort() -> ! {
     std::process::abort()
 }
@@ -624,10 +810,31 @@ pub unsafe fn page_collect(page: *mut Page) {
             }
             (*page).free_is_zero = false;
             // Append the stolen chain, counting its length against `used`.
+            //
+            // This is also where REMOTELY freed blocks get their liveness bit
+            // cleared. Doing it here rather than in `remote_free` is what
+            // keeps the map owner-only and therefore free of atomics: the
+            // freeing thread only pushes onto `xthread_free`, and the owner
+            // reconciles the map when it drains that list. The cost is a
+            // window — a block freed remotely still reads as live until the
+            // next collect — which is acceptable because the map exists to
+            // catch a forged link landing on a LIVE block, and a
+            // recently-freed one reading as live is the conservative
+            // direction.
+            //
+            // One `block_next` per element, not two: the original loop called
+            // it in the condition AND the body, doubling the decode (and, in
+            // `secure`, the bound check) on every element of the walk.
             let mut tail = head;
             let mut n = 1u32;
-            while !block_next(page, tail).is_null() {
-                tail = block_next(page, tail);
+            loop {
+                #[cfg(feature = "blockmap")]
+                blockmap_transition(page, tail.cast(), false);
+                let nxt = block_next(page, tail);
+                if nxt.is_null() {
+                    break;
+                }
+                tail = nxt;
                 n += 1;
             }
             block_set_next(page, tail, (*page).free);
@@ -666,6 +873,28 @@ pub unsafe fn page_extend(page: *mut Page, area: *mut u8) {
         if capacity >= reserved {
             return;
         }
+        // First carve of this page's life: place the liveness map AFTER the
+        // blocks. `reserved` was already reduced in `page_fresh` to leave room
+        // for it, so this stays inside the span.
+        //
+        // The front would be the better place on security grounds — a forward
+        // overflow would run away from the map instead of into it — but the
+        // payload start is not ours to move. `page_area` has eight consumers
+        // (the interior-pointer adjustment in `alloc::free`, the large-object
+        // path, `visit_blocks`, segment reclaim…) and offsetting the payload
+        // here made exactly ONE of them agree, desynchronising the rest; the
+        // `aligned_at_offsets` test aborted on the first run because free
+        // derived a block start the allocator had never handed out. Keeping
+        // `area` meaning what it has always meant is worth more than the
+        // placement.
+        //
+        // Zeroing is explicit: a RECLAIMED span is recycled memory and carries
+        // whatever the previous tenant left in it.
+        #[cfg(feature = "blockmap")]
+        if capacity == 0 {
+            (*page).payload = area;
+            core::ptr::write_bytes(area.add(reserved * bsize), 0, bitmap_bytes(reserved));
+        }
         let take = ((4096 / bsize).max(1)).min(reserved - capacity);
         let start = area.add(capacity * bsize);
         // Link the fresh blocks in address order.
@@ -693,6 +922,87 @@ pub unsafe fn page_all_free(page: *mut Page) -> bool {
     unsafe { (*page).used == 0 }
 }
 
+/// The address→index arithmetic the `blockmap` feature rests on, checked
+/// against EVERY REAL BIN SIZE rather than a few hand-picked ones.
+///
+/// This is the piece most likely to be silently wrong: a division replaced by
+/// a multiply is correct only under a precondition (exact multiples), and a
+/// wrong index writes the wrong bit — which would either miss real
+/// double-allocations or abort on legitimate ones. Pinning it against
+/// `bin_size` for the whole bin range, at every block offset, is cheap and
+/// leaves nothing to trust.
+#[cfg(all(test, feature = "blockmap"))]
+mod blockmap_index_tests {
+    use super::*;
+    use crate::bins::bin_size;
+
+    /// `(delta >> k) * inv(odd)` must equal `delta / block_size` for every bin
+    /// size and every block position in a 64 KiB page.
+    #[test]
+    fn index_matches_real_division_for_every_bin() {
+        for bin in 1..=40usize {
+            let bs = bin_size(bin);
+            if bs == 0 {
+                continue;
+            }
+            let k = bs.trailing_zeros();
+            let odd = bs >> k;
+            let inv = odd_mod_inverse(odd);
+            let blocks = (64 * 1024 / bs).min(4096);
+            for idx in 0..blocks {
+                let delta = idx * bs;
+                let got = (delta >> k).wrapping_mul(inv);
+                assert_eq!(
+                    got, idx,
+                    "bin {bin} (block_size {bs}): delta {delta} gave index {got}, want {idx}"
+                );
+            }
+        }
+    }
+
+    /// An interior pointer must map to the CONTAINING block or to something
+    /// the capacity bound rejects — never to a different, plausible block.
+    ///
+    /// That middle outcome is the dangerous one: attributing liveness to the
+    /// wrong block would both miss real double-allocations and abort on
+    /// legitimate ones. The two safe outcomes are fine for opposite reasons —
+    /// the containing index is the RIGHT answer for a liveness map, and a
+    /// garbage index fails `idx < capacity`.
+    #[test]
+    fn interior_pointers_map_to_the_containing_block_or_out_of_range() {
+        const CAP: usize = 4096;
+        let mut saw_containing = 0;
+        let mut saw_garbage = 0;
+        for bin in 2..=40usize {
+            let bs = bin_size(bin);
+            if bs <= 1 {
+                continue;
+            }
+            let k = bs.trailing_zeros();
+            let odd = bs >> k;
+            let inv = odd_mod_inverse(odd);
+            let base = 4usize;
+            for off in 1..bs.min(64) {
+                let delta = base * bs + off;
+                let got = (delta >> k).wrapping_mul(inv);
+                if got == base {
+                    saw_containing += 1;
+                } else if got >= CAP {
+                    saw_garbage += 1;
+                } else {
+                    panic!(
+                        "bin {bin} (block_size {bs}) offset {off}: interior pointer mapped to \
+                         index {got} — neither the containing block ({base}) nor out of range"
+                    );
+                }
+            }
+        }
+        // Both arms must actually occur, or the test is only exercising one.
+        assert!(saw_containing > 0, "no containing-block cases covered");
+        assert!(saw_garbage > 0, "no out-of-range cases covered");
+    }
+}
+
 #[cfg(test)]
 mod link_tests {
     use super::*;
@@ -710,6 +1020,8 @@ mod link_tests {
     fn accepts_genuine_links_anywhere_in_the_same_segment() {
         assert!(link_is_plausible(BASE, B), "segment's first block");
         assert!(link_is_plausible(B, B), "self-link");
+        assert!(link_is_plausible(B + 16, B), "next block");
+        assert!(link_is_plausible(B - 16, B), "previous block");
         assert!(link_is_plausible(B + 4096, B), "forward link");
         assert!(link_is_plausible(B - 4096, B), "backward link");
         assert!(
@@ -725,11 +1037,11 @@ mod link_tests {
         }
     }
 
-    /// The case the old alignment-only check let through, and the whole reason
-    /// the segment bound exists: a deliberate attacker picks an ALIGNED
-    /// target, because every address worth steering an allocator at — GOT
-    /// entries, vtables, function pointers, saved return addresses — already
-    /// is one. Alignment alone filters accidents, not adversaries.
+    /// A deliberate attacker picks an ALIGNED target, because every address
+    /// worth steering an allocator at — GOT entries, vtables, function
+    /// pointers, saved return addresses — already is one. Alignment alone
+    /// filters accidents, not adversaries; the segment bound is what puts
+    /// those targets out of reach.
     #[test]
     fn rejects_aligned_targets_outside_the_segment() {
         assert!(
@@ -759,5 +1071,26 @@ mod link_tests {
         assert!(!link_is_plausible(BASE + SEGMENT_SIZE, B));
         assert!(link_is_plausible(BASE, B));
         assert!(!link_is_plausible(BASE - 16, B));
+    }
+
+    /// What this bound deliberately does NOT stop, pinned so nobody mistakes
+    /// its scope: a target in the SAME segment — including the neighbouring
+    /// block, which is exactly R-005's relative forgery — passes.
+    ///
+    /// A page-scoped bound was built and measured for this and cost +5 Ir/op
+    /// while still not closing the intra-PAGE case; the only thing that does
+    /// is the `blockmap` liveness map, at +58 Ir/op and off by default. If
+    /// this test ever goes red the bound has been tightened, and its cost
+    /// needs re-measuring before anyone celebrates.
+    #[test]
+    fn does_not_stop_intra_segment_redirection() {
+        assert!(
+            link_is_plausible(B + 16, B),
+            "the neighbouring block is reachable by design — see R-005"
+        );
+        assert!(
+            link_is_plausible(B + 0x10_0000, B),
+            "1 MiB away, still the same segment"
+        );
     }
 }

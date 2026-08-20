@@ -196,8 +196,22 @@ fn assert_child_aborts(scenario: &str) {
 }
 
 /// True when this build actually has the mitigation compiled in.
+///
+/// `linkcheck` counts: it applies the SAME bound to an unencoded link, so both
+/// attacks below must still be stopped by it. That arm is the whole point of
+/// the experiment — a build with the bound and no encoding should still refuse
+/// an out-of-segment target, and if it does not, the feature is worthless.
 fn mitigation_present() -> bool {
-    if cfg!(feature = "secure") {
+    // `blockmap` counts too, and by a completely different route: it does not
+    // check the link at all, it checks the BLOCK the link led to. A poisoned
+    // link produces an address whose computed block index is nowhere near the
+    // page, so the map rejects it on the bound. Worth asserting because it
+    // means the two defences are independent — either alone must stop this.
+    if cfg!(any(
+        feature = "secure",
+        feature = "linkcheck",
+        feature = "blockmap"
+    )) {
         return true;
     }
     // The encoding and the link check are both `secure`-only; the default

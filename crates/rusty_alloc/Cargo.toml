@@ -17,6 +17,37 @@ default = []
 debug_checks = []
 # Feature-gated rdtsc path profiler (§7.5 of the plan). OFF = byte-identical build.
 profile = []
+# EXPERIMENTAL (2026-08-20): the free-list link BOUND without the encoding.
+#
+# `secure` costs a flat ~15 instructions per allocation, and almost all of that
+# is the per-page keyed encode/decode plus key generation — not the bound
+# itself, which is two ALU ops on a value already in a register. This feature
+# isolates the bound so its cost can be measured on its own.
+#
+# What it buys WITHOUT encoding: an attacker who overwrites a plain link can
+# still choose the value, but the bound confines the target to the SAME 32 MiB
+# segment — which removes GOT entries, vtables, stack addresses and saved
+# return addresses from reach entirely. Strictly weaker than `secure` (which
+# also denies steering at all without both per-page keys), strictly stronger
+# than today's default, which follows any value it is handed.
+#
+# Not on by default and not yet recommended: see the plan file for the
+# measurement and the false-positive testing before promoting it.
+linkcheck = []
+# EXPERIMENTAL (2026-08-20): per-page block-liveness bitmap.
+#
+# The one defence that actually stops the residual in R-005. Encoding and
+# bounds both try to prevent a link being FORGED; this detects the thing a
+# forgery is for — `malloc` handing out a block that is already live. It does
+# not care how the link was forged, so it covers key recovery, relative
+# forgery and blind luck alike.
+#
+# The bitmap is out-of-band with respect to the free list itself and carries no
+# key, so unlike the encoding it is not defeated by a read primitive.
+#
+# OFF by default and independently switchable from `secure`/`linkcheck` so it
+# can be measured, and reverted, on its own. Composes with either.
+blockmap = []
 # Hardened build (our `smi`). M8. Deliberately NOT default — see the cost below.
 #
 # Always on with this feature: per-page encrypted free-list links, plus a

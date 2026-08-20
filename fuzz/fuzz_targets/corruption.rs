@@ -40,7 +40,8 @@ use rusty_alloc::page::link_is_plausible;
 use rusty_alloc::types::SEGMENT_SIZE;
 
 /// The naive statement of "same 32 MiB segment", written deliberately
-/// differently from the implementation so agreement means something.
+/// differently from the implementation (`(a ^ b) < SEGMENT_SIZE`) so that
+/// agreement between them means something.
 fn same_segment_reference(a: usize, b: usize) -> bool {
     a / SEGMENT_SIZE == b / SEGMENT_SIZE
 }
@@ -66,9 +67,11 @@ fuzz_target!(|data: &[u8]| {
     // ---- Part 1: the predicate, against an independent reference ----------
     //
     // Two rounds so one input exercises both a fully random pair and a NEAR
-    // pair — random 64-bit values almost never land in the same segment, so
+    // pair. Random 64-bit values almost never land in the same segment, so
     // without the second round the `true` branch would be fuzzed at a rate of
-    // about 2^-39 and the interesting boundary would never be reached.
+    // about 2^-39 and the interesting boundary — where the check actually
+    // decides something — would never be reached.
+    //
     let a = take8(&mut it);
     let b = take8(&mut it);
     for (dec, base) in [(a, b), (a, a.wrapping_add(b % (4 * SEGMENT_SIZE)))] {

@@ -17,6 +17,13 @@ rusty_alloc = { path = "../crates/rusty_alloc" }
 # hunt) has nothing to hunt in.
 [features]
 secure = ["rusty_alloc/secure"]
+# Same reason, for the experimental bound-without-encoding arm: under
+# `linkcheck` a FALSE POSITIVE is an abort, so pointing any target at this
+# build turns every fuzz target into a false-positive hunt.
+linkcheck = ["rusty_alloc/linkcheck"]
+# Under `blockmap` a false positive is likewise an abort, so any target aimed
+# at this build is a false-positive hunt for the liveness map.
+blockmap = ["rusty_alloc/blockmap"]
 
 # Standalone workspace: the fuzz crate needs nightly + libFuzzer and must not
 # drag those requirements into the main workspace's Windows/stable builds.

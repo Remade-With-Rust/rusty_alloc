@@ -335,6 +335,25 @@ impl Heap {
             };
             (*p).block_size = bsize;
             (*p).reserved = ((slices * SEGMENT_SLICE_SIZE) / bsize) as u32;
+            // `blockmap`: the liveness map is carved from the front of this
+            // page's payload (see `page_extend`), so the block count has to
+            // come down by the bytes it occupies or the last block would run
+            // off the end of the span. Sized from the PRE-reduction count,
+            // which is conservative — the map that actually gets carved is
+            // sized from the reduced `reserved` and is therefore no larger.
+            //
+            // `bs_shift`/`bs_inv` turn an address delta into a block index
+            // with a shift and a multiply instead of a division; block sizes
+            // here are not powers of two, so the division would otherwise land
+            // on the allocation hot path.
+            #[cfg(feature = "blockmap")]
+            {
+                let raw = (slices * SEGMENT_SLICE_SIZE) / bsize;
+                let bm = crate::page::bitmap_bytes(raw);
+                (*p).reserved = ((slices * SEGMENT_SLICE_SIZE - bm) / bsize) as u32;
+                (*p).payload = ptr::null_mut();
+                (*p).bs_inv = crate::page::odd_mod_inverse(bsize >> bsize.trailing_zeros());
+            }
             (*p).capacity = 0;
             (*p).used = 0;
             (*p).free = ptr::null_mut();
