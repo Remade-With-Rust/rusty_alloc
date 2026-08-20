@@ -86,7 +86,7 @@ MIT. See `LICENSE` at the repository root.
 
 **Tier** critical-path · **Audited** 2026-08-19 (survey) · **v1.0.0 gates** 12/15 · [Full checklist](https://github.com/remade-with-rust/rusty_alloc/blob/main/crates/rusty_alloc/docs/plans/use-protection-please.md)
 
-`█████████████████░░░` **89%** &nbsp;·&nbsp; 31 Completed · 1 Scheduled · 3 Incomplete · 20 N/A
+`█████████████████░░░` **89%** &nbsp;·&nbsp; 32 Completed · 1 Scheduled · 3 Incomplete · 19 N/A
 
 | Phase | ✅ Completed | 🗓 Scheduled | ⬜ Incomplete | · N/A |
 |---|--:|--:|--:|--:|
@@ -100,10 +100,10 @@ MIT. See `LICENSE` at the repository root.
 | 7 — Formal verification | 1 | 0 | 0 | 0 |
 | 8 — Build and binary | 0 | 0 | 0 | 2 |
 | 9 — Runtime privilege | 0 | 0 | 0 | 1 |
-| 10 — Cryptography | 1 | 0 | 0 | 2 |
+| 10 — Cryptography | 2 | 0 | 0 | 1 |
 | 11 — CI/CD, release, and operations | 3 | 0 | 2 | 0 |
 | 12 — Compliance controls | 0 | 0 | 0 | 14 |
-| **Total** | **31** | **1** | **3** | **20** |
+| **Total** | **32** | **1** | **3** | **19** |
 
 **Next up** — H-27 Continuous fuzzing with no open crashes (2026-09-19 (30 days from the nightly job's first run))
 

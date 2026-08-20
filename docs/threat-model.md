@@ -107,6 +107,104 @@ bytes and followed them, and a test asserting only "the child died" would pass
 in exactly the case the mitigation failed. Confirmed by disabling the check
 and watching the signal flip.
 
+## Side-channel analysis (H-35)
+
+Performed 2026-08-20. The row previously read `N/A` on the grounds that "no
+secret-equality comparison exists… not a MAC verify". That answered only half
+the gate — which asks for constant-time behaviour **and no secret branches** —
+and it stopped being true the same day, when the free-list link check grew a
+branch on a key-derived value. The correct answer is not "inapplicable" but
+"analysed, with one characterised residual".
+
+### What is secret here
+
+Three values, none of them user data: the per-page free-list keys
+(`keys = [rng.next_usize() | 1, rng.next_usize()]`, regenerated for every
+page), the per-heap ChaCha8 state (OS-seeded at heap creation), and — only
+when guarded sampling is switched on — the sampling countdown. Their sole
+value is to an attacker already executing inside the process. That is exactly
+why H-20 is `N/A` while this row is not: H-20 asks whether user secrets are
+protected (there are none), this one asks whether these values leak in a way
+that defeats the mitigation they exist to power.
+
+### Channel 1 — the link check is a secret-dependent branch
+
+`link_is_plausible(dec, b.addr())` branches on `dec = (enc ^ k0) - k1`, which
+is key-derived. That is a secret branch, and denying it would be false.
+
+It carries no timing signal, though, and for a specific reason: **its outcome
+is invariant across every legitimate input.** A valid link always passes both
+conditions, so on any non-corrupt workload the branch never varies and there is
+nothing to distinguish. It speaks only by aborting, which is its purpose.
+
+### Channel 2 — the abort oracle (real, self-destroying)
+
+An attacker with a write primitive can submit a chosen `enc` and learn one bit
+from whether the process dies: did that value decode block-aligned and inside
+the segment? That is a genuine oracle.
+
+It does not accumulate. Each query costs the whole process, and on restart the
+heap CSPRNG reseeds from OS entropy, so the keys it was probing no longer
+exist. Even within one process the keys are per-page, so a fresh page voids
+whatever was learned. An oracle that destroys its own secret on every use is
+not a practical attack, and that — not "no secret branches" — is the honest
+reason this is acceptable.
+
+### Channel 3 — the encoding does not resist a READ primitive
+
+This is the real residual (**R-005**), and it is inherited from mimalloc's
+scheme rather than introduced here.
+
+Encoding is `enc = (next + k1) ^ k0`. An attacker who can *read* a freed
+block's link word and who knows or can infer `next` obtains one equation in
+the two unknowns. Two such pairs from the same page are solvable bit-by-bit
+from the least-significant end, as mixed XOR/add systems generally are.
+
+Full key recovery is not even required for the practical attack. To redirect a
+link to a target `T` near a known block `n1`, the attacker needs
+`(T + k1) ^ (n1 + k1)`, which collapses to `T ^ n1` in every bit position
+where the addition does not carry. Targets close to a known block are
+therefore forgeable with high probability and no key knowledge at all. Since
+the same-segment bound already confines targets to one segment, and blocks
+within a page are close together, this residual is precisely the case the
+bound cannot help with: **intra-page redirection, i.e. type confusion between
+two live objects of the same size class.**
+
+The posture to state plainly: free-list encoding is designed against a *blind*
+overwrite. It is not designed against read-plus-write, and it does not survive
+one. Also noted for completeness — `k0` is forced odd (`| 1`), so one bit of
+64 is known a priori; negligible on its own, but it is not zero.
+
+### Channel 4 — RNG modulo timing (negligible)
+
+`Random::below(n)` is `next_usize() % n`: a hardware divide whose dividend is
+secret and whose latency can vary with operand values on some cores. It is
+reachable only when guarded sampling is enabled (inert by default), and the
+value it computes decides *which* allocation gets a guard page — something the
+attacker can already observe directly from the guard page itself. The channel
+therefore reveals nothing that is not already in plain sight.
+
+### Channel 5 — returned pointers leak nothing
+
+The encoding exists only inside freed memory. Every pointer handed to a caller
+is a real block address at a deterministic page offset, so no key-derived value
+ever crosses the API boundary.
+
+### The CSPRNG itself
+
+ChaCha8 is an ARX construction — add, rotate, XOR. No S-boxes, no table
+lookups, no data-dependent branches or memory accesses, so it is structurally
+constant-time; there is no cache-timing surface of the AES-table variety to
+have. Its core is pinned against RFC 8439 §2.1.1 (see H-34).
+
+### Conclusion
+
+No constant-time *comparison* obligation exists (no MAC verify, no secret
+equality anywhere). One secret-dependent branch exists; it is invariant on
+legitimate inputs and self-limiting as an oracle. The residual worth tracking
+is R-005: an attacker holding both read and write primitives can forge
+intra-page links, which encoding was never built to prevent.
+
 ## Residual risks
 
 Tracked with owners and review dates in the audit plan files:
@@ -114,6 +212,9 @@ Tracked with owners and review dates in the audit plan files:
 [core](../crates/rusty_alloc/docs/plans/use-protection-please.md) ·
 [api](../crates/rusty_alloc_api/docs/plans/use-protection-please.md).
 Headlines: R-001 foreign-pointer trust in `free` (upstream parity, `secure`
-mitigates), R-002 bespoke ChaCha8 for hardening randomness, R-003 OOM abort
-in heap creation, R-004 no coverage-guided fuzzing yet (targets landing; the
-soak is scheduled work).
+mitigates), R-002 bespoke ChaCha8 for hardening randomness (vetted against RFC
+8439 vectors as of 2026-08-19 — see H-34), R-003 OOM abort in heap creation,
+R-004 no coverage-guided fuzzing yet (targets landing; the soak is scheduled
+work), R-005 free-list encoding does not survive a read primitive, so an
+attacker holding read AND write can forge intra-page links (see the
+side-channel analysis above).
