@@ -240,6 +240,56 @@ impl Heap {
         self.malloc_generic(size)
     }
 
+    /// Allocate `size` bytes, fully zeroed — `malloc` + zeroing, but with the
+    /// popped page IN HAND so the recycled-block path never re-resolves the
+    /// usable size.
+    ///
+    /// The public `zalloc`/`calloc` used to do `malloc(size)` then
+    /// `zero_block(p, is_zero)`, and `zero_block`'s non-zero arm called
+    /// `usable_size(p)` — which masks to the segment, resolves the page, checks
+    /// the segment kind and un-aligns, all to recover a `block_size` this
+    /// function already holds in `(*p).block_size`. On the steady calloc churn
+    /// path (recycled block ⇒ `free_is_zero` false) that resolution ran on
+    /// every call. Here it is a single field load.
+    #[inline]
+    pub fn zalloc(&mut self, size: usize) -> *mut u8 {
+        if size <= SMALL_SIZE_MAX {
+            let w = wsize_from_size(size);
+            let p = self.direct[w];
+            // SAFETY: direct entries always point at a live page of this heap
+            // or at the immortal sentinel; we hold the heap lock.
+            let b = unsafe { page_pop(p) };
+            if !b.is_null() {
+                self.stat_alloc();
+                // SAFETY: b is a live block of p; `(*p).block_size` is its
+                // usable extent — this path never hands out an interior
+                // (aligned-at) pointer, so no unalign is needed.
+                unsafe {
+                    if (*p).free_is_zero {
+                        b.cast::<usize>().write(0);
+                    } else {
+                        ptr::write_bytes(b, 0, (*p).block_size);
+                    }
+                }
+                return b;
+            }
+        }
+        // Slow/large path: rare, and the generic allocator has resolved the
+        // page anyway. Recover the usable size the general way.
+        let (b, is_zero) = self.malloc_generic(size);
+        if !b.is_null() {
+            // SAFETY: b is a live block just returned by malloc_generic.
+            unsafe {
+                if is_zero {
+                    b.cast::<usize>().write(0);
+                } else {
+                    ptr::write_bytes(b, 0, crate::alloc::usable_size(b));
+                }
+            }
+        }
+        b
+    }
+
     /// The slow path — mimalloc's heartbeat: runs when a fast list is dry, so
     /// deferred work (collect, extend, fresh pages; later: purge, deferred
     /// frees) happens at a regular allocation cadence.

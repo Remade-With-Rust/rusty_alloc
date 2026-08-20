@@ -241,14 +241,11 @@ pub fn zalloc(size: usize) -> *mut u8 {
     if h.is_null() {
         return ptr::null_mut(); // heap creation failed: OOM ⇒ null
     }
-    // SAFETY: own heap; zero_block contract below.
-    unsafe {
-        let (p, is_zero) = (*h).malloc(size);
-        if !p.is_null() {
-            zero_block(p, is_zero);
-        }
-        p
-    }
+    // `Heap::zalloc` zeroes with the popped page in hand, avoiding the
+    // `usable_size` re-resolution the old `malloc` + `zero_block` pair paid on
+    // every recycled block (opps.md #5).
+    // SAFETY: own live heap.
+    unsafe { (*h).zalloc(size) }
 }
 
 /// Make a just-popped block fully zero. Even "fresh zero" blocks carry the
