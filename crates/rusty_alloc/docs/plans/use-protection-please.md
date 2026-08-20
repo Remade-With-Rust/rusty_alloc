@@ -39,7 +39,7 @@ and a supply-chain attacker targeting the two external deps.
 trusts `slice_offset` read from the pointer's own segment, so a pointer that
 is not ours yields an arbitrary `slot.sub(off)` (upstream mimalloc has the
 identical shape; `secure` adds encrypted free lists + guard pages).
-*Full model* — not yet written (H-01).
+*Full model* — [docs/threat-model.md](../../../../docs/threat-model.md) (2026-08-19).
 
 ---
 
@@ -51,29 +51,29 @@ identical shape; `secure` adds encrypted free lists + guard pages).
 
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
-| H-01 | ★ Threat model documented and linked from README | Incomplete | No `docs/threat-model.md`, no `SECURITY.md`; the sketch above is a seed, not the model | |
-| H-02 | Threat model revisited after last major change | Incomplete | Blocked on H-01 | |
+| H-01 | ★ Threat model documented and linked from README | Completed | `docs/threat-model.md` (assets, adversaries, trust boundaries, STRIDE pass, 2026-08-19); linked from the root README §Security and this crate's README | |
+| H-02 | Threat model revisited after last major change | Completed | Model dated 2026-08-19, same day as the last code change; revisit triggers named in the model header | |
 
 ### Phase 1 — Toolchain
 
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
-| H-03 | Toolchain pinned (`rust-toolchain.toml`) | Incomplete | `rust-toolchain.toml` exists with components+targets, but `channel = "stable"` floats — pass needs an explicit `1.x.y` | |
+| H-03 | Toolchain pinned (`rust-toolchain.toml`) | Completed | `channel = "1.97.1"` + components + tier-1 targets; CI jobs pin the same version explicitly | |
 | H-04 | Committed `.cargo/config.toml` hardening defaults | Incomplete | No `.cargo/config.toml` in the repo | |
-| H-05 | ★ Release profile hardened (overflow-checks, LTO, panic policy) | Incomplete | `[profile.release]`: `lto="thin"`, `codegen-units=1`, `panic="abort"` all deliberate — but **no `overflow-checks = true`**. For an allocator this needs a MEASURED decision (bench/icount-arms.sh A/B), not a blind flag; hot-path arithmetic is masks/shifts | |
-| H-06 | Security toolchain available to CI and developers | Incomplete | `.github/workflows/ci.yml` installs rustfmt/clippy/miri only; no deny/audit/vet/geiger anywhere | |
+| H-05 | ★ Release profile hardened (overflow-checks, LTO, panic policy) | Incomplete | LTO/cgu/panic deliberate. `overflow-checks = true` now MEASURED (2026-08-19, opscan): batch +4.19 Ir/op (+7.1%, would fall back behind mimalloc), mixed +15.6 (+11%), med +4.3 — a waiver is PROPOSED on that number (untrusted-size arithmetic is explicitly `checked_*`; every debug/test/Miri build runs with overflow checks on). Owner decision: waive or eat it | |
+| H-06 | Security toolchain available to CI and developers | Completed | CI installs version-pinned cargo-deny 0.20.2, cargo-audit 0.22.2, cargo-fuzz 0.13.2, miri, clippy, rustfmt; vet/geiger arrive with their gates | |
 
 ### Phase 2 — Supply chain
 
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
-| H-07 | ★ `Cargo.lock` committed | Incomplete | **`.gitignore` line 2 ignores `Cargo.lock`** — `git check-ignore Cargo.lock` confirms. Modern cargo guidance tracks lockfiles for libraries too | |
-| H-08 | ★ `deny.toml` policy present and enforced | Incomplete | No `deny.toml`. Surface is small: two external deps (`libc`, `windows-sys`) + dev-deps (loom) | |
-| H-09 | ★ Vulnerability scan clean (`cargo audit`) | Incomplete | Not run (tool not installed); nothing in CI | |
+| H-07 | ★ `Cargo.lock` committed | Completed | `.gitignore` line removed; `Cargo.lock` tracked as of 2026-08-19 | |
+| H-08 | ★ `deny.toml` policy present and enforced | Completed | `deny.toml` covers advisories+licenses+bans+sources; `cargo deny check` = `advisories ok, bans ok, licenses ok, sources ok` (2026-08-19, deep run); per-PR in CI. The ban policy caught `cc` via dev-only loom→generator on its first run — scoped `wrappers` exception with written justification | |
+| H-09 | ★ Vulnerability scan clean (`cargo audit`) | Completed | `cargo audit --deny warnings` clean over 46 lockfile deps (2026-08-19); per-PR + weekly cron in CI | |
 | H-10 | ★ `cargo vet` coverage complete | Incomplete | No `supply-chain/`; vet never initialised | |
 | H-11 | Unsafe inventory measured and trending down (geiger) | Incomplete | Not run; static census 2026-08-19: 347 `unsafe` occurrences / 226 `SAFETY:` comments across src/ (baseline for the trend) | |
 | H-12 | ★ SBOM generated and published with releases | Incomplete | No SBOM on the v0.7.0 release; `cargo auditable`/`cyclonedx` not in the release flow | |
-| H-13 | Git deps pinned; no unknown registries or sources | Incomplete | Zero git deps, zero alternate registries (grep of manifests) — the missing half is `[sources]` enforcement in `deny.toml` (H-08) | |
+| H-13 | Git deps pinned; no unknown registries or sources | Completed | Zero git deps; `deny.toml` `[sources]` denies unknown registries/git, allow-list = crates.io only; `sources ok` in the deep run | |
 | H-14 | Dependency freshness reviewed, human-in-the-loop updates | Incomplete | No Renovate/Dependabot config; no triaged outdated report | |
 
 ### Phase 3 — Code level
@@ -81,9 +81,9 @@ identical shape; `secure` adds encrypted free lists + guard pages).
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
 | H-15 | ★ Workspace lint policy set and clean | Incomplete | `[workspace.lints]` denies `unsafe_op_in_unsafe_fn` + `clippy::undocumented_unsafe_blocks`; `cargo clippy --all-targets --all-features -- -D warnings` exit 0 (run 2026-08-19, and per-PR in CI). Below the bar only because pedantic/nursery are not configured | |
-| H-16 | ★ `unsafe` isolated, SAFETY-commented, inventoried | Incomplete | SAFETY comments are **lint-enforced** (`undocumented_unsafe_blocks = deny`, clippy clean 2026-08-19), confined to prim/, page/segment metadata and the xthread protocol per design. Missing: `UNSAFE.md` inventory with purpose + audit dates | |
+| H-16 | ★ `unsafe` isolated, SAFETY-commented, inventoried | Completed | SAFETY comments lint-enforced (`undocumented_unsafe_blocks = deny`, clippy clean); `UNSAFE.md` module inventory with purpose + last-audit dates + the four `unsafe impl` justifications + rules of engagement (2026-08-19) | |
 | H-17 | Arithmetic safety explicit | Incomplete | Positive spot-checks: `calloc`/`mallocn`/`reallocn`/`recalloc` use `checked_mul`; `slice_offset` range guarded by a const assert. 19 explicit-arithmetic calls counted; the full `as`-cast review on untrusted sizes has not been done | |
-| H-18 | ★ No `unwrap`/`expect`/panic on untrusted paths; typed errors | Incomplete | src/ census: 2 `unwrap` (both `prim/mock.rs`, Miri-only mock, not shipped) + **1 `expect` at `init.rs:499` (`create_heap`) — heap-creation OOM aborts instead of letting `malloc` return null; reachable from a fresh thread's first allocation under memory exhaustion**. Fix or justify | |
+| H-18 | ★ No `unwrap`/`expect`/panic on untrusted paths; typed errors | Completed | The `init.rs:499` OOM `expect` is FIXED (2026-08-19): heap-creation failure now propagates null through every allocation path (mimalloc parity); api constructors get a defined panic; the 2 remaining unwraps are the Miri-only mock. Cost priced at +1 Ir on the generic path only (batch 59.17, mixed IMPROVED to 139.07) | |
 | H-19 | Input validation — external bytes treated as hostile | Incomplete | Sizes: overflow-checked, huge → dedicated segments, `align` power-of-two-validated. Pointers: `free` trusts `slice_offset` from the pointer's own segment — a FOREIGN pointer yields a wild `slot.sub(off)` (upstream parity; `secure` mitigates via encrypted free lists + guard pages; `mi_is_in_heap_region` exists but is not on the free path). Recorded as R-001 | |
 | H-20 | ★ Secrets zeroized; never logged | N/A | No user/long-lived secret material in the unit: the per-page free-list keys and CSPRNG state are in-process hardening state, valueless outside the live process; the crate has no logging at all (0 log macros) | |
 | H-21 | Concurrency discipline | Completed | 4 manual `unsafe impl Send/Sync` (`TlsSlot`, `EmptyPage`, `EmptyHeapBox`), each with a written justification at the impl; no `static mut`; the cross-thread free protocol is loom-model-checked (`tests/loom_xthread.rs`, written before the implementation) and Miri-clean including the MT storm (33 tests, 2026-08-19) | |
@@ -99,15 +99,15 @@ identical shape; `secure` adds encrypted free lists + guard pages).
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
 | H-23 | ★ Tests pass under Miri | Completed | `cargo +nightly miri test -p rusty_alloc`, whole target, 2026-08-19: **33 tests passed, 0 UB, 0 leaks**, including `stress_mt` (the abandon/adopt storm, 411 s interpreted) and `rss_churn`; also per-PR in CI (`ci.yml` miri job). Register-read tests are `#[cfg_attr(miri, ignore)]` with in-file reasons | |
-| H-24 | Critical paths pass the sanitizers (ASan/MSan/TSan) | Incomplete | Never run (needs nightly + `-Zbuild-std`; deferred since M4) | |
+| H-24 | Critical paths pass the sanitizers (ASan/MSan/TSan) | Incomplete | ASan now runs implicitly — both fuzz targets build `-Zsanitizer=address` and executed 628k inputs with 0 findings (2026-08-19) — but the TEST SUITE has not run under ASan/TSan/MSan | |
 | H-25 | `cargo careful test` green | Incomplete | Never run; tool not installed | |
 
 ### Phase 6 — Fuzzing and properties
 
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
-| H-26 | ★ Fuzz target per public parser, decoder, or message handler | Incomplete | **No `fuzz/` directory.** The v1 plan (G5) specified 4 targets — arbitrary alloc/free/realloc/aligned traces, MT schedules, OOM injection — never built. The trace format + replayer (`rusty_alloc_bench`) already exist as the natural harness | |
-| H-27 | ★ Continuous fuzzing with no open crashes | Incomplete | No fuzzing has ever run (blocked on H-26) | |
+| H-26 | ★ Fuzz target per public parser, decoder, or message handler | Completed | `fuzz/` with seeded corpora (2026-08-19): `alloc_ops` (malloc/zalloc/aligned/realloc/usable/free/collect op sequences with CANARY discipline — detects two-owners/overlap, not just crashes) and `xthread` (cross-thread frees + thread teardown/abandon/adopt). Both build under ASan+libFuzzer; smoke: 514k + 114k execs, 0 findings; per-PR smoke job in CI | |
+| H-27 | ★ Continuous fuzzing with no open crashes | Incomplete | Targets exist and run (628k combined smoke execs under ASan, 0 crashes; per-PR CI smoke) — the ≥30-day coverage-guided soak has not elapsed yet; start the clock | |
 | H-28 | Property tests cover the documented invariants | Incomplete | Hand-rolled property-style tests exist (e.g. `bins` size-class law derived from `os::page_size()`; G1 replay asserts alignment/zeroing/disjointness/canaries on 1M-op traces) but no proptest/quickcheck over arbitrary inputs | |
 | H-29 | Mutation and/or differential testing on critical modules | Completed | This project IS differentially tested by design: G2 runs recorded traces through us and C mimalloc side-by-side (semantic equality, bin geometry pinned via `good_size`); 2026-08-19 executed the 3-arm real-world sweep (8 programs byte-identical vs mimalloc AND glibc, 144/144 runs) and the 19-config corpus sweep. No mutation score (open refinement, not a gap in the gate's either/or) | |
 
@@ -142,10 +142,10 @@ identical shape; `secure` adds encrypted free lists + guard pages).
 
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
-| H-37 | CI runs the hardening gate on every PR | Incomplete | Per-PR: fmt + clippy(-D warnings, all features) + check + test + **Miri** + wasm-execute + oracle build (`ci.yml`) — strong, but no deny/audit, and actions pinned by tag (`@v4`, `@stable`) not SHA | |
+| H-37 | CI runs the hardening gate on every PR | Completed | Per-PR: fmt, clippy(-D warnings), check, test, deny, audit, Miri, fuzz-smoke, wasm-execute, oracle; actions SHA-pinned; tools version-pinned; `permissions: contents: read` (least-privilege token); weekly advisory cron | |
 | H-38 | Releases signed, attested, and changelogged for security | Incomplete | `v0.7.0` is an unsigned annotated tag; no provenance/auditable artifacts; `docs/LEDGER.md` records security-relevant changes in prose but there is no CHANGELOG security section | |
-| H-39 | ★ `SECURITY.md` with a coordinated disclosure process | Incomplete | Absent. Note the project HAS a working disclosure history (FFAI's 0.3.1 segfault report → same-day 0.3.2 + yank recommendation) — the process exists informally and needs writing down with a contact + response window | |
-| H-40 | Advisory monitoring and scheduled re-audit | Incomplete | No RustSec subscription recorded; no re-audit schedule (this file's Next review is the first) | |
+| H-39 | ★ `SECURITY.md` with a coordinated disclosure process | Completed | `SECURITY.md` (2026-08-19): private GitHub advisories contact, 3-business-day acknowledgement, 90-day coordinated disclosure, supported-versions and scope sections | |
+| H-40 | Advisory monitoring and scheduled re-audit | Completed | RustSec monitored by `cargo audit` per-PR AND a weekly CI cron (Mondays 06:00); re-audit scheduled quarterly (Next review 2026-11-19, in the header) | |
 | H-41 | ★ Residual risks listed and accepted; waivers time-bounded | Incomplete | Register below is populated (R-001..R-004) but **acceptance is pending the owner** — an auditor cannot accept risk on the owner's behalf | |
 
 ### Phase 12 — Compliance controls
@@ -226,3 +226,4 @@ Append one line per pass; never rewrite history. The trend is the point.
 | Date | Depth | Auditor | Completed / Scheduled / Incomplete | ★ met | Note |
 |---|---|---|---|---|---|
 | 2026-08-19 | survey+cited tools | Claude Fable 5 | 3 / 0 / 32 (20 N/A) | 1/15 | first pass; ★ blockers: H-01 H-05 H-07 H-08 H-09 H-10 H-12 H-15 H-16 H-18 H-26 H-27 H-39 H-41 |
+| 2026-08-19 | deep (tools executed) | Claude Fable 5 | 16 / 0 / 19 (20 N/A) | 9/15 | same-day execution pass: lockfile, deny+audit clean, SECURITY.md, threat model, UNSAFE.md, toolchain pin, CI hardening, OOM null-fix, fuzz targets live (628k execs). ★ blockers left: H-05(waiver) H-10 H-12 H-15 H-27(soak) H-41(owner) |

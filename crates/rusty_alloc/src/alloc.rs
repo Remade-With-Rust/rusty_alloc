@@ -48,15 +48,47 @@ unsafe fn owner_heap(pg: *mut Page) -> *mut Heap {
         if xh != 0 {
             (*init::box_of_xheap(xh)).heap.get()
         } else {
-            my_heap() // pre-M6 pages / fallback
+            // Pre-M6 pages / fallback. Reaching here on a thread whose heap
+            // creation FAILED is impossible for a live page: the local free
+            // path requires this thread to own the segment, which requires it
+            // to have allocated, which requires a created heap.
+            let h = my_heap();
+            debug_assert!(!h.is_null(), "owner_heap fallback on a heapless thread");
+            h
         }
     }
 }
 
+/// This thread's heap, creating it on first use — NULL when creation fails
+/// (memory exhaustion). Every caller is a slow path and must treat null as
+/// "the allocation fails": return null / skip the bookkeeping. The malloc
+/// FAST path never sees this — the TLS slot holds the immortal sentinel, and
+/// `malloc_slow` performs its own null check after `ensure_heap`.
 #[inline]
 fn my_heap() -> *mut Heap {
-    // SAFETY: heap_box returns this thread's live box.
-    unsafe { (*init::heap_box()).heap.get() }
+    let hb = init::heap_box();
+    if hb.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: non-null ⇒ this thread's live box.
+    unsafe { (*hb).heap.get() }
+}
+
+/// Bump a per-heap realloc counter, tolerating a heapless thread (a thread
+/// whose heap creation failed under memory exhaustion has no counters).
+#[inline]
+fn stat_realloc(in_place: bool) {
+    let h = my_heap();
+    if !h.is_null() {
+        // SAFETY: own live heap; counters only.
+        unsafe {
+            if in_place {
+                (*h).stats.realloc_in_place += 1;
+            } else {
+                (*h).stats.realloc_moved += 1;
+            }
+        }
+    }
 }
 
 /// Allocate `size` bytes (8-byte aligned; 16-multiple bins are 16-aligned).
@@ -110,21 +142,48 @@ pub fn malloc(size: usize) -> *mut u8 {
 #[cold]
 #[inline(never)]
 unsafe fn malloc_slow(hb: *mut init::HeapBox, size: usize) -> *mut u8 {
-    let hb = init::ensure_heap(hb);
-    // SAFETY: `hb` is now this thread's live, initialised box — exclusive
-    // &mut scope on the calling thread's own heap. Straight to the generic
-    // path: the fast list was dry (or the size non-small) a moment ago on
-    // this same thread, so re-running the fast path here could only repeat
-    // the miss — `mixed` measured +0.68 Ir/op for that repeat before this
-    // went direct.
+    if hb != init::empty_heap_box_ptr() {
+        // SAFETY: a non-sentinel box is this thread's live, initialised box —
+        // exclusive &mut scope on the calling thread's own heap. Straight to
+        // the generic path: the fast list was dry (or the size non-small) a
+        // moment ago on this same thread, so re-running the fast path here
+        // could only repeat the miss — `mixed` measured +0.68 Ir/op for that
+        // repeat before this went direct. This arm must stay a TAIL call: the
+        // first OOM-handling shape kept the once-per-thread init in this
+        // function, whose register needs cost the common slow path a
+        // push/pop + call/ret pair (+2.4 Ir/op on `mixed`).
+        return unsafe { (*(*hb).heap.get()).malloc_generic(size).0 };
+    }
+    malloc_first(size)
+}
+
+/// A fresh thread's very first allocation: create the heap, then allocate.
+/// Split from [`malloc_slow`] so its register needs (keeping `size` alive
+/// across `init_thread_heap`) are paid once per THREAD, not once per slow
+/// call.
+#[cold]
+#[inline(never)]
+fn malloc_first(size: usize) -> *mut u8 {
+    let hb = init::ensure_heap(init::empty_heap_box_ptr());
+    if hb.is_null() {
+        // Heap creation failed (memory exhaustion): the malloc contract on
+        // OOM is a null return, never an abort. The TLS slot still holds the
+        // sentinel, so a later call retries creation.
+        return ptr::null_mut();
+    }
+    // SAFETY: hb is this thread's live, initialised box.
     unsafe { (*(*hb).heap.get()).malloc_generic(size).0 }
 }
 
 /// Allocate `size` zeroed bytes.
 pub fn zalloc(size: usize) -> *mut u8 {
+    let h = my_heap();
+    if h.is_null() {
+        return ptr::null_mut(); // heap creation failed: OOM ⇒ null
+    }
     // SAFETY: own heap; zero_block contract below.
     unsafe {
-        let (p, is_zero) = (*my_heap()).malloc(size);
+        let (p, is_zero) = (*h).malloc(size);
         if !p.is_null() {
             zero_block(p, is_zero);
         }
@@ -184,8 +243,12 @@ pub fn malloc_aligned(size: usize, align: usize) -> *mut u8 {
 /// `mi_malloc_aligned_at(size, alignment, offset)`: returns `p` with
 /// `(p + offset) % alignment == 0`.
 pub fn malloc_aligned_at(size: usize, align: usize, offset: usize) -> *mut u8 {
+    let h = my_heap();
+    if h.is_null() {
+        return ptr::null_mut(); // heap creation failed: OOM ⇒ null
+    }
     // SAFETY: own heap.
-    unsafe { (*my_heap()).malloc_aligned_at(size, align, offset).0 }
+    unsafe { (*h).malloc_aligned_at(size, align, offset).0 }
 }
 
 /// `mi_zalloc_aligned`.
@@ -195,9 +258,13 @@ pub fn zalloc_aligned(size: usize, align: usize) -> *mut u8 {
 
 /// `mi_zalloc_aligned_at`.
 pub fn zalloc_aligned_at(size: usize, align: usize, offset: usize) -> *mut u8 {
+    let h = my_heap();
+    if h.is_null() {
+        return ptr::null_mut(); // heap creation failed: OOM ⇒ null
+    }
     // SAFETY: own heap; zero_block contract (zeroes [p, p+usable)).
     unsafe {
-        let (p, is_zero) = (*my_heap()).malloc_aligned_at(size, align, offset);
+        let (p, is_zero) = (*h).malloc_aligned_at(size, align, offset);
         if !p.is_null() {
             zero_block(p, is_zero);
         }
@@ -246,8 +313,7 @@ pub unsafe fn realloc_aligned_at(
         && newsize >= usable / 2
         && (p.addr() + offset).is_multiple_of(align.max(1))
     {
-        // SAFETY: own heap, stats only.
-        unsafe { (*my_heap()).stats.realloc_in_place += 1 };
+        stat_realloc(true);
         return p;
     }
     let np = malloc_aligned_at(newsize, align, offset);
@@ -258,7 +324,7 @@ pub unsafe fn realloc_aligned_at(
     unsafe {
         core::ptr::copy_nonoverlapping(p, np, usable.min(newsize));
         free(p);
-        (*my_heap()).stats.realloc_moved += 1;
+        stat_realloc(false);
     }
     np
 }
@@ -320,8 +386,7 @@ pub unsafe fn rezalloc_aligned_at(
         && newsize >= usable / 2
         && (p.addr() + offset).is_multiple_of(align.max(1))
     {
-        // SAFETY: own heap, stats only.
-        unsafe { (*my_heap()).stats.realloc_in_place += 1 };
+        stat_realloc(true);
         return p;
     }
     let np = if align <= 1 {
@@ -340,7 +405,7 @@ pub unsafe fn rezalloc_aligned_at(
         let new_usable = usable_size(np);
         core::ptr::write_bytes(np.add(keep), 0, new_usable - keep);
         free(p);
-        (*my_heap()).stats.realloc_moved += 1;
+        stat_realloc(false);
     }
     np
 }
@@ -612,8 +677,7 @@ pub unsafe fn realloc(p: *mut u8, newsize: usize) -> *mut u8 {
         // the deterministic instrument (perl 1.0602 -> 1.0602, sqlite
         // 1.0305 -> 1.0305, unchanged to four digits). Reverted: an
         // unmeasurable gain does not justify losing a work-parity counter.
-        // SAFETY: own heap for stats only.
-        unsafe { (*my_heap()).stats.realloc_in_place += 1 };
+        stat_realloc(true);
         return p;
     }
     let np = malloc(newsize);
@@ -624,7 +688,7 @@ pub unsafe fn realloc(p: *mut u8, newsize: usize) -> *mut u8 {
     unsafe {
         core::ptr::copy_nonoverlapping(p, np, usable.min(newsize));
         free(p);
-        (*my_heap()).stats.realloc_moved += 1;
+        stat_realloc(false);
     }
     np
 }
@@ -680,15 +744,23 @@ pub fn is_in_heap_region(p: *const u8) -> bool {
 /// `mi_collect`: drain cross-thread frees and retire empty pages of the
 /// calling thread's heap.
 pub fn collect(force: bool) {
+    let h = my_heap();
+    if h.is_null() {
+        return; // heapless thread: nothing to collect
+    }
     // SAFETY: own heap.
-    unsafe { (*my_heap()).collect(force) };
+    unsafe { (*h).collect(force) };
 }
 
 /// Snapshot of the CALLING thread's heap counters (per-heap by design —
 /// work-parity gates run single-threaded where these are exact).
 pub fn stats() -> crate::heap::Stats {
+    let h = my_heap();
+    if h.is_null() {
+        return crate::heap::Stats::new(); // heapless thread: zero counters
+    }
     // SAFETY: own heap.
-    unsafe { (*my_heap()).stats }
+    unsafe { (*h).stats }
 }
 
 // ---------------------------------------------------------------------------

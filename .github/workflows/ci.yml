@@ -3,10 +3,21 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly advisory sweep (H-40): cargo-audit re-checks the RustSec feed even
+  # when nothing is being merged.
+  schedule:
+    - cron: "0 6 * * 1"
+
+# Least-privilege token (H-37): nothing in this workflow writes to the repo.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
+# Actions are SHA-pinned (H-37): a moved tag must not change what CI runs.
+# checkout 11d5960a = v4.2.2 · rust-toolchain 6c977a6c = master 2026-07 ·
+# setup-node 49933ea5 = v4.4.0. Bump deliberately, with the SHA.
 jobs:
   test:
     strategy:
@@ -15,9 +26,10 @@ jobs:
         os: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4          # submodules NOT needed for the Rust gates
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
+          toolchain: 1.97.1
           components: rustfmt, clippy
       - name: fmt
         run: cargo fmt --all --check
@@ -28,13 +40,47 @@ jobs:
       - name: test (all features)
         run: cargo test --workspace --all-features
 
+  # H-06/H-08/H-09: the supply-chain gate — policy (deny) + advisories (audit)
+  # on every PR, tools version-pinned so the gate itself is reproducible.
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+      - name: install cargo-deny + cargo-audit (pinned)
+        run: cargo install cargo-deny --version 0.20.2 --locked && cargo install cargo-audit --version 0.22.2 --locked
+      - name: cargo deny check
+        run: cargo deny check
+      - name: cargo audit
+        run: cargo audit --deny warnings
+
+  # H-26/H-27: the fuzz targets must BUILD and survive a short libFuzzer run
+  # on every PR (the long soak runs on its own schedule; this catches a
+  # target that rotted or a crasher that reproduces instantly).
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: nightly
+      - name: install cargo-fuzz (pinned)
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: fuzz alloc_ops (smoke)
+        run: cargo +nightly fuzz run alloc_ops -- -max_total_time=60
+      - name: fuzz xthread (smoke)
+        run: cargo +nightly fuzz run xthread -- -max_total_time=60
+
   # The compile-gate rule: both tier-1 targets checked even where they don't run.
   cross-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
+          toolchain: 1.97.1
           targets: x86_64-pc-windows-msvc
       - name: check windows target from linux
         run: cargo check --workspace --target x86_64-pc-windows-msvc
@@ -43,9 +89,10 @@ jobs:
   miri:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
+          toolchain: nightly
           components: miri
       - name: miri (mock prim backend)
         run: cargo +nightly miri test -p rusty_alloc
@@ -56,11 +103,12 @@ jobs:
   wasm:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
+          toolchain: 1.97.1
           targets: wasm32-unknown-unknown
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "20"
       - name: check core for wasm32
@@ -73,7 +121,7 @@ jobs:
   oracle:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           submodules: recursive
       - name: build oracle arms

@@ -35,7 +35,7 @@ spoofing), and reporters who need a disclosure channel that works.
 *Highest-value attack path* — a poisoned release: no signed tags, no SBOM, no
 lockfile in VCS means a tampered dependency tree is hard to detect after the
 fact.
-*Full model* — not yet written (H-01).
+*Full model* — [docs/threat-model.md](../threat-model.md) (2026-08-19).
 
 ---
 
@@ -47,29 +47,29 @@ fact.
 
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
-| H-01 | ★ Threat model documented and linked from README | Incomplete | No `docs/threat-model.md`, no `SECURITY.md` anywhere in the repo | |
-| H-02 | Threat model revisited after last major change | Incomplete | Blocked on H-01 | |
+| H-01 | ★ Threat model documented and linked from README | Completed | `docs/threat-model.md` (assets, adversaries, trust boundaries, STRIDE pass, 2026-08-19); README §Security links it | |
+| H-02 | Threat model revisited after last major change | Completed | Model dated 2026-08-19, same day as the last code change | |
 
 ### Phase 1 — Toolchain
 
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
-| H-03 | Toolchain pinned (`rust-toolchain.toml`) | Incomplete | Present (components + tier-1 targets) but `channel = "stable"` floats; pass needs `1.x.y` | |
+| H-03 | Toolchain pinned (`rust-toolchain.toml`) | Completed | `channel = "1.97.1"` + components + tier-1 targets; CI pins the same version | |
 | H-04 | Committed `.cargo/config.toml` hardening defaults | Incomplete | Absent | |
-| H-05 | ★ Release profile hardened (overflow-checks, LTO, panic policy) | Incomplete | `[profile.release]`: `lto="thin"` + `codegen-units=1` + `panic="abort"` all deliberate and commented; **no `overflow-checks = true`** — needs the measured decision (see core plan) | |
-| H-06 | Security toolchain available to CI and developers | Incomplete | `ci.yml` installs rustfmt/clippy/miri; deny/audit/vet/geiger absent from CI and the dev docs | |
+| H-05 | ★ Release profile hardened (overflow-checks, LTO, panic policy) | Incomplete | LTO/cgu/panic deliberate; `overflow-checks = true` MEASURED at +7.1% batch / +11% mixed (core plan H-05) — waiver proposed on that number, owner decision pending | |
+| H-06 | Security toolchain available to CI and developers | Completed | CI installs version-pinned cargo-deny 0.20.2, cargo-audit 0.22.2, cargo-fuzz 0.13.2, miri, clippy, rustfmt | |
 
 ### Phase 2 — Supply chain
 
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
-| H-07 | ★ `Cargo.lock` committed | Incomplete | **`.gitignore:2` ignores `Cargo.lock`** (`git check-ignore` confirms) | |
-| H-08 | ★ `deny.toml` policy present and enforced | Incomplete | Absent. Dependency surface is deliberately tiny: `libc`, `windows-sys`, dev-only `loom` | |
-| H-09 | ★ Vulnerability scan clean (`cargo audit`) | Incomplete | Never run; not in CI | |
+| H-07 | ★ `Cargo.lock` committed | Completed | `.gitignore` entry removed; lockfile tracked as of 2026-08-19 | |
+| H-08 | ★ `deny.toml` policy present and enforced | Completed | `cargo deny check` = all four checks ok (2026-08-19); per-PR in CI; the ban policy caught dev-only `cc` (loom→generator) on its first run — scoped exception with written justification | |
+| H-09 | ★ Vulnerability scan clean (`cargo audit`) | Completed | Clean over 46 lockfile deps (2026-08-19); per-PR + weekly cron in CI | |
 | H-10 | ★ `cargo vet` coverage complete | Incomplete | No `supply-chain/` | |
 | H-11 | Unsafe inventory measured and trending down (geiger) | Incomplete | Not run; member static baselines recorded 2026-08-19 (core 347/226, api 14) | |
 | H-12 | ★ SBOM generated and published with releases | Incomplete | v0.7.0 released without an SBOM | |
-| H-13 | Git deps pinned; no unknown registries or sources | Incomplete | Zero git deps and zero alternate registries across all six manifests; `[sources]` enforcement pending `deny.toml` | |
+| H-13 | Git deps pinned; no unknown registries or sources | Completed | Zero git deps; `[sources]` in `deny.toml` denies unknown, crates.io-only allow-list; `sources ok` | |
 | H-14 | Dependency freshness reviewed, human-in-the-loop updates | Incomplete | No Renovate/Dependabot config | |
 
 ### Phase 3 — Code level
@@ -94,7 +94,7 @@ fact.
 
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
-| H-23 | ★ Tests pass under Miri | Completed | CI runs `cargo +nightly miri test -p rusty_alloc` on every PR (`ci.yml` miri job); 2026-08-19 whole-target run: 33 tests, 0 UB (core plan H-23). The api member's own Miri coverage is vacuous — tracked there | |
+| H-23 | ★ Tests pass under Miri | Completed | CI runs `cargo +nightly miri test -p rusty_alloc` on every PR (`ci.yml` miri job); 2026-08-19 whole-target run: 33 tests, 0 UB (core plan H-23); the api member now has its own Miri suite (5 tests, no longer vacuous) | |
 | H-24 | Critical paths pass the sanitizers (ASan/MSan/TSan) | Incomplete | Never run (workspace CI has no sanitizer matrix) | |
 | H-25 | `cargo careful test` green | Incomplete | Never run | |
 
@@ -102,8 +102,8 @@ fact.
 
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
-| H-26 | ★ Fuzz target per public parser, decoder, or message handler | Incomplete | No `fuzz/` anywhere in the workspace (v1 plan G5 specified 4 targets, never built) | |
-| H-27 | ★ Continuous fuzzing with no open crashes | Incomplete | Blocked on H-26 | |
+| H-26 | ★ Fuzz target per public parser, decoder, or message handler | Completed | `fuzz/` (alloc_ops + xthread, seeded corpora, canary discipline); 628k smoke execs under ASan, 0 findings; per-PR smoke in CI — details in the core plan | |
+| H-27 | ★ Continuous fuzzing with no open crashes | Incomplete | Targets live; the ≥30-day soak has not elapsed — start the clock | |
 | H-28 | Property tests cover the documented invariants | Incomplete | Audited per member; no proptest/quickcheck anywhere | |
 | H-29 | Mutation and/or differential testing on critical modules | Completed | The workspace's whole gate design is differential: the vendored C mimalloc oracle (G2 semantic trace diff), the 3-arm byte-identity real-world sweep (144/144, 2026-08-19), the 19-config corpus sweep — see core plan H-29 | |
 
@@ -138,10 +138,10 @@ fact.
 
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
-| H-37 | CI runs the hardening gate on every PR | Incomplete | Per-PR: fmt, clippy(-D warnings, all features), check, test(all features), Miri, wasm-EXECUTE, oracle build — a strong base; missing deny/audit, and actions are tag-pinned (`@v4`) not SHA-pinned | |
+| H-37 | CI runs the hardening gate on every PR | Completed | fmt, clippy, check, test, deny, audit, Miri, fuzz-smoke, wasm-execute, oracle per PR; actions SHA-pinned; tools version-pinned; least-privilege token; weekly advisory cron | |
 | H-38 | Releases signed, attested, and changelogged for security | Incomplete | `v0.4.0`/`v0.7.0` tags unsigned; no provenance; `docs/LEDGER.md` documents security-relevant changes in prose (a real asset) but no CHANGELOG discipline | |
-| H-39 | ★ `SECURITY.md` with a coordinated disclosure process | Incomplete | Absent. Informal process demonstrably works (FFAI's 0.3.1 report → same-day fix + yank recommendation); needs a contact + window + policy in writing | |
-| H-40 | Advisory monitoring and scheduled re-audit | Incomplete | No RustSec feed subscription recorded; this audit sets the first Next-review date | |
+| H-39 | ★ `SECURITY.md` with a coordinated disclosure process | Completed | Present at the repo root: private GitHub advisories, 3-business-day ack, 90-day coordinated disclosure, scope + supported versions | |
+| H-40 | Advisory monitoring and scheduled re-audit | Completed | cargo-audit per-PR + weekly CI cron; quarterly re-audit (Next review 2026-11-19) | |
 | H-41 | ★ Residual risks listed and accepted; waivers time-bounded | Incomplete | Register below; acceptance pending the owner | |
 
 ### Phase 12 — Compliance controls
@@ -210,3 +210,4 @@ nothing is Scheduled until both are filled.
 | Date | Depth | Auditor | Completed / Scheduled / Incomplete | ★ met | Note |
 |---|---|---|---|---|---|
 | 2026-08-19 | survey+cited tools | Claude Fable 5 | 2 / 0 / 28 (25 N/A) | 1/13 | first pass; ★ blockers: H-01 H-05 H-07 H-08 H-09 H-10 H-12 H-15 H-26 H-27 H-39 H-41 |
+| 2026-08-19 | deep (tools executed) | Claude Fable 5 | 14 / 0 / 16 (25 N/A) | 7/13 | same-day execution pass. ★ blockers left: H-05(waiver) H-10 H-12 H-15 H-27(soak) H-41(owner) |

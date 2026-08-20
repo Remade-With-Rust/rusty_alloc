@@ -1,0 +1,55 @@
+# cargo-deny policy (H-08). The dependency surface is deliberately tiny —
+# libc + windows-sys at runtime, loom/libc dev-only — and this file is what
+# keeps it that way. Run: `cargo deny check` (CI does, on every PR).
+
+[graph]
+all-features = true
+
+[advisories]
+# Any advisory (vulnerability, unmaintained, unsound, notice) is a failure
+# until triaged; ignores must carry a dated reason here.
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# The product is MIT; permissive-only in the tree. The vendored oracle and
+# bench corpus are git submodules, not cargo dependencies, so they never
+# appear in this graph (they keep their own licences and never ship).
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Path-only deps in publish=false fixture crates (rusty_alloc-wasm -> the
+# core) carry no version; that is not a registry wildcard.
+allow-wildcard-paths = true
+# The reason this allocator exists: no C in the dependency tree. A *-sys
+# crate that builds C would defeat the premise silently; windows-sys is
+# bindings-only (no cc) and is the one permitted exception by name.
+#
+# The `wrappers` exception on `cc` is DEV-ONLY reach: loom (the model
+# checker, a dev-dependency that never ships) pulls generator, whose build
+# script uses cc. The published crates' runtime graph stays C-free; this
+# ban still fires if cc ever appears anywhere else. (Found by this very
+# policy on its first run, 2026-08-19.)
+deny = [
+    { crate = "cc", wrappers = ["generator"] },
+    { crate = "openssl-sys" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

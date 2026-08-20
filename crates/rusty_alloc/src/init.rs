@@ -456,7 +456,10 @@ pub fn for_each_heap(f: &mut dyn FnMut(&crate::heap::Heap)) {
     heaps_unlock();
 }
 
-/// Get (or create) the calling thread's heap box.
+/// Get (or create) the calling thread's heap box. NULL when creation fails
+/// (memory exhaustion) — callers translate that into their own failure value
+/// (a null allocation, a no-op collect); the TLS slot keeps the sentinel so a
+/// later call retries.
 #[inline]
 pub fn heap_box() -> *mut HeapBox {
     let hb = heap_tls::get();
@@ -481,7 +484,7 @@ pub fn heap_box_fast() -> *mut HeapBox {
 }
 
 /// Upgrade a possibly-sentinel box from [`heap_box_fast`] to this thread's
-/// real, initialised heap box.
+/// real, initialised heap box. NULL when creation fails (see [`heap_box`]).
 #[inline]
 pub fn ensure_heap(hb: *mut HeapBox) -> *mut HeapBox {
     if hb != empty_heap_box_ptr() {
@@ -493,10 +496,18 @@ pub fn ensure_heap(hb: *mut HeapBox) -> *mut HeapBox {
 
 /// Allocate + initialize a HeapBox (shared by thread bootstrap and
 /// `mi_heap_new*`). Registered in the global registry; NOT installed in TLS.
+///
+/// Returns NULL when the OS refuses the mapping (memory exhaustion). This
+/// used to `expect()` — which, under the release profile's `panic = "abort"`,
+/// turned OOM into a process abort on a path reachable from any fresh
+/// thread's first `malloc`. The malloc contract on OOM is a null return, and
+/// upstream returns NULL from `mi_heap_new` for the same reason (H-18/R-003
+/// in the hardening audit).
 pub fn create_heap(tag: i32, allow_destroy: bool, arena_id: i32) -> *mut HeapBox {
     let size = core::mem::size_of::<HeapBox>();
-    let block = os::alloc_aligned(size, os::page_size(), true, false)
-        .expect("rusty_alloc: cannot allocate heap");
+    let Ok(block) = os::alloc_aligned(size, os::page_size(), true, false) else {
+        return ptr::null_mut();
+    };
     let hb: *mut HeapBox = block.ptr.cast();
     // SAFETY: fresh committed mapping large enough for HeapBox; we initialize
     // every field before publishing the pointer.
@@ -537,6 +548,11 @@ pub fn create_heap(tag: i32, allow_destroy: bool, arena_id: i32) -> *mut HeapBox
 #[cold]
 fn init_thread_heap() -> *mut HeapBox {
     let hb = create_heap(0, false, -1);
+    if hb.is_null() {
+        // OOM: install nothing — the TLS slot keeps the sentinel, so the
+        // NEXT allocation retries creation instead of dereferencing null.
+        return ptr::null_mut();
+    }
     heap_tls::set(hb);
     BACKING_PTR.with(|c| c.set(hb));
     done_slot().set(hb.cast::<c_void>());

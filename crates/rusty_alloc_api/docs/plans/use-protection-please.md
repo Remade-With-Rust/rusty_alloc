@@ -31,7 +31,7 @@ core must uphold the core's contracts from safe Rust.
 (double free via `Heap` misuse, layout mismatch in `GlobalAlloc`).
 *Highest-value attack path* — a safe API sequence that reaches the core with a
 violated precondition; the core's double-free abort and Miri are the nets.
-*Full model* — covered by the core crate's model once H-01 lands there.
+*Full model* — [docs/threat-model.md](../../../../docs/threat-model.md) (2026-08-19).
 
 ---
 
@@ -43,29 +43,29 @@ violated precondition; the core's double-free abort and Miri are the nets.
 
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
-| H-01 | ★ Threat model documented and linked from README | Incomplete | None; will link the core crate's model when it exists | |
+| H-01 | ★ Threat model documented and linked from README | Completed | Links `docs/threat-model.md` from the crate README (absolute URL for crates.io) | |
 | H-02 | Threat model revisited after last major change | N/A | tier `crit` only | |
 
 ### Phase 1 — Toolchain
 
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
-| H-03 | Toolchain pinned (`rust-toolchain.toml`) | Incomplete | Workspace file exists; `channel = "stable"` floats (needs `1.x.y`) | |
+| H-03 | Toolchain pinned (`rust-toolchain.toml`) | Completed | Workspace pin `1.97.1` | |
 | H-04 | Committed `.cargo/config.toml` hardening defaults | Incomplete | Absent at workspace root | |
-| H-05 | ★ Release profile hardened (overflow-checks, LTO, panic policy) | Incomplete | Inherits workspace `[profile.release]` — deliberate LTO/cgu/panic, no `overflow-checks = true` (see core plan H-05) | |
-| H-06 | Security toolchain available to CI and developers | Incomplete | CI lacks deny/audit/vet/geiger (workspace-level) | |
+| H-05 | ★ Release profile hardened (overflow-checks, LTO, panic policy) | Incomplete | Inherits the workspace profile; `overflow-checks` measured + waiver proposed (core plan H-05) | |
+| H-06 | Security toolchain available to CI and developers | Completed | Workspace CI: version-pinned deny/audit/fuzz/miri/clippy/rustfmt | |
 
 ### Phase 2 — Supply chain
 
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
-| H-07 | ★ `Cargo.lock` committed | Incomplete | Workspace `.gitignore` ignores `Cargo.lock` | |
-| H-08 | ★ `deny.toml` policy present and enforced | Incomplete | None (workspace-level) | |
-| H-09 | ★ Vulnerability scan clean (`cargo audit`) | Incomplete | Not run; sole dependency is the sibling core crate | |
+| H-07 | ★ `Cargo.lock` committed | Completed | Workspace lockfile tracked as of 2026-08-19 | |
+| H-08 | ★ `deny.toml` policy present and enforced | Completed | Workspace `cargo deny check` all-ok (2026-08-19); per-PR in CI | |
+| H-09 | ★ Vulnerability scan clean (`cargo audit`) | Completed | Clean over the workspace lockfile (2026-08-19); per-PR + weekly cron | |
 | H-10 | ★ `cargo vet` coverage complete | N/A | tier `crit` only | |
 | H-11 | Unsafe inventory measured and trending down (geiger) | N/A | tier `crit` only | |
 | H-12 | ★ SBOM generated and published with releases | Incomplete | No SBOM on the v0.7.0 release | |
-| H-13 | Git deps pinned; no unknown registries or sources | Incomplete | Zero git deps (path+version dep on the core only); `[sources]` enforcement pending `deny.toml` | |
+| H-13 | Git deps pinned; no unknown registries or sources | Completed | Path+version dep on the core only; `[sources]` enforced workspace-wide | |
 | H-14 | Dependency freshness reviewed, human-in-the-loop updates | Incomplete | No update-bot config | |
 
 ### Phase 3 — Code level
@@ -73,7 +73,7 @@ violated precondition; the core's double-free abort and Miri are the nets.
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
 | H-15 | ★ Workspace lint policy set and clean | Incomplete | Same workspace lints + clippy clean (2026-08-19, per-PR CI); pedantic/nursery not configured | |
-| H-16 | ★ `unsafe` isolated, SAFETY-commented, inventoried | Incomplete | 14 `unsafe` occurrences, SAFETY comments lint-enforced (`undocumented_unsafe_blocks = deny`, clippy clean); no `UNSAFE.md` | |
+| H-16 | ★ `unsafe` isolated, SAFETY-commented, inventoried | Completed | SAFETY comments lint-enforced; the crate's 14 sites are in the workspace `UNSAFE.md` inventory (GlobalAlloc/Allocator contract row) | |
 | H-17 | Arithmetic safety explicit | Completed | No size arithmetic in the shim: layouts pass through to the core, which owns the checked math (grep: 0 arithmetic-discipline sites needed, 0 raw `as` on lengths) | |
 | H-18 | ★ No `unwrap`/`expect`/panic on untrusted paths; typed errors | Completed | grep 2026-08-19: 0 `unwrap()`, 0 `expect(` in src/ | |
 | H-19 | Input validation — external bytes treated as hostile | N/A | tier `crit` only — the shim consumes no external bytes | |
@@ -90,7 +90,7 @@ violated precondition; the core's double-free abort and Miri are the nets.
 
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
-| H-23 | ★ Tests pass under Miri | Incomplete | `cargo +nightly miri test -p rusty_alloc-api` run 2026-08-19: **0 tests executed (1 ignored) — a vacuous pass, which the registry rules Incomplete.** The crate's behaviour is exercised under Miri only indirectly through the core's suites; it needs its own Miri-runnable tests | |
+| H-23 | ★ Tests pass under Miri | Completed | `tests/api_miri.rs` added (GlobalAlloc round-trips incl. zeroed + realloc-prefix, first-class Heap delete-migration and destroy): `cargo +nightly miri test -p rusty_alloc-api` = **5 passed, 0 failed** (2026-08-19) — no longer vacuous | |
 | H-24 | Critical paths pass the sanitizers (ASan/MSan/TSan) | N/A | tier `crit` only | |
 | H-25 | `cargo careful test` green | N/A | tier `crit` only | |
 
@@ -134,10 +134,10 @@ violated precondition; the core's double-free abort and Miri are the nets.
 
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
-| H-37 | CI runs the hardening gate on every PR | Incomplete | fmt/clippy/check/test/Miri(core)/wasm per PR; no deny/audit; actions tag-pinned not SHA-pinned | |
+| H-37 | CI runs the hardening gate on every PR | Completed | Workspace CI (see root plan H-37) | |
 | H-38 | Releases signed, attested, and changelogged for security | Incomplete | Unsigned tags; no attestation | |
-| H-39 | ★ `SECURITY.md` with a coordinated disclosure process | Incomplete | Absent (workspace-level fix) | |
-| H-40 | Advisory monitoring and scheduled re-audit | Incomplete | None recorded | |
+| H-39 | ★ `SECURITY.md` with a coordinated disclosure process | Completed | Repo-root `SECURITY.md` covers both published crates | |
+| H-40 | Advisory monitoring and scheduled re-audit | Completed | Workspace monitoring (per-PR + weekly cron); quarterly re-audit | |
 | H-41 | ★ Residual risks listed and accepted; waivers time-bounded | Incomplete | Register below listed; acceptance pending the owner | |
 
 ### Phase 12 — Compliance controls
@@ -197,3 +197,4 @@ Proposed order; Owner/Target are the human step.
 | Date | Depth | Auditor | Completed / Scheduled / Incomplete | ★ met | Note |
 |---|---|---|---|---|---|
 | 2026-08-19 | survey+cited tools | Claude Fable 5 | 2 / 0 / 20 (33 N/A) | 1/12 | first pass; ★ blockers: H-01 H-05 H-07 H-08 H-09 H-12 H-15 H-16 H-23 H-39 H-41 |
+| 2026-08-19 | deep (tools executed) | Claude Fable 5 | 15 / 0 / 7 (33 N/A) | 8/12 | same-day execution pass. ★ blockers left: H-05(waiver) H-12 H-15 H-41(owner) |

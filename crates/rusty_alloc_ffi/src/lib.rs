@@ -226,6 +226,9 @@ pub extern "C" fn mi_thread_init() {
 #[unsafe(no_mangle)]
 pub extern "C" fn mi_thread_done() {
     let hb = rusty_alloc::init::heap_box();
+    if hb.is_null() {
+        return; // heap creation failed earlier (OOM): nothing to tear down
+    }
     // SAFETY: hb is the calling thread's live box; thread_done clears the TLS
     // pointer so a later allocation re-creates a fresh heap.
     unsafe { rusty_alloc::init::thread_done(hb) };

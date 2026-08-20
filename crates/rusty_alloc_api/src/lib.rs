@@ -34,18 +34,30 @@ pub struct Heap {
 
 impl Heap {
     /// New heap; dropped ⇒ blocks migrate to the backing heap.
+    ///
+    /// # Panics
+    /// When the OS refuses the heap's backing mapping (memory exhaustion) —
+    /// a defined panic, matching std's convention for infallible
+    /// constructors, rather than a null pointer carried into later use.
     pub fn new() -> Heap {
+        let hb = rusty_alloc::init::create_heap(0, false, -1);
+        assert!(!hb.is_null(), "rusty_alloc: heap creation failed (OOM)");
         Heap {
-            hb: rusty_alloc::init::create_heap(0, false, -1),
+            hb,
             destroy_on_drop: false,
         }
     }
 
     /// New heap; dropped ⇒ every allocation is released wholesale
     /// (arena-style teardown).
+    ///
+    /// # Panics
+    /// As [`Heap::new`], on memory exhaustion.
     pub fn new_destroyable() -> Heap {
+        let hb = rusty_alloc::init::create_heap(0, true, -1);
+        assert!(!hb.is_null(), "rusty_alloc: heap creation failed (OOM)");
         Heap {
-            hb: rusty_alloc::init::create_heap(0, true, -1),
+            hb,
             destroy_on_drop: true,
         }
     }

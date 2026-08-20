@@ -1,0 +1,33 @@
+[package]
+name = "rusty_alloc-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rusty_alloc = { path = "../crates/rusty_alloc" }
+
+# Standalone workspace: the fuzz crate needs nightly + libFuzzer and must not
+# drag those requirements into the main workspace's Windows/stable builds.
+[workspace]
+
+[[bin]]
+name = "alloc_ops"
+path = "fuzz_targets/alloc_ops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xthread"
+path = "fuzz_targets/xthread.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
