@@ -29,7 +29,7 @@ are to try.
 | 4 | `update_direct` recomputes `bin_size` twice | 2 | batch loss | **ASSESSED — premise false, the cheap version is already there** |
 | 5 | `zero_block` re-resolves `usable_size` (calloc) | 2 | calloc | **LANDED — calloc 152.62 → 132.00, −20.62 Ir/op** |
 | 6 | Batch-op gap → traced to free's `used--` codegen | 3 | batch loss | **CLOSED as a codegen floor (refuted)** |
-| 7 | `wait_no_remote_in_flight` 512-slot scan | 3 | latency | proposed |
+| 7 | `wait_no_remote_in_flight` 512-slot scan | 3 | latency | **LANDED — bounded to the carved region** |
 | 8 | Collect-loop double `block_next` | — | batch loss | **banked (landed)** |
 
 ---
@@ -191,13 +191,29 @@ it against a path we already win on every other op and match on real programs.
 The earlier idea here (maintain the count at push time to avoid the collect walk)
 is moot: the walk is not where the gap is.
 
-### 7. `wait_no_remote_in_flight` 512-slot scan
+### 7. `wait_no_remote_in_flight` 512-slot scan — LANDED
 
 **Where:** [segment.rs:183](../crates/rusty_alloc/src/segment.rs#L183)
 
-O(512) scan on every segment release. Fires only on release (rare), so it is a
-latency spike, not a throughput cost — but a candidate for a bitmap if segment
-churn ever surfaces in a soak.
+Was a fixed O(512) scan on every segment release, checking each slot's
+`xthread_free` for an in-flight remote free (`XFLAG_FREEING`). But slots at or
+after `next_free_slice` were **never carved**, so their `xthread_free` is still
+0 — `& XMASK == XFLAG_NORMAL`, never `XFLAG_FREEING` — and scanning them is
+guaranteed-idle work.
+
+**Fix (2026-08-20):** bound the loop to the carved region
+`[HEADER_SLICES, next_free_slice)`. A segment that only ever carved 10 slices now
+scans 10, not 512 — the cost is proportional to how much of the segment was
+used, not a fixed 512. A Huge segment sets `next_free_slice = SLICES_PER_SEGMENT`
+so it is unaffected (correct — its one page spans the whole reservation).
+
+Deterministic-latency win: the worst case is unchanged (a segment that filled
+scans ~511) but the *typical* release — a lightly-used segment — is now far
+cheaper and, more importantly, **bounded by actual use**. Correctness rests on
+the never-carved invariant already documented at the top of `segment.rs`
+("carved region `[HEADER_SLICES, next_free_slice)`"), and is exercised by the
+loom-modeled cross-thread protocol test plus `stress_mt` / `teardown_reclaim` /
+`abandon_rss` — all green.
 
 ---
 
@@ -227,6 +243,7 @@ flat or negative result is a finding.
 | 2026-08-20 | 3 | **AUDIT — hot paths already clean** | 39 `panic_bounds_check` sites lib-wide, but **zero** reachable from the shipped `malloc` / `free` / `calloc` fast paths (confirmed on the override `.so`). All 39 are on slow/cold paths (segment alloc/free 11, visitors/adopt 6, arena 7, teardown, and 2 on the `malloc_generic` refill). The safe-Rust hot path pays NO bounds-check tax — the h264-skill lesson holds. Refill-path removal tracked below. |
 | 2026-08-20 | 5 | **LANDED — calloc 152.62 → 132.00 (−20.62 Ir/op)** | `Heap::zalloc` pops the block and zeroes it with the page IN HAND, using `(*p).block_size` for the usable extent instead of `zero_block`'s `usable_size(p)` re-resolution (segment mask + page resolve + kind check + unalign) on every recycled block. calloc 0.949x → **0.820x** vs mimalloc. Every other op byte-identical (small 79.38, batch 60.17, realloc 379.53 unchanged) — plain malloc/free untouched. Full-extent zeroing contract preserved (the `zalloc_is_zero_across_the_whole_usable_extent` property still passes). Workspace release + all-features clippy clean. |
 | 2026-08-20 | 4 | **ASSESSED — not worth it** | Premise false: `bin_size(bin)` is `bin << 3` for the common `bin <= 8`, and `bin_size(bin-1)` only runs for `bin > 8`. Replacing the shift with a table/stored load reintroduces a `panic_bounds_check` (bin from `bins::bin` is unbounded to LLVM) that costs more than it saves. The `.min` clamp that would bound it was tried under #3 and changed nothing. Left as-is. |
+| 2026-08-20 | 7 | **LANDED — segment-release scan bounded to actual use** | Fixed O(512) sweep on every segment release → `[HEADER_SLICES, next_free_slice)`, i.e. only the carved region; never-carved slots are guaranteed-idle (`xthread_free == 0`). A segment that carved 10 slices scans 10, not 512. Deterministic-latency win, bounded by use. Loom + stress_mt + teardown_reclaim + abandon_rss green; the aligned-op profile incidentally reconfirmed we already BEAT mimalloc there (ra 172/op vs mi 190/op — mimalloc burns 63/op in `_mi_page_retire`), so no parity gap to chase in the aligned path. |
 
 ### Refutation banked (do not retry the wrong way)
 

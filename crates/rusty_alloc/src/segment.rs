@@ -185,7 +185,17 @@ unsafe fn wait_no_remote_in_flight(seg: *mut Segment) {
     // SAFETY: the page table is inside the live header; atomics only.
     unsafe {
         let base: *mut Page = (&raw mut (*seg).pages).cast();
-        for i in 0..SLICES_PER_SEGMENT {
+        // Only the CARVED region can hold a page with a remote free in flight.
+        // Slots at/after `next_free_slice` were never carved, so their
+        // `xthread_free` is still 0 (`& XMASK == XFLAG_NORMAL`, never
+        // `XFLAG_FREEING`) — scanning them is guaranteed-idle work. Bounding to
+        // `[HEADER_SLICES, next_free_slice)` turns a fixed 512-slot sweep into
+        // one proportional to how much of the segment was ever used: a segment
+        // that carved 10 slices scans 10, not 512. (A Huge segment sets
+        // `next_free_slice = SLICES_PER_SEGMENT`, so it is unaffected — correct,
+        // since its one page occupies the whole reservation.)
+        let end = (*seg).next_free_slice as usize;
+        for i in HEADER_SLICES..end {
             let pg = base.add(i);
             while (*pg)
                 .xthread_free
