@@ -636,6 +636,18 @@ pub unsafe fn page_push_local(page: *mut Page, block: *mut Block) -> u32 {
         (*page).local_free = block;
         let u = (*page).used.wrapping_sub(1);
         (*page).used = u;
+        // NOTE (2026-08-20): this decrement is where the batch-op gap to
+        // mimalloc lives, and it is a safe-Rust CODEGEN FLOOR, not a fixable
+        // structure. mimalloc's free emits `subw $1, used; je` — one
+        // memory-destination RMW whose flags feed the retire branch (2
+        // instructions). We emit load / dec / store / test / branch (5),
+        // because the decremented value must be in memory before the branch
+        // (the retire tail re-reads `used`) AND drive the branch, and LLVM
+        // will not select `dec [mem]; jle` for that shape. Splitting the push
+        // from the decrement and inlining the latter next to the branch was
+        // tried and produced BYTE-IDENTICAL asm — see docs/opps.md #6. Closing
+        // it needs inline asm on the hottest path, which is not worth ~0.5% on
+        // one synthetic op.
         u
     }
 }

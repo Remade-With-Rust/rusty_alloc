@@ -28,7 +28,7 @@ are to try.
 | 3 | Emitted-bounds-check audit of the hot paths | 2 | unknown | proposed |
 | 4 | `update_direct` recomputes `bin_size` twice | 2 | batch loss | proposed |
 | 5 | `zero_block` re-resolves `usable_size` (calloc) | 2 | calloc | proposed |
-| 6 | Double-free count walk in `page_collect` | 3 | batch_fifo | proposed |
+| 6 | Batch-op gap → traced to free's `used--` codegen | 3 | batch loss | **CLOSED as a codegen floor (refuted)** |
 | 7 | `wait_no_remote_in_flight` 512-slot scan | 3 | latency | proposed |
 | 8 | Collect-loop double `block_next` | — | batch loss | **banked (landed)** |
 
@@ -128,15 +128,45 @@ growing the hot path's register pressure is the whole trick.
 
 ## Tier 3 — deterministic-latency, not instruction-hot
 
-### 6. Double-free count walk in `page_collect`
+### 6. The batch-op gap — TRACED, and it is a safe-Rust codegen floor
 
-**Where:** [page.rs:828-853](../crates/rusty_alloc/src/page.rs#L828-L853)
+**Where:** `free`'s `used` decrement, via [page.rs:page_push_local](../crates/rusty_alloc/src/page.rs#L625)
+and the retire branch in [alloc.rs:free_inline](../crates/rusty_alloc/src/alloc.rs#L598).
 
-Walks the entire stolen xthread chain every collect to count its length for the
-`used` decrement. On batch_fifo (the adversarial free order, one of the two
-losing ops) that chain is long. Maintaining the count at push time would avoid
-the walk, but the remote push is a lock-free CAS with a 2-bit flag packed in the
-word — intrusive. Lower priority; flagged for completeness.
+The +0.47 Ir/op batch_lifo/batch_fifo gap — our one measured loss to mimalloc —
+was localized on 2026-08-20 with a per-function callgrind profile + a direct
+disassembly of both allocators' `free`. Findings:
+
+- **malloc is at parity** (ra 15.99/op ≈ mi 15.99/op). The entire gap is in
+  `free`.
+- `free` fast path, executed instruction count: **ours 27, mimalloc 24** (excl.
+  its CET `endbr64`). The +3 breaks down as, instruction for instruction:
+  - **`used--` decrement: +3.** mimalloc emits `subw $1, [used]; je` — one
+    memory-destination RMW whose flags feed the retire branch (2 insns). We emit
+    `mov used→eax; dec; mov eax→used; test; jle` (5). LLVM will not select
+    `dec [mem]; jle` because the decremented value must be in memory before the
+    branch (the retire tail re-reads `used`) and also drive the branch.
+  - **thread compare: +1.** mimalloc does `cmp %rcx, %fs:0` — the TLS
+    self-pointer as a cmp memory operand. We do `mov %fs:0,%rcx` then `cmp`,
+    because `thread_id()` is an inline-asm `mov fs:0` that forces a register.
+  - **idx × sizeof(Page): −1** (we use one `imul`, mimalloc a `lea`+`shl`) — a
+    place we are already tighter.
+
+**Attempted and REFUTED (2026-08-20):** split the list-push from the `used`
+decrement and inlined the decrement adjacent to the branch, the shape most
+likely to trigger `dec [mem]`. Result: **byte-identical asm** — same
+`mov/dec/mov/test/jle` at the same addresses. Reverted; the only artifact is a
+NOTE at the decrement recording this so it is not retried. C's `--page->used <= 0`
+gets `subw; je` from Clang; the equivalent Rust does not, and neither fold is
+reachable without inline asm on the hottest path in the allocator.
+
+**Conclusion:** the batch gap is a **Rust-vs-C instruction-selection floor**, not
+an algorithmic deficiency. Both missing folds (memory-RMW decrement, fs-relative
+cmp operand) are LLVM codegen choices we cannot steer from safe Rust. Closing the
+last ~0.5% on this one synthetic op would take inline asm in `free` — not worth
+it against a path we already win on every other op and match on real programs.
+The earlier idea here (maintain the count at push time to avoid the collect walk)
+is moot: the walk is not where the gap is.
 
 ### 7. `wait_no_remote_in_flight` 512-slot scan
 
@@ -170,6 +200,7 @@ flat or negative result is a finding.
 | 2026-08-20 | 8 | landed | collect double-decode removed (banked with blockmap) |
 | 2026-08-20 | 2 | **LANDED** | realloc counter gated debug-only; opscan realloc 393.69 → 379.53 (**−14.16 Ir/op**, 0.788 → 0.759), removes a `my_heap()` TLS resolution per release realloc. No memory cost. Clean A/B vs freshly-built baseline. |
 | 2026-08-20 | 1 | **LANDED, with a refutation banked** | The stated target (opscan batch) was **byte-identical** — batch_lifo stayed 60.17. The two-point estimator `(Ir(2N)−Ir(N))/N` cancels the page-fill/refill where `page_extend`'s division lives, so opscan is structurally blind to this. The win is real but on WHOLE-PROGRAM page-carving: perl ra 777,445,780 → 776,731,380 (**−713k, −0.092%**), lua −413k (−0.068%), sqlite −9k, all deterministic (callgrind, exact per binary). Also a determinism win in its own right — removes 3 data-dependent-latency hardware DIVISIONS from the refill path. Cost: +8 B/page (Page 80 → 88), ≈0.01% memory; header still fits in slice 0 in every config (tightest, secure+blockmap, keeps ~4 KB headroom). |
+| 2026-08-20 | 6 | **REFUTED — codegen floor, nothing shipped** | Traced the batch gap to free's `used--` (5 insns vs mimalloc's `subw; je` = 2) + the thread-compare (`mov fs:0` + cmp vs mimalloc's `cmp reg, fs:0`). malloc is at parity; free is ours 27 / mi 24 executed insns. The push/decrement split meant to trigger `dec [mem]; jle` produced BYTE-IDENTICAL asm. Both folds need inline asm on the hottest path — declined. The gap is a Rust-vs-C instruction-selection floor, not algorithmic. A NOTE at the decrement records this so it is not retried. |
 
 ### Refutation banked (do not retry the wrong way)
 
