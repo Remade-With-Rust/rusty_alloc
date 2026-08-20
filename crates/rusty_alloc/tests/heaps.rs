@@ -159,8 +159,17 @@ fn heaps_arenas_subprocs_options() {
         options::get_size(23) >= 1024 * 1024 * 1024,
         "arena_reserve KiB scaling"
     );
-    let merged = rusty_alloc::stats::merged();
-    assert!(merged.allocs > 0);
+    // DEBUG ONLY: `allocs` is fed by `Heap::stat_alloc`, which is
+    // `#[cfg(debug_assertions)]` because it sits on the hottest path — so in
+    // release it is never incremented and this assertion cannot pass. (Its
+    // neighbours `large_allocs` / `realloc_in_place` are NOT gated, which is
+    // why `spans.rs` is unaffected.) Second of two such sites; both were red
+    // in `cargo test --release` and invisible because CI only runs debug.
+    #[cfg(debug_assertions)]
+    {
+        let merged = rusty_alloc::stats::merged();
+        assert!(merged.allocs > 0);
+    }
     let (_, _, _, rss, ..) = rusty_alloc::stats::process_info();
     assert!(rss > 0, "process_info rss");
 }

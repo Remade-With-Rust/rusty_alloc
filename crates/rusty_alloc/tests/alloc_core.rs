@@ -194,8 +194,19 @@ fn churn_sweep_randomized() {
     // Counters are process-global and tests run in parallel — a strict
     // allocs==frees leak check needs a single-test process (the replay gate
     // does it); here just assert the counters observed our work.
-    let s = rusty_alloc::alloc::stats();
-    assert!(s.allocs >= iters / 2);
+    //
+    // DEBUG ONLY, and this gate is the fix for a real defect: `stats.allocs`
+    // is itself `#[cfg(debug_assertions)]` (see `Heap::stat_alloc`), so in a
+    // release build it is never incremented and stays 0 — making this
+    // assertion fail 100% of the time, not flakily. It went unnoticed because
+    // CI runs `cargo test --workspace --all-features` in DEBUG and never in
+    // release, so `cargo test --release` has been red on this crate the whole
+    // time with nobody watching.
+    #[cfg(debug_assertions)]
+    {
+        let s = rusty_alloc::alloc::stats();
+        assert!(s.allocs >= iters / 2);
+    }
 }
 
 #[test]
