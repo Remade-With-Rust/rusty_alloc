@@ -102,7 +102,15 @@ fn span_lifecycle_and_realloc() {
         let s_ip0 = stats().realloc_in_place;
         let r2 = realloc(r, 112);
         assert_eq!(r2, r, "grow-within-usable must stay in place");
-        assert_eq!(stats().realloc_in_place - s_ip0, 1);
+        // The counter is the SECONDARY witness; pointer identity above is the
+        // behaviour callers depend on. Debug-only because `realloc_in_place` is
+        // now a `#[cfg(debug_assertions)]` counter (see `alloc::stat_realloc` —
+        // it was costing the release realloc path a full heap resolution just
+        // to bump a diagnostic). In release it stays 0, so assert only in debug.
+        #[cfg(debug_assertions)]
+        {
+            assert_eq!(stats().realloc_in_place - s_ip0, 1);
+        }
         // Grow across bins: moves, prefix preserved.
         let r3 = realloc(r2, 4096);
         assert!(!r3.is_null());

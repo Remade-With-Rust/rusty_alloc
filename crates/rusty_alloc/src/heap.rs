@@ -13,7 +13,7 @@ use crate::page::{
     page_extend, page_pop, page_push_local, page_set_flag, pflags,
 };
 use crate::segment::{
-    self, Segment, SegmentKind, huge_free, page_area, page_index, segment_of, span_alloc, span_free,
+    self, Segment, SegmentKind, huge_free, page_area, segment_of, span_alloc, span_free,
 };
 use crate::types::{
     BIN_FULL, BIN_HUGE, LARGE_OBJ_SIZE_MAX, MEDIUM_OBJ_SIZE_MAX, MEDIUM_PAGE_SLICES,
@@ -277,9 +277,10 @@ impl Heap {
             while !p.is_null() {
                 page_collect(p);
                 if (*p).free.is_null() && (*p).capacity < (*p).reserved {
-                    let seg = segment_of(p.cast());
-                    let idx = page_index(seg, p);
-                    page_extend(p, page_area(seg, idx));
+                    // `(*p).area` is the cached payload start (see `Page::area`);
+                    // it replaces `segment_of + page_index + page_area` — a mask,
+                    // a division and a shift — with one load on the refill path.
+                    page_extend(p, (*p).area);
                     self.stats.extends += 1;
                 }
                 if !(*p).free.is_null() {
@@ -309,9 +310,7 @@ impl Heap {
                 self.update_direct(bin);
                 return (ptr::null_mut(), false); // OOM
             }
-            let seg = segment_of(p.cast());
-            let idx = page_index(seg, p);
-            page_extend(p, page_area(seg, idx));
+            page_extend(p, (*p).area);
             self.stats.extends += 1;
             self.update_direct(bin);
             let b = page_pop(p);
@@ -470,11 +469,9 @@ impl Heap {
             (*p).xheap.store(self.delayed as usize, Ordering::Release);
             (*p).heap_tag = self.tag;
             page_set_flag(p, XFLAG_DELAYED);
-            let seg = segment_of(p.cast::<u8>());
-            let idx = page_index(seg, p);
             self.stat_alloc();
             self.stats.large_allocs += 1;
-            (page_area(seg, idx), fresh)
+            ((*p).area, fresh)
         }
     }
 

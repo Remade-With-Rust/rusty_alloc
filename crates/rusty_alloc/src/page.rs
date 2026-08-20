@@ -370,6 +370,19 @@ pub struct Page {
     pub reserved: u32,
     /// Block size in bytes (0 = free span / unused slot).
     pub block_size: usize,
+    /// Payload start of this page (`seg + idx * SEGMENT_SLICE_SIZE`), cached so
+    /// the refill path never has to recover it from the slot pointer.
+    ///
+    /// Recovering it means `page_index` — `(slot - pages_base) / size_of::
+    /// <Page>()`, a division by a non-power-of-two — followed by a multiply
+    /// back. That is fine ONCE, at carve, where the slice index is already an
+    /// integer (`span_mark`'s `idx`), so this is written there with a shift and
+    /// no division. It replaces three `segment_of + page_index + page_area`
+    /// chains on the generic refill path — exactly where batch alloc/free churn
+    /// lives, our one measured loss to mimalloc — with a single load. The
+    /// address is a fixed geometric property of the slot, so it never changes
+    /// once set. Null in the empty sentinel, which is never carved from.
+    pub area: *mut u8,
     /// Slices this page spans.
     pub slice_count: u16,
     /// For interior slices: distance BACK to the span-start slot, **in bytes**
@@ -519,6 +532,7 @@ impl Page {
             capacity: 0,
             reserved: 0,
             block_size: 8,
+            area: ptr::null_mut(),
             slice_count: 1,
             slice_offset: 0,
             bin: 0,

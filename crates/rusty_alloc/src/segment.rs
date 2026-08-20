@@ -285,6 +285,10 @@ unsafe fn span_mark(seg: *mut Segment, idx: usize, len: usize) {
     unsafe {
         (*seg).pages[idx].slice_offset = 0;
         (*seg).pages[idx].slice_count = len as u16;
+        // Cache the payload start now, while `idx` is an integer — a shift, no
+        // division. The refill path then reads `(*p).area` instead of
+        // recovering it with `page_index` (see `Page::area`).
+        (*seg).pages[idx].area = seg.cast::<u8>().add(idx * SEGMENT_SLICE_SIZE);
         let mut j = 1;
         while j < len {
             // BYTES back to the span start, not slices — see Page::slice_offset.
@@ -707,3 +711,4 @@ pub unsafe fn huge_free(seg: *mut Segment) -> Result<(), PrimError> {
         os::free(block)
     }
 }
+

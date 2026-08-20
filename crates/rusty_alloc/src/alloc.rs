@@ -121,18 +121,33 @@ fn debug_foreign_pointer_guard(p: *mut u8) {
 
 /// Bump a per-heap realloc counter, tolerating a heapless thread (a thread
 /// whose heap creation failed under memory exhaustion has no counters).
+///
+/// DEBUG ONLY, and that is the point: like `Heap::stat_alloc`/`stat_free` — and
+/// like upstream's `MI_STAT` — the realloc counters exist for diagnostics, not
+/// for the shipped allocator. Keeping them live cost the RELEASE realloc path a
+/// full `my_heap()` resolution (a TLS load, a null check, a `heap.get()`) on
+/// every call, purely to increment a number nobody reads in production — the
+/// realloc decision itself needs only `usable_size(p)`, never the owning heap.
+/// In release this compiles to nothing and the resolution disappears.
 #[inline]
 fn stat_realloc(in_place: bool) {
-    let h = my_heap();
-    if !h.is_null() {
-        // SAFETY: own live heap; counters only.
-        unsafe {
-            if in_place {
-                (*h).stats.realloc_in_place += 1;
-            } else {
-                (*h).stats.realloc_moved += 1;
+    #[cfg(debug_assertions)]
+    {
+        let h = my_heap();
+        if !h.is_null() {
+            // SAFETY: own live heap; counters only.
+            unsafe {
+                if in_place {
+                    (*h).stats.realloc_in_place += 1;
+                } else {
+                    (*h).stats.realloc_moved += 1;
+                }
             }
         }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = in_place;
     }
 }
 
@@ -903,8 +918,13 @@ pub unsafe fn heap_realloc(hb: *mut init::HeapBox, p: *mut u8, newsize: usize) -
     // SAFETY: p live per contract.
     let usable = unsafe { usable_size(p) };
     if newsize <= usable && newsize >= usable / 2 {
+        // Debug-only counter (see `stat_realloc`): the release path returns `p`
+        // with no heap touch at all.
+        #[cfg(debug_assertions)]
         // SAFETY: hb live.
-        unsafe { (*heap_of(hb)).stats.realloc_in_place += 1 };
+        unsafe {
+            (*heap_of(hb)).stats.realloc_in_place += 1;
+        }
         return p;
     }
     // SAFETY: forwarded contracts.
@@ -915,7 +935,10 @@ pub unsafe fn heap_realloc(hb: *mut init::HeapBox, p: *mut u8, newsize: usize) -
         }
         core::ptr::copy_nonoverlapping(p, np, usable.min(newsize));
         free(p);
-        (*heap_of(hb)).stats.realloc_moved += 1;
+        #[cfg(debug_assertions)]
+        {
+            (*heap_of(hb)).stats.realloc_moved += 1;
+        }
         np
     }
 }
