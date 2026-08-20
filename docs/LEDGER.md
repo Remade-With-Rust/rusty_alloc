@@ -4,6 +4,57 @@ One entry per milestone/brick: what landed, the numbers with their method lines,
 what was reverted and **which kind** of revert (measured-worse vs within-noise).
 Newest first.
 
+## RE-BENCHMARK after the huge-path fix — zero cost, and the HARNESS was lying in the 4th digit (2026-08-19)
+
+Asked to confirm the `remove_huge_segment` fix cost nothing. It costs nothing,
+and looking for that answer properly turned up an instrument defect.
+
+**The A/B, and it is a real one:** the pre-fix commit (`aca50c6`) built into
+its own target dir and measured ABBA-interleaved against HEAD in the same
+session, same box, same driver binary — not HEAD against a number written
+down earlier.
+
+| op | pre-fix | HEAD | delta |
+|---|---:|---:|---:|
+| **huge** (the ONLY path the fix touches) | 666.00 | 666.00 | **+0.00** |
+| big / large | 171.00 | 171.00 | +0.00 |
+| batch_lifo | 60.17 | 60.17 | +0.00 |
+| small | 79.38 | 79.38 | +0.00 |
+| mixed | 140.07 | 140.07 | +0.00 |
+
+Zero, exactly, everywhere. Expected on reflection: the walk already computed
+the answer, so `if self.remove_huge_segment(seg)` branches on a value already
+in a register, and the found path — the only one a correct program takes —
+falls straight through to the call it always made. `huge` repeated 666.00
+three times.
+
+**The instrument defect.** The real-program ratios moved in the 4th digit
+between runs (perl 0.9989 → 0.9992), which should be impossible: this ledger
+records perl and sqlite as "deterministic to 4-6 digits". Rather than wave it
+off as noise, measured it — three repeats per arm:
+
+| | run 1 | run 2 | run 3 | spread |
+|---|---:|---:|---:|---:|
+| unpinned, ra | 778,844,391 | 778,625,662 | 778,855,141 | **229,479** |
+| **PERL_HASH_SEED=0, ra** | 777,444,364 | 777,444,364 | 777,444,364 | **0** |
+
+**Perl randomises its hash seed per PROCESS**, so every run allocated a
+different pattern — ~0.03% of noise sitting exactly on the digit the ra/mi
+ratio is quoted to. `bench/icount-arms.sh` now pins `PERL_HASH_SEED` and
+`PERL_PERTURB_KEYS`; the perl arm is bit-identical run to run and the ratio
+is a stable **0.9991**.
+
+**The part worth remembering: this project had already learned this.**
+`bench/rss.sh` pins `PERL_HASH_SEED` — added 2026-08-06 after an 11 MiB swing
+on the same binary invalidated three RSS conclusions, and that entry states
+the rule as *"no null arm, no result"*. The lesson lived in one harness and
+was never carried across to the other, so the icount harness quietly repeated
+the same mistake in a different unit. **A lesson that lives in one instrument
+is not a lesson.** Lua's seed is not pinnable from the environment, so it
+stays labelled indicative; perl and sqlite are the verdicts.
+
+Standing numbers after both: lua 0.9797, **perl 0.9991**, sqlite 1.0003.
+
 ## HARDENING — a semgrep rule written from our own history found the 0.4.0 bug still live on the huge path (2026-08-19)
 
 Second finding of the day from a tool that had never been run here, and the
