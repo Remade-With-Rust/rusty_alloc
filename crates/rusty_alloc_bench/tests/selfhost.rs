@@ -127,9 +127,23 @@ fn work_parity_counters_move() {
     let v: Vec<Box<u64>> = (0..10_000).map(Box::new).collect();
     drop(v);
     let after = rusty_alloc::alloc::stats();
-    assert!(
-        after.allocs - before.allocs >= 10_000,
-        "counters must observe the work"
-    );
-    assert!(after.frees - before.frees >= 10_000);
+    // DEBUG ONLY. Both counters read here are fed by `Heap::stat_alloc` /
+    // `Heap::stat_free`, which are `#[cfg(debug_assertions)]` because they sit
+    // on the two hottest paths in the allocator. In a release build they are
+    // never incremented, both deltas are 0, and neither assertion can pass.
+    //
+    // Third and last site of this defect (after `alloc_core.rs` and
+    // `heaps.rs`), and the one that shows why it survived: it lives in a
+    // DIFFERENT crate, so testing `-p rusty_alloc` alone never reveals it. The
+    // full sweep is `allocs` and `frees` only — `large_allocs` and
+    // `realloc_in_place` are ungated, which is why `spans.rs` is fine.
+    #[cfg(debug_assertions)]
+    {
+        assert!(
+            after.allocs - before.allocs >= 10_000,
+            "counters must observe the work"
+        );
+        assert!(after.frees - before.frees >= 10_000);
+    }
+    let _ = (before, after);
 }
