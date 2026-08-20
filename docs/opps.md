@@ -245,6 +245,19 @@ barrier (~20 cycles, dirties the cache line) where a load is ~4 — so the
 wall-clock saving on every slow-path alloc is larger than the −1 Ir suggests.
 Both an instruction win and a deterministic-latency win.
 
+**Sibling check (curiosity discipline) — one rejected.** After #9 landed, the
+other unconditional locked RMWs on warm paths were audited for the same
+load-guard. The `flags.fetch_or(HAS_ALIGNED)` on the aligned-alloc path
+([heap.rs:716](../crates/rusty_alloc/src/heap.rs#L716)) looked identical — a
+sticky bit re-set on every adjusted aligned alloc — but load-guarding it is an
+**Ir REGRESSION**: unlike #9's swap (whose early return skipped the drain
+loop's register setup, netting −1 Ir), `fetch_or` is a leaf op with nothing to
+skip, so a peek adds `load + test + je` (2-3 Ir) to save one `lock or` (1 Ir).
+It would trade latency for instruction count — and this project's metric is Ir,
+so it would read as `aligned` regressing in every opscan. Not shipped;
+`page_collect`'s xthread steal was already load-guarded before it CASes, so #9
+was the one place the pattern actually paid.
+
 ## Banked
 
 ### 8. Collect-loop double `block_next` — LANDED 2026-08-20
