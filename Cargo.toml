@@ -34,7 +34,7 @@ categories = ["memory-management", "no-std", "development-tools"]
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(kani)"] }
 
 # Lint policy (hardening gate H-15). `pedantic` and `nursery` are ENABLED at
 # workspace level and the build is clean under them, because every group

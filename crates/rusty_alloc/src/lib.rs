@@ -22,6 +22,10 @@ pub mod options;
 pub mod os;
 pub mod page;
 pub mod prim;
+/// Kani proof harnesses (H-30). `cfg(kani)`-only: absent from every shipped
+/// build, so it costs the crate nothing.
+#[cfg(kani)]
+mod proofs;
 pub mod random;
 pub mod segment;
 pub mod segment_map;

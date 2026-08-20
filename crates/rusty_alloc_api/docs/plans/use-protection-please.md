@@ -135,7 +135,7 @@ violated precondition; the core's double-free abort and Miri are the nets.
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
 | H-37 | CI runs the hardening gate on every PR | Completed | Workspace CI (see root plan H-37) | |
-| H-38 | Releases signed, attested, and changelogged for security | Incomplete | Unsigned tags; no attestation | |
+| H-38 | Releases signed, attested, and changelogged for security | Incomplete | Machine-side DONE (2026-08-19): `release.yml` now emits `SHA256SUMS.txt` alongside the SBOMs and calls `actions/attest-build-provenance`, so every `v*` tag produces a signed, GitHub-attested statement of what built the artifacts and from which commit. Security-relevant changes are recorded per-milestone in `docs/LEDGER.md`. **The remaining half needs a human key**: tags are unsigned (`v0.4.0`, `v0.7.0`), and only the owner can hold the signing key — configure `user.signingkey` + `tag.gpgSign`, or adopt sigstore. Left Incomplete rather than claimed | |
 | H-39 | ★ `SECURITY.md` with a coordinated disclosure process | Completed | Repo-root `SECURITY.md` covers both published crates | |
 | H-40 | Advisory monitoring and scheduled re-audit | Completed | Workspace monitoring (per-PR + weekly cron); quarterly re-audit | |
 | H-41 | ★ Residual risks listed and accepted; waivers time-bounded | Incomplete | Register below listed; acceptance pending the owner | |

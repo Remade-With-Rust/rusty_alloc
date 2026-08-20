@@ -44,6 +44,13 @@ jobs:
           mv crates/rusty_alloc_api/rusty_alloc-api.cdx.json sbom/
           ls -la sbom/
 
+      # H-38: checksums make tampering detectable after the fact, which is
+      # the whole point of attaching anything. Generated here rather than by
+      # hand so they cannot drift from the artifacts they describe.
+      - name: checksum the artifacts
+        run: |
+          cd sbom && sha256sum *.cdx.json > SHA256SUMS.txt && cat SHA256SUMS.txt
+
       - name: attach to the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -51,7 +58,16 @@ jobs:
           tag="${{ github.event.inputs.tag || github.ref_name }}"
           gh release view "$tag" >/dev/null 2>&1 || \
             gh release create "$tag" --title "$tag" --generate-notes
-          gh release upload "$tag" sbom/*.cdx.json --clobber
+          gh release upload "$tag" sbom/*.cdx.json sbom/SHA256SUMS.txt --clobber
+
+      # Build provenance: a signed, GitHub-attested statement of WHAT built
+      # these artifacts, from WHICH commit and workflow. This is the half of
+      # H-38 that does not need a human key — tag signing does, and is the
+      # owner's step (documented in docs/RELEASING.md).
+      - name: attest build provenance
+        uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018 # v1
+        with:
+          subject-path: sbom/*.cdx.json
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

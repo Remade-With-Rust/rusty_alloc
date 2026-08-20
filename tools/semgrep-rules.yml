@@ -1,0 +1,106 @@
+# Semgrep rules for rusty_alloc (hardening gate H-22).
+#
+# Clippy is a general Rust linter. These rules encode THIS codebase's own
+# history: every one of them corresponds to a defect that actually shipped or
+# was caught late, recorded in docs/LEDGER.md. A generic ruleset would not
+# find any of them, which is the whole reason the gate asks for analysis
+# "beyond the default linter".
+
+rules:
+  # ---------------------------------------------------------------------
+  # The 0.4.0 use-after-free family. Three functions could RELEASE the
+  # segment they were handed while returning `()`, so every caller kept
+  # using the pointer. The fix made them `#[must_use] -> bool`; the trap
+  # that remains is a caller silently discarding that answer.
+  # ---------------------------------------------------------------------
+  - id: discarded-lifecycle-result
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      `let _ =` on a segment/page lifecycle call discards a value that says
+      WHETHER THE OBJECT STILL EXISTS. Ignoring it is exactly the 0.4.0
+      use-after-free family (adopt_segment / retire_span / remove_segment).
+      If this call site is genuinely terminal, say so in a comment on the
+      same line — every legitimate one in the tree already does.
+    patterns:
+      - pattern-regex: 'let\s+_\s*=\s*(self\.|\(\*[a-z_]+\)\.)?(adopt_segment|retire_span|remove_segment)\s*\('
+      - pattern-not-regex: '.*//.*'
+    paths:
+      include: ['crates/rusty_alloc/src/**']
+
+  # ---------------------------------------------------------------------
+  # M4 and M7, the same lesson twice: "reachability and provenance follow
+  # POINTERS, not integers." Storing a pointer as usize made Miri report the
+  # registry and the 1 GiB arena as leaks, and cost real debugging time.
+  # ---------------------------------------------------------------------
+  - id: pointer-stored-as-integer
+    languages: [rust]
+    severity: WARNING
+    message: >-
+      A pointer stored in an integer field loses provenance and reachability
+      (Miri leak-checks by following pointers). This was fixed twice already
+      — the heap registry (M4) and the arena base (M7). Use AtomicPtr / *mut T
+      unless the integer form is load-bearing, and say why if it is.
+    patterns:
+      - pattern-regex: '(?i)pub\s+\w*(base|ptr|head|heap)\w*:\s*(AtomicUsize|usize)\s*,'
+      - pattern-not-regex: '.*(xheap|xthread|delayed|thread_id|subproc|owner_tid).*'
+    paths:
+      include: ['crates/rusty_alloc/src/**']
+
+  # ---------------------------------------------------------------------
+  # The whole premise: no C in the dependency tree. deny.toml enforces this
+  # for cargo dependencies; this catches someone reaching for a build script
+  # or FFI shim inside the crate itself.
+  # ---------------------------------------------------------------------
+  - id: no-c-build-dependency
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      A C build (cc/bindgen/pkg-config) inside the crate defeats the premise
+      of the project — pure Rust, no C toolchain, wasm-buildable. The
+      vendored oracle is a submodule and never a dependency.
+    pattern-regex: '\b(cc::Build|bindgen::|pkg_config::)'
+    paths:
+      include: ['crates/**']
+      exclude: ['**/build.rs.example']
+
+  # ---------------------------------------------------------------------
+  # The counters must stay debug-only (M11): shipping them made every
+  # published ratio a counters-on-vs-counters-off comparison AND cost real
+  # instructions on the hottest path.
+  # ---------------------------------------------------------------------
+  - id: unconditional-hot-path-counter
+    languages: [rust]
+    severity: WARNING
+    message: >-
+      A `stats.*` increment that is not behind `#[cfg(debug_assertions)]`.
+      Upstream mimalloc compiles counters out of release (MI_STAT 0); ours
+      must too, or the fast path pays for telemetry nobody reads — and every
+      benchmark against the oracle becomes unfair (M11).
+    # Multiline: a counter is FINE when a `#[cfg(debug_assertions)]` opens the
+    # block it sits in. Matching only the increment line reported both of the
+    # crate's correctly-gated counters as violations on the first run — the
+    # rule was wrong, not the code.
+    patterns:
+      - pattern-regex: '(?s)\.stats\.(allocs|frees)\s*\+=\s*1'
+      - pattern-not-regex: '(?s)#\[cfg\(debug_assertions\)\][^}]*?\.stats\.(allocs|frees)\s*\+=\s*1'
+    paths:
+      include: ['crates/rusty_alloc/src/alloc.rs', 'crates/rusty_alloc/src/page.rs']
+
+  # ---------------------------------------------------------------------
+  # `debug_assert!(false, ...)` compiles OUT in release, so the caller falls
+  # through instead of stopping. That is precisely how `remove_segment`
+  # freed a segment it had failed to unlink (0.4.0, defect #3).
+  # ---------------------------------------------------------------------
+  - id: debug-assert-false-as-error-path
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      `debug_assert!(false, ..)` used as an error path vanishes in release
+      and the code FALLS THROUGH. This shape caused the 0.4.0 dangling-list
+      crash. Return a value the caller must handle, or abort explicitly.
+    # `^\s*` anchors to real code: without it the rule matched its own
+    # explanation inside a doc comment, which is a finding about prose.
+    pattern-regex: '^\s*debug_assert!\s*\(\s*false\s*,'
+    paths:
+      include: ['crates/rusty_alloc/src/**']

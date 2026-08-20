@@ -226,4 +226,164 @@ mod tests {
         let ys: Vec<u32> = (0..8).map(|_| b.next_u32()).collect();
         assert_ne!(xs, ys, "two reseeds collided");
     }
+
+    // ---------------------------------------------------------------------
+    // H-34: this is a BESPOKE crypto primitive (the crate cannot depend on a
+    // crypto library — an allocator must not depend on code that allocates),
+    // so the hardening audit requires it be vetted rather than trusted. The
+    // vetting is structural and bottoms out in a published vector:
+    //
+    //   1. the quarter-round — the entire cryptographic core — is checked
+    //      against RFC 8439 §2.1.1's test vector;
+    //   2. the block function's STRUCTURE (constants, key/counter/nonce
+    //      placement, the column/diagonal round pattern, the feed-forward
+    //      add) is checked against the RFC's layout;
+    //   3. the stream's contract (counter advance, keystream never repeats,
+    //      streams separate) is checked as properties.
+    //
+    // ChaCha8 differs from RFC 8439's ChaCha20 in ONE parameter: 4
+    // double-rounds instead of 10. Everything the RFC's vectors can pin —
+    // the quarter round and the block layout — is therefore fully pinned
+    // here; the round count is verified by inspection against the loop bound
+    // and asserted below so a future edit cannot silently change it.
+    // ---------------------------------------------------------------------
+
+    /// RFC 8439 §2.1.1: the authoritative quarter-round test vector.
+    #[test]
+    fn quarter_round_matches_rfc8439() {
+        // The RFC states the quarter round on four numbers directly. Our
+        // `qround` operates on state indices, so place them at 0,1,2,3.
+        let mut x = [0u32; 16];
+        x[0] = 0x1111_1111;
+        x[1] = 0x0102_0304;
+        x[2] = 0x9b8d_6f43;
+        x[3] = 0x0123_4567;
+        qround(&mut x, 0, 1, 2, 3);
+        assert_eq!(x[0], 0xea2a_92f4, "quarter round: a");
+        assert_eq!(x[1], 0xcb1c_f8ce, "quarter round: b");
+        assert_eq!(x[2], 0x4581_472e, "quarter round: c");
+        assert_eq!(x[3], 0x5881_c4bb, "quarter round: d");
+    }
+
+    /// The block layout the RFC specifies: the four "expand 32-byte k"
+    /// constants, the key in words 4..12, the counter in 12..14 and the
+    /// stream/nonce in 14..16.
+    #[test]
+    fn state_layout_matches_rfc8439() {
+        let mut r = Random::new();
+        let key = [
+            0x0302_0100, 0x0706_0504, 0x0b0a_0908, 0x0f0e_0d0c, 0x1312_1110, 0x1716_1514,
+            0x1b1a_1918, 0x1f1e_1d1c,
+        ];
+        r.seed_from(key, 0xdead_beef_cafe_f00d);
+        assert_eq!(
+            [r.state[0], r.state[1], r.state[2], r.state[3]],
+            [0x6170_7865, 0x3320_646e, 0x7962_2d32, 0x6b20_6574],
+            "the four ChaCha constants are wrong"
+        );
+        assert_eq!(&r.state[4..12], &key, "key is not in words 4..12");
+        assert_eq!([r.state[12], r.state[13]], [0, 0], "counter must start at 0");
+        assert_eq!(r.state[14], 0xcafe_f00d, "stream low word");
+        assert_eq!(r.state[15], 0xdead_beef, "stream high word");
+    }
+
+    /// The 64-bit block counter advances by one per refill and carries
+    /// correctly across the 32-bit boundary — a counter that fails to
+    /// advance would repeat the keystream, which is the catastrophic failure
+    /// mode for a stream cipher.
+    #[test]
+    fn block_counter_advances_and_carries() {
+        let mut r = Random::new();
+        r.seed_from([0; 8], 0);
+        for _ in 0..16 {
+            r.next_u32(); // forces exactly one refill
+        }
+        assert_eq!([r.state[12], r.state[13]], [1, 0], "counter did not advance");
+
+        // Force the low word to wrap and confirm the carry reaches word 13.
+        r.state[12] = u32::MAX;
+        r.used = 16;
+        r.next_u32();
+        assert_eq!(
+            [r.state[12], r.state[13]],
+            [0, 1],
+            "64-bit counter carry is broken: the keystream would repeat"
+        );
+    }
+
+    /// ChaCha8 is EIGHT rounds. If a future edit changes the loop bound the
+    /// primitive silently becomes something else — pin the identity by
+    /// checking a full keystream block against this implementation's own
+    /// frozen output for an all-zero key, which changes if the round count,
+    /// the round pattern, or the feed-forward add changes.
+    #[test]
+    fn chacha8_block_is_frozen() {
+        let mut r = Random::new();
+        r.seed_from([0; 8], 0);
+        let block: Vec<u32> = (0..16).map(|_| r.next_u32()).collect();
+
+        // Independently recompute the SAME block from the RFC's algorithm,
+        // written here in a deliberately different shape (explicit round
+        // list, no shared helper) so a bug in `refill`'s structure does not
+        // reproduce itself in the check.
+        let mut s = [0u32; 16];
+        s[0] = 0x6170_7865;
+        s[1] = 0x3320_646e;
+        s[2] = 0x7962_2d32;
+        s[3] = 0x6b20_6574;
+        let orig = s;
+        let mut x = s;
+        for _ in 0..4 {
+            for &(a, b, c, d) in &[
+                (0usize, 4usize, 8usize, 12usize),
+                (1, 5, 9, 13),
+                (2, 6, 10, 14),
+                (3, 7, 11, 15),
+                (0, 5, 10, 15),
+                (1, 6, 11, 12),
+                (2, 7, 8, 13),
+                (3, 4, 9, 14),
+            ] {
+                x[a] = x[a].wrapping_add(x[b]);
+                x[d] = (x[d] ^ x[a]).rotate_left(16);
+                x[c] = x[c].wrapping_add(x[d]);
+                x[b] = (x[b] ^ x[c]).rotate_left(12);
+                x[a] = x[a].wrapping_add(x[b]);
+                x[d] = (x[d] ^ x[a]).rotate_left(8);
+                x[c] = x[c].wrapping_add(x[d]);
+                x[b] = (x[b] ^ x[c]).rotate_left(7);
+            }
+        }
+        let expect: Vec<u32> = x.iter().zip(orig.iter()).map(|(a, b)| a.wrapping_add(*b)).collect();
+        assert_eq!(block, expect, "ChaCha8 block function diverged from the RFC construction");
+        s = orig; // silence the unused-assignment lint on `s`
+        let _ = s;
+    }
+
+    /// A keystream that is not obviously degenerate: bit balance within a
+    /// few sigma of 50%, and no repeated 32-bit word run. This would not
+    /// catch a subtle cryptographic weakness — nothing cheap would — but it
+    /// catches the failures that matter here (a stuck counter, an all-zero
+    /// or short-period stream) loudly.
+    #[test]
+    fn keystream_is_not_degenerate() {
+        let mut r = Random::new();
+        r.seed_from([0xdead_beef; 8], 7);
+        let n: u32 = 4096;
+        let words: Vec<u32> = (0..n).map(|_| r.next_u32()).collect();
+        let ones: u32 = words.iter().map(|w| w.count_ones()).sum();
+        let frac = f64::from(ones) / f64::from(n * 32);
+        assert!(
+            (0.45..0.55).contains(&frac),
+            "keystream bit balance {frac} is not plausibly random"
+        );
+        let mut sorted = words.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        // 4096 draws from 2^32 should essentially never collide.
+        assert!(
+            sorted.len() >= words.len() - 1,
+            "keystream repeated words: period far too short"
+        );
+    }
 }

@@ -75,6 +75,50 @@ fn my_heap() -> *mut Heap {
     unsafe { (*hb).heap.get() }
 }
 
+/// Catch a FOREIGN pointer handed to `free` — one this allocator never
+/// returned — before it is used to derive metadata (hardening gate H-19,
+/// residual risk R-001).
+///
+/// `free` masks the pointer to a 32 MiB segment base and reads `slice_offset`
+/// out of it. For a pointer we own that is correct by construction; for a
+/// pointer belonging to *another* allocator it reads whatever happens to sit
+/// at that address and follows it. That is the mechanism behind the
+/// mixed-allocator crashes this project has already documented (a
+/// jemalloc-linked redis under `LD_PRELOAD`), and upstream mimalloc's
+/// `mi_free` has the identical shape.
+///
+/// The global segment map already answers "is this address in a window we
+/// own?" in one load and one bit test — it was built for
+/// `mi_is_in_heap_region` and simply was not wired to the free path. It is
+/// wired here **under `debug_assertions` and `debug_checks` only**, because:
+///
+///   * it is a DIAGNOSTIC, not a safety oracle — a racing segment release can
+///     flip the answer, so a hard release-mode abort could fire on a
+///     legitimate free; and
+///   * on the release fast path it would cost a dependent load of a 1 MiB
+///     sparse table per free, which is exactly the kind of cost this crate
+///     measures before adopting.
+///
+/// What it buys: every test, every Miri run, every fuzz iteration and every
+/// debug-built consumer now turns "mysterious corruption later" into "this
+/// pointer was not ours, at this call". That is where the bug is findable.
+#[inline(always)]
+fn debug_foreign_pointer_guard(p: *mut u8) {
+    #[cfg(any(debug_assertions, feature = "debug_checks"))]
+    {
+        debug_assert!(
+            crate::segment_map::contains(p),
+            "rusty_alloc: free() called on a pointer this allocator never returned \
+             ({p:p} is not in any registered segment window). A foreign pointer here \
+             reads metadata from memory we do not own — see UNSAFE.md and R-001."
+        );
+    }
+    #[cfg(not(any(debug_assertions, feature = "debug_checks")))]
+    {
+        let _ = p;
+    }
+}
+
 /// Bump a per-heap realloc counter, tolerating a heapless thread (a thread
 /// whose heap creation failed under memory exhaustion has no counters).
 #[inline]
@@ -478,6 +522,7 @@ pub unsafe fn free_inline(p: *mut u8) {
     if p.is_null() {
         return;
     }
+    debug_foreign_pointer_guard(p);
     let seg = segment_of(p);
     // SAFETY: p is ours per the contract → seg is a live segment header. The
     // OWNING heap is recovered from the page's xheap back-pointer (container-

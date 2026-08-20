@@ -4,9 +4,11 @@ on:
     branches: [main]
   pull_request:
   # Weekly advisory sweep (H-40): cargo-audit re-checks the RustSec feed even
-  # when nothing is being merged.
+  # when nothing is being merged. The same trigger runs the Kani proofs, which
+  # are too slow to block every PR.
   schedule:
     - cron: "0 6 * * 1"
+  workflow_dispatch:
 
 # Least-privilege token (H-37): nothing in this workflow writes to the repo.
 permissions:
@@ -63,6 +65,50 @@ jobs:
       # fails the moment one of them becomes a runtime dependency.
       - name: cargo vet
         run: cargo vet --locked
+
+  # H-22: static analysis BEYOND clippy. The rules in tools/semgrep-rules.yml
+  # are written from this crate's own incident history (docs/LEDGER.md) — a
+  # generic ruleset would find none of them. Their first run found a real
+  # latent defect: `remove_huge_segment` still had the release-compiled-out
+  # `debug_assert!(false, ..)` shape that caused the 0.4.0 dangling-list
+  # crash on the normal-segment path.
+  static-analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: install semgrep (pinned)
+        run: pipx install semgrep==1.173.0 || pip install --user semgrep==1.173.0
+      - name: semgrep (repo-specific rules)
+        run: semgrep --config tools/semgrep-rules.yml --error --quiet
+      # The rules must be able to FAIL, or they are decoration. This asserts
+      # they still fire on the bad shapes they exist to catch.
+      - name: prove the rules are not vacuous
+        run: bash tools/semgrep-selftest.sh
+      # H-11: the unsafe ratchet. Growth is allowed but must be deliberate —
+      # documented in UNSAFE.md and re-baselined in the same commit.
+      - name: unsafe census ratchet
+        run: bash tools/unsafe-census.sh
+
+  # H-30: the proofs must keep proving. Kani is slow, so this runs on a
+  # schedule and on demand rather than blocking every PR — the harnesses
+  # cover arithmetic that changes rarely, and a regression there would also
+  # trip the property tests and Miri long before a release.
+  proofs:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+      - name: install kani (pinned)
+        run: cargo install --locked kani-verifier --version 0.67.0 && cargo kani setup
+      # --ignore-global-asm: Kani cannot analyse the crate's `global_asm!`
+      # (the initial-exec TLS slot). None of these harnesses touch that code —
+      # they prove pure index/size arithmetic — so the exclusion does not
+      # weaken them, but it is stated rather than hidden.
+      - name: cargo kani
+        run: cargo kani -p rusty_alloc -Z unstable-options --ignore-global-asm
 
   # H-26/H-27: the fuzz targets must BUILD and survive a short libFuzzer run
   # on every PR (the long soak runs on its own schedule; this catches a

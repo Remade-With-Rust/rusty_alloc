@@ -128,6 +128,14 @@ pub unsafe fn block_set_next(page: *const Page, b: *mut Block, next: *mut Block)
 /// knowing the heap type. Plain Treiber push / owner swap-drain.
 pub struct DelayedList {
     /// Head block (no flag bits).
+    ///
+    /// A `usize` rather than a pointer ON PURPOSE, and this is the one place
+    /// in the crate where that is correct: the cross-thread protocol packs a
+    /// 2-bit state flag into the low bits of this word and CASes the pair
+    /// atomically (blocks are >= 8-aligned, so the bits are free). An
+    /// `AtomicPtr` cannot carry the flag, and splitting them would break the
+    /// single-CAS invariant the loom model verifies.
+    // nosemgrep: pointer-stored-as-integer -- packed flag word, see above
     pub head: AtomicUsize,
 }
 

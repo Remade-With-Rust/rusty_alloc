@@ -514,22 +514,38 @@ impl Heap {
         }
     }
 
-    /// Unlink a huge segment from this heap's list.
+    /// Unlink a huge segment from this heap's list. **Returns whether it was
+    /// actually found and unlinked; `false` means `seg` is not ours and must
+    /// NOT be released.**
+    ///
+    /// This mirrors [`Heap::remove_segment`], and for the same reason. That
+    /// function used to end in a bare `debug_assert!(false, …)` — compiled
+    /// out in release — so a caller that failed to unlink fell through and
+    /// freed a segment still linked in another list, leaving a dangling head
+    /// that later crashed `thread_done`'s walk (0.4.0, defect #3; the probe
+    /// fired in 4 of 30 runs). The normal-segment path was fixed by returning
+    /// the fact and making it `#[must_use]`; **the HUGE path kept the unsound
+    /// shape until a `tools/semgrep-rules.yml` rule written from that very
+    /// incident flagged it (2026-08-19).** The one caller now releases only
+    /// what it unlinked.
     ///
     /// # Safety
-    /// Owner thread; `seg` is in the list.
-    unsafe fn remove_huge_segment(&mut self, seg: *mut Segment) {
+    /// Owner thread.
+    #[must_use = "false means the segment was NOT unlinked and must not be freed"]
+    unsafe fn remove_huge_segment(&mut self, seg: *mut Segment) -> bool {
         // SAFETY: list owned by this heap.
         unsafe {
             let mut cur = &raw mut self.huge_segments;
             while !(*cur).is_null() {
                 if *cur == seg {
                     *cur = (*seg).next;
-                    return;
+                    return true;
                 }
                 cur = &raw mut (**cur).next;
             }
-            debug_assert!(false, "huge segment not in heap list");
+            // Diagnostic only — the RETURN is what the caller acts on.
+            debug_assert!(false, "huge segment not in heap list"); // nosemgrep: debug-assert-false-as-error-path
+            false
         }
     }
 
@@ -703,7 +719,7 @@ impl Heap {
                     }
                     // Result ignored deliberately: `aseg` is never touched
                     // again on this path, so release-during-adoption is fine.
-                    let _ = self.adopt_segment(aseg);
+                    let _ = self.adopt_segment(aseg); // nosemgrep: discarded-lifecycle-result -- terminal, see comment above
                 }
             }
             let _ = force;
@@ -722,7 +738,7 @@ impl Heap {
                         // `seg` is not touched again; `next` is a QUEUED page,
                         // and a released segment has no queued pages (release
                         // requires used_pages == 0).
-                        let _ = self.retire_span(seg, p);
+                        let _ = self.retire_span(seg, p); // nosemgrep: discarded-lifecycle-result -- terminal, see comment above
                     }
                     p = next;
                 }
@@ -949,8 +965,12 @@ impl Heap {
             match (*seg).kind {
                 SegmentKind::Huge => {
                     self.stat_free();
-                    self.remove_huge_segment(seg);
-                    let _ = huge_free(seg);
+                    // Release ONLY what we actually unlinked. Freeing a
+                    // segment still linked in some list leaves a dangling
+                    // head behind — the 0.4.0 defect-#3 shape.
+                    if self.remove_huge_segment(seg) {
+                        let _ = huge_free(seg); // terminal: seg is gone after this
+                    }
                 }
                 SegmentKind::Normal => {
                     // Page ALREADY resolved by alloc::free -- resolving it a
@@ -1061,7 +1081,7 @@ impl Heap {
                 }
                 cur = &raw mut (**cur).next;
             }
-            debug_assert!(false, "segment not in heap list");
+            debug_assert!(false, "segment not in heap list"); // nosemgrep: debug-assert-false-as-error-path -- diagnostic; the `false` return below is what callers act on
             false
         }
     }

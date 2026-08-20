@@ -29,6 +29,14 @@ audit-as-crates-io = false
 version = "1.1.5"
 criteria = "safe-to-run"
 
+[[exemptions.autocfg]]
+version = "1.5.1"
+criteria = "safe-to-run"
+
+[[exemptions.bitflags]]
+version = "2.13.1"
+criteria = "safe-to-run"
+
 [[exemptions.cc]]
 version = "1.4.0"
 criteria = "safe-to-run"
@@ -61,6 +69,26 @@ criteria = "safe-to-run"
 version = "0.2.17"
 criteria = "safe-to-run"
 
+[[exemptions.proc-macro2]]
+version = "1.0.107"
+criteria = "safe-to-run"
+
+[[exemptions.proptest]]
+version = "1.11.0"
+criteria = "safe-to-run"
+
+[[exemptions.r-efi]]
+version = "5.3.0"
+criteria = "safe-to-run"
+
+[[exemptions.rand]]
+version = "0.9.5"
+criteria = "safe-to-run"
+
+[[exemptions.rand_xorshift]]
+version = "0.3.0"
+criteria = "safe-to-run"
+
 [[exemptions.regex-automata]]
 version = "0.4.18"
 criteria = "safe-to-run"
@@ -75,6 +103,10 @@ criteria = "safe-to-run"
 
 [[exemptions.shlex]]
 version = "2.0.1"
+criteria = "safe-to-run"
+
+[[exemptions.syn]]
+version = "2.0.119"
 criteria = "safe-to-run"
 
 [[exemptions.thread_local]]
@@ -93,6 +125,18 @@ criteria = "safe-to-run"
 version = "0.3.23"
 criteria = "safe-to-run"
 
+[[exemptions.unicode-ident]]
+version = "1.0.24"
+criteria = "safe-to-run"
+
 [[exemptions.valuable]]
 version = "0.1.1"
+criteria = "safe-to-run"
+
+[[exemptions.zerocopy]]
+version = "0.8.56"
+criteria = "safe-to-run"
+
+[[exemptions.zerocopy-derive]]
+version = "0.8.56"
 criteria = "safe-to-run"

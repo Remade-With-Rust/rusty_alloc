@@ -4,6 +4,68 @@ One entry per milestone/brick: what landed, the numbers with their method lines,
 what was reverted and **which kind** of revert (measured-worse vs within-noise).
 Newest first.
 
+## HARDENING — a semgrep rule written from our own history found the 0.4.0 bug still live on the huge path (2026-08-19)
+
+Second finding of the day from a tool that had never been run here, and the
+same shape as the first: an instrument the audit required, run for the first
+time, immediately pointing at real code.
+
+**The finding.** `tools/semgrep-rules.yml` encodes five rules taken from this
+project's own incident log rather than from a generic ruleset. One of them
+looks for `debug_assert!(false, …)` used as an error path — the shape that
+caused 0.4.0 defect #3, where `remove_segment` failed to unlink a segment, the
+assert vanished in release, and the caller freed it anyway, leaving a dangling
+list head that crashed `thread_done`'s walk.
+
+The rule fired on `Heap::remove_huge_segment`. **The normal-segment path was
+fixed in 0.4.0; the HUGE path kept the unsound shape.** It returned `()`, so:
+
+```rust
+self.remove_huge_segment(seg);   // silently found nothing in release
+let _ = huge_free(seg);          // ...released it regardless
+```
+
+Fixed identically to its sibling: `-> bool`, `#[must_use]` with a message
+naming the consequence, and the one caller now releases only what it unlinked.
+This is the same lesson the 0.4.0 entry already records — *put the outcome in
+the type, not in a comment* — applied to the site that was missed.
+
+**Also from this pass, each an instrument run for the first time:**
+
+- **Kani (H-30):** five harnesses, all `VERIFICATION: SUCCESSFUL`. The one
+  that matters most proves `page_of`'s slice index is in range for EVERY
+  in-segment offset — the contract that justifies M10b's removal of its
+  bounds check. Miri, the fuzzers and loom can only say "no counterexample
+  found"; this says none exists. Two limits stated, not hidden: Kani cannot
+  analyse the crate's `global_asm!` (run with `--ignore-global-asm`; no
+  harness touches that code), and the two bin-geometry proofs are BOUNDED to
+  `2 × MEDIUM_OBJ_SIZE_MAX` because unbounded 64-bit `leading_zeros`/shift
+  reasoning did not terminate (>13 CPU-minutes, killed).
+- **ChaCha8 vetted (H-34):** the bespoke CSPRNG's quarter-round — its entire
+  cryptographic core — now checks against **RFC 8439 §2.1.1's published test
+  vector**, with the block layout checked against the RFC's state and the
+  64-bit counter's advance AND carry checked (a stuck counter repeats the
+  keystream). 7 tests.
+- **Foreign-pointer guard (H-19, R-001):** `free()` now consults the segment
+  map before deriving metadata, so a pointer this allocator never returned is
+  caught at the call rather than producing a wild `slot.sub(off)`.
+  Debug/`debug_checks` only, MEASURED at zero release cost, and **proven to
+  fire** by `tests/foreign_free.rs` — a gate nobody has watched fail is not a
+  gate.
+- **Unsafe ratchet (H-11):** `cargo geiger` does not compile on 1.97.1 in any
+  version tried, so the substitution is `tools/unsafe-census.sh` + a committed
+  baseline that FAILS on growth. It caught its own first weakness honestly:
+  version one counted the word "unsafe" in a doc comment and tripped on
+  `proofs.rs`. A gate that cries wolf over prose is one people learn to
+  re-baseline without reading, so the census now strips comments (808 in
+  code, 21 files).
+
+**Two rules were also REFINED after producing false positives** — the
+correctly-`cfg`-gated counters, and a doc comment describing the bad shape.
+The rule was wrong, not the code, and `tools/semgrep-selftest.sh` now asserts
+all five still fire on synthesised bad code so the job cannot go green by
+matching nothing.
+
 ## HARDENING — ThreadSanitizer found a real data race on the free fast path (2026-08-19)
 
 The `use-protection-please` audit's H-24 (sanitizers) had never been run in

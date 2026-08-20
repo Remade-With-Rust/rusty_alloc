@@ -86,24 +86,24 @@ MIT. See `LICENSE` at the repository root.
 
 **Tier** critical-path · **Audited** 2026-08-19 (survey) · **v1.0.0 gates** 12/15 · [Full checklist](https://github.com/remade-with-rust/rusty_alloc/blob/main/crates/rusty_alloc/docs/plans/use-protection-please.md)
 
-`██████████████░░░░░░` **74%** &nbsp;·&nbsp; 26 Completed · 1 Scheduled · 8 Incomplete · 20 N/A
+`█████████████████░░░` **89%** &nbsp;·&nbsp; 31 Completed · 1 Scheduled · 3 Incomplete · 20 N/A
 
 | Phase | ✅ Completed | 🗓 Scheduled | ⬜ Incomplete | · N/A |
 |---|--:|--:|--:|--:|
 | 0 — Threat modeling | 2 | 0 | 0 | 0 |
 | 1 — Toolchain | 3 | 0 | 1 | 0 |
-| 2 — Supply chain | 7 | 0 | 1 | 0 |
-| 3 — Code level | 5 | 0 | 1 | 1 |
-| 4 — Static analysis | 0 | 0 | 1 | 0 |
+| 2 — Supply chain | 8 | 0 | 0 | 0 |
+| 3 — Code level | 6 | 0 | 0 | 1 |
+| 4 — Static analysis | 1 | 0 | 0 | 0 |
 | 5 — Dynamic analysis | 3 | 0 | 0 | 0 |
 | 6 — Fuzzing and properties | 3 | 1 | 0 | 0 |
-| 7 — Formal verification | 0 | 0 | 1 | 0 |
+| 7 — Formal verification | 1 | 0 | 0 | 0 |
 | 8 — Build and binary | 0 | 0 | 0 | 2 |
 | 9 — Runtime privilege | 0 | 0 | 0 | 1 |
-| 10 — Cryptography | 0 | 0 | 1 | 2 |
+| 10 — Cryptography | 1 | 0 | 0 | 2 |
 | 11 — CI/CD, release, and operations | 3 | 0 | 2 | 0 |
 | 12 — Compliance controls | 0 | 0 | 0 | 14 |
-| **Total** | **26** | **1** | **8** | **20** |
+| **Total** | **31** | **1** | **3** | **20** |
 
 **Next up** — H-27 Continuous fuzzing with no open crashes (2026-09-19 (30 days from the nightly job's first run))
 

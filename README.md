@@ -201,24 +201,24 @@ rebuilt in Rust, memory-safe by construction, measured rather than asserted.
 
 **Tier** critical-path · **Audited** 2026-08-19 (survey) · **v1.0.0 gates** 10/13 · [Full checklist](docs/plans/use-protection-please.md)
 
-`██████████████░░░░░░` **73%** &nbsp;·&nbsp; 22 Completed · 1 Scheduled · 7 Incomplete · 25 N/A
+`█████████████████░░░` **87%** &nbsp;·&nbsp; 26 Completed · 1 Scheduled · 3 Incomplete · 25 N/A
 
 | Phase | ✅ Completed | 🗓 Scheduled | ⬜ Incomplete | · N/A |
 |---|--:|--:|--:|--:|
 | 0 — Threat modeling | 2 | 0 | 0 | 0 |
 | 1 — Toolchain | 3 | 0 | 1 | 0 |
-| 2 — Supply chain | 7 | 0 | 1 | 0 |
+| 2 — Supply chain | 8 | 0 | 0 | 0 |
 | 3 — Code level | 1 | 0 | 0 | 6 |
-| 4 — Static analysis | 0 | 0 | 1 | 0 |
+| 4 — Static analysis | 1 | 0 | 0 | 0 |
 | 5 — Dynamic analysis | 3 | 0 | 0 | 0 |
 | 6 — Fuzzing and properties | 3 | 1 | 0 | 0 |
-| 7 — Formal verification | 0 | 0 | 1 | 0 |
+| 7 — Formal verification | 1 | 0 | 0 | 0 |
 | 8 — Build and binary | 0 | 0 | 0 | 2 |
 | 9 — Runtime privilege | 0 | 0 | 0 | 1 |
-| 10 — Cryptography | 0 | 0 | 1 | 2 |
+| 10 — Cryptography | 1 | 0 | 0 | 2 |
 | 11 — CI/CD, release, and operations | 3 | 0 | 2 | 0 |
 | 12 — Compliance controls | 0 | 0 | 0 | 14 |
-| **Total** | **22** | **1** | **7** | **25** |
+| **Total** | **26** | **1** | **3** | **25** |
 
 **Next up** — H-27 Continuous fuzzing with no open crashes (2026-09-19 (30 days from the nightly job's first run))
 
