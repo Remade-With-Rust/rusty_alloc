@@ -17,7 +17,24 @@ default = []
 debug_checks = []
 # Feature-gated rdtsc path profiler (§7.5 of the plan). OFF = byte-identical build.
 profile = []
-# Hardened build: guard pages, encrypted free lists, guarded-object sampling (our `smi`). M8.
+# Hardened build (our `smi`). M8. Deliberately NOT default — see the cost below.
+#
+# Always on with this feature: per-page encrypted free-list links, plus a
+# same-segment + alignment bound on every decoded link (`page::link_is_plausible`).
+#
+# Available but INERT until asked for: guarded objects and their guard pages.
+# The `guarded_max` OPTION defaults to 0, so `init::create_heap` skips both
+# `guarded_set_*` calls and the heap keeps `guarded_rate: 0`. Enabling `secure`
+# alone therefore does NOT give you guard pages — set the `guarded_max` option
+# > 0, or call `guarded_set_sample_rate` / `mi_heap_guarded_set_sample_rate`.
+#
+# Measured cost (2026-08-20, callgrind Ir, same binary both arms): a FLAT ~15
+# instructions per allocation — 8-25% per-op depending only on how cheap the op
+# is (batch 60->75, big 171->185, `usable` and `huge` exactly +0.00 since
+# neither walks a free list) and +0.6-1.8% whole-program on lua/perl/sqlite.
+# Opt-in because that is enough to forfeit mimalloc parity, which is the
+# headline result: perl 0.9991 -> 1.0160, sqlite 1.0003 -> 1.0061,
+# calloc 0.949 -> 1.041, batch_lifo 1.008 -> 1.259.
 secure = []
 
 [target.'cfg(windows)'.dependencies]

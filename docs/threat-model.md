@@ -63,12 +63,37 @@ least every 12 months (next: 2027-08-19 or earlier per the audit cadence in
 | **D**enial of service | Forced abort or hang from reachable inputs | Double-free abort is a deliberate policy (corruption beats availability). Known gap: heap-creation OOM aborts instead of null-returning (`init.rs:499`, R-003). The init CAS winner aborts rather than hangs on TLS-slot failure (audited 2026-08-06) |
 | **E**levation of privilege | The allocator runs at the host's privilege; the escalation risk is memory corruption → see Tampering | Loom-modeled cross-thread protocol; Miri whole-target in CI; 640-thread churn probe; differential oracle |
 
-## What the `secure` feature adds (opt-in, measured 4–7%)
+## What the `secure` feature adds (opt-in; a flat ~15 instructions per allocation)
 
-Guard pages around guarded-sampled objects, per-page encrypted free-list
-links, a same-segment bound on every decoded link, and guarded-object
-sampling. Services facing untrusted input should enable it; the default build
-matches upstream mimalloc's release posture plus double-free detection.
+**Always on with the feature:** per-page encrypted free-list links, and a
+same-segment + alignment bound on every decoded link.
+
+**Available but INERT until asked for:** guarded objects and their guard pages.
+The `guarded_max` option defaults to 0, so `init::create_heap` skips both
+`guarded_set_*` calls and the heap keeps `guarded_rate: 0`. **Enabling
+`secure` alone does not give you guard pages** — set the `guarded_max` option
+above 0, or call `mi_heap_guarded_set_sample_rate`. Anyone hardening a
+hostile-input service on the strength of "secure = guard pages" should read
+that sentence twice; the previous wording here implied otherwise.
+
+**Cost, measured 2026-08-20** (callgrind Ir, same binary in both arms, only the
+preloaded `.so` differing) — this supersedes an earlier "4–7%" estimate that
+was roughly 3–4× too pessimistic:
+
+- **A flat ~15 instructions per allocation**, not a percentage. It lands as
+  8–25% per-op purely because the base varies (batch_lifo 60.17 → 75.14 is
+  25%; big 171.00 → 185.00 is 8%). `usable` (30.00) and `huge` (666.00) are
+  **+0.00** — neither walks a free list, which is what confirms the cost is
+  link traffic and nothing else. `realloc` is +46 ≈ 3×15, matching its three
+  free-list operations.
+- **+0.6% to +1.8% whole-program** on lua / perl / sqlite.
+
+**Why it stays opt-in:** that is still enough to forfeit mimalloc parity — the
+headline result of the optimization campaign — on real programs, not merely on
+synthetic loops. perl 0.9991 → 1.0160, sqlite 1.0003 → 1.0061, calloc 0.949 →
+1.041, batch_lifo 1.008 → 1.259. Services facing untrusted input should enable
+it anyway and accept ~1–2%; the default build matches upstream mimalloc's
+release posture plus double-free detection.
 
 **These mitigations are tested for EFFICACY, not merely for function.** That
 distinction was a real gap until 2026-08-20: the tests in `secure.rs` all
