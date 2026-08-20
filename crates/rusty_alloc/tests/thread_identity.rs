@@ -53,6 +53,10 @@ fn thread_id_is_stable_within_a_thread() {
 
 #[test]
 #[cfg_attr(miri, ignore)]
+#[allow(
+    clippy::needless_collect,
+    reason = "the collect is load-bearing: it spawns EVERY thread before any join. Removing it makes the iterator spawn-and-join one thread at a time, silently serialising the concurrency the test exists to create."
+)]
 fn thread_id_is_unique_across_live_threads() {
     const THREADS: usize = 16;
     // A barrier keeps every thread ALIVE simultaneously — ids may legitimately

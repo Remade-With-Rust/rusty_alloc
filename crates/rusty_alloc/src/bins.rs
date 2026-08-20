@@ -146,7 +146,7 @@ mod tests {
         // worst-case waste is 25% (hit just above each bin boundary).
         for size in 65..=MEDIUM_OBJ_SIZE_MAX {
             let g = good_size(size);
-            assert!(g - size <= size / 4 + 16, "waste {}-{size} too large", g);
+            assert!(g - size <= size / 4 + 16, "waste {g}-{size} too large");
         }
     }
 }

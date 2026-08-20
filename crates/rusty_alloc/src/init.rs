@@ -102,7 +102,7 @@ pub static EMPTY_HEAP_BOX: EmptyHeapBox = EmptyHeapBox(HeapBox {
 /// Pointer to the shared empty heap box.
 #[inline]
 pub const fn empty_heap_box_ptr() -> *mut HeapBox {
-    &raw const EMPTY_HEAP_BOX.0 as *mut HeapBox
+    (&raw const EMPTY_HEAP_BOX.0).cast_mut()
 }
 
 /// Recover the owning HeapBox from a page's `xheap` value (the container-of
@@ -438,15 +438,30 @@ fn init_tid() -> usize {
 }
 
 /// Snapshot-visit every registered heap (stats aggregation). The visitor
-/// receives a COPY of the heap's counters: owners mutate them concurrently, so
-/// this is an approximate racy snapshot by design (volatile whole-struct read;
-/// converting the counters to atomics is a ledgered follow-up).
+/// receives a COPY of the heap's counters.
+///
+/// **This read is racy by design and `volatile` does not make it less so** —
+/// clippy's `volatile_composites` is right to flag it, and the lint is
+/// allowed HERE rather than workspace-wide so the reasoning stays attached to
+/// the one site that does it. `read_volatile` on a composite gives no
+/// per-field atomicity and no ordering, so a concurrent owner mutating its
+/// counters can yield a snapshot whose fields disagree with each other. That
+/// is accepted: these are `#[cfg(debug_assertions)]` diagnostic counters
+/// (upstream's `MI_STAT` rule), nothing branches on them, and the alternative
+/// — taking `&` to a struct another thread is writing — would be UB rather
+/// than merely imprecise. The real fix is making the counters atomics, which
+/// is the tracked follow-up (R-005 in the hardening audit).
+#[allow(
+    clippy::volatile_composites,
+    reason = "racy diagnostic snapshot; see the doc comment. Tracked as R-005."
+)]
 pub fn for_each_heap(f: &mut dyn FnMut(&crate::heap::Heap)) {
     heaps_lock();
     let mut hb = HEAPS_HEAD.load(Ordering::Acquire);
     while !hb.is_null() {
-        // SAFETY: registry entries are live boxes; read_volatile snapshots the
-        // owner-mutated struct without asserting exclusive access via &mut.
+        // SAFETY: registry entries are live boxes. The read is unsynchronised
+        // with the owning thread's writes (see above) but stays within a live,
+        // correctly-aligned allocation for the whole of the copy.
         unsafe {
             let snapshot = core::ptr::read_volatile((*hb).heap.get());
             f(&snapshot);
@@ -463,10 +478,10 @@ pub fn for_each_heap(f: &mut dyn FnMut(&crate::heap::Heap)) {
 #[inline]
 pub fn heap_box() -> *mut HeapBox {
     let hb = heap_tls::get();
-    if hb != empty_heap_box_ptr() {
-        hb
-    } else {
+    if hb == empty_heap_box_ptr() {
         init_thread_heap()
+    } else {
+        hb
     }
 }
 
@@ -487,10 +502,10 @@ pub fn heap_box_fast() -> *mut HeapBox {
 /// real, initialised heap box. NULL when creation fails (see [`heap_box`]).
 #[inline]
 pub fn ensure_heap(hb: *mut HeapBox) -> *mut HeapBox {
-    if hb != empty_heap_box_ptr() {
-        hb
-    } else {
+    if hb == empty_heap_box_ptr() {
         init_thread_heap()
+    } else {
+        hb
     }
 }
 
@@ -568,11 +583,11 @@ std::thread_local! {
 /// `mi_heap_get_backing`.
 pub fn backing_heap() -> *mut HeapBox {
     let b = BACKING_PTR.with(|c| c.get());
-    if !b.is_null() {
-        b
-    } else {
+    if b.is_null() {
         let _ = heap_box(); // bootstraps and sets BACKING_PTR
         BACKING_PTR.with(|c| c.get())
+    } else {
+        b
     }
 }
 

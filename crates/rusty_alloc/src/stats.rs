@@ -194,8 +194,7 @@ fn unix_process_info() -> (usize, usize, usize, usize, usize, usize, usize, usiz
                         .nth(1)
                         .and_then(|v| v.parse::<usize>().ok())
                 })
-                .map(|pages| pages * crate::os::page_size())
-                .unwrap_or(0);
+                .map_or(0, |pages| pages * crate::os::page_size());
             (current, peak)
         };
 

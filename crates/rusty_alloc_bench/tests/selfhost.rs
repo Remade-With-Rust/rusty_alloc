@@ -43,6 +43,10 @@ fn grow_shrink_vectors() {
 }
 
 #[test]
+#[allow(
+    clippy::needless_collect,
+    reason = "the collect is load-bearing: it spawns EVERY thread before any join. Removing it makes the iterator spawn-and-join one thread at a time, silently serialising the concurrency the test exists to create."
+)]
 fn cross_thread_free_under_lock() {
     // M2's global lock must make alloc-on-A/free-on-B safe (lock-free version
     // is M4). This is exactly what cargo test's own thread pool does too.

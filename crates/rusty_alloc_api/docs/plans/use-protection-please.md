@@ -51,7 +51,7 @@ violated precondition; the core's double-free abort and Miri are the nets.
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
 | H-03 | Toolchain pinned (`rust-toolchain.toml`) | Completed | Workspace pin `1.97.1` | |
-| H-04 | Committed `.cargo/config.toml` hardening defaults | Incomplete | Absent at workspace root | |
+| H-04 | Committed `.cargo/config.toml` hardening defaults | Completed | `.cargo/config.toml` (2026-08-19): full RELRO (`-z relro -z now`) + `-z noexecstack` on both Linux targets, `/NXCOMPAT /DYNAMICBASE /CETCOMPAT` on MSVC. VERIFIED IN THE ARTIFACT, not assumed — `readelf` on the shipped cdylib shows `GNU_RELRO`, `FLAGS: BIND_NOW`, and `GNU_STACK RW` (non-exec). Frame pointers DELIBERATELY excluded and measured: +6.14 Ir/op batch (+10.4%), +11.01 small (+14.0%) — they reinstate the prologues M13/M16/the 2026-08-19 campaign removed; the debuggability intent is met by `debug = true` shipping full DWARF instead. Deviation stated in the file | |
 | H-05 | ★ Release profile hardened (overflow-checks, LTO, panic policy) | Incomplete | Inherits the workspace profile; `overflow-checks` measured + waiver proposed (core plan H-05) | |
 | H-06 | Security toolchain available to CI and developers | Completed | Workspace CI: version-pinned deny/audit/fuzz/miri/clippy/rustfmt | |
 
@@ -64,15 +64,15 @@ violated precondition; the core's double-free abort and Miri are the nets.
 | H-09 | ★ Vulnerability scan clean (`cargo audit`) | Completed | Clean over the workspace lockfile (2026-08-19); per-PR + weekly cron | |
 | H-10 | ★ `cargo vet` coverage complete | N/A | tier `crit` only | |
 | H-11 | Unsafe inventory measured and trending down (geiger) | N/A | tier `crit` only | |
-| H-12 | ★ SBOM generated and published with releases | Incomplete | No SBOM on the v0.7.0 release | |
+| H-12 | ★ SBOM generated and published with releases | Completed | CycloneDX 1.5 SBOMs for both published crates are ATTACHED to the v0.7.0 GitHub release (`rusty_alloc.cdx.json`, `rusty_alloc-api.cdx.json`, verified via `gh release view`), generated from the committed lockfile. `.github/workflows/release.yml` regenerates and attaches them on every `v*` tag, so this cannot silently lapse | |
 | H-13 | Git deps pinned; no unknown registries or sources | Completed | Path+version dep on the core only; `[sources]` enforced workspace-wide | |
-| H-14 | Dependency freshness reviewed, human-in-the-loop updates | Incomplete | No update-bot config | |
+| H-14 | Dependency freshness reviewed, human-in-the-loop updates | Completed | `.github/dependabot.yml` (2026-08-19): weekly cargo, monthly for the separate `/fuzz` workspace (which would otherwise never update), monthly github-actions so the SHA pins do not become permanently stale. No auto-merge — every update PR runs the full hardening gate and needs review | |
 
 ### Phase 3 — Code level
 
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
-| H-15 | ★ Workspace lint policy set and clean | Incomplete | Same workspace lints + clippy clean (2026-08-19, per-PR CI); pedantic/nursery not configured | |
+| H-15 | ★ Workspace lint policy set and clean | Completed | `clippy::pedantic` AND `clippy::nursery` are enabled workspace-wide and `cargo clippy --workspace --all-targets --all-features -- -D warnings` is CLEAN under them (2026-08-19). Method: turning both groups on raised 481 warnings across ~25 lints; each was triaged, the ~20 declined categories are listed in `Cargo.toml` WITH A REASON EACH (doc style, API shape, and the audited cast family), and the rest were FIXED — literal separators, `let...else`, hoisted consts, `cast_mut`/`&raw` conversions. Net: ~95 additional lints now enforced. Per-PR in CI | |
 | H-16 | ★ `unsafe` isolated, SAFETY-commented, inventoried | Completed | SAFETY comments lint-enforced; the crate's 14 sites are in the workspace `UNSAFE.md` inventory (GlobalAlloc/Allocator contract row) | |
 | H-17 | Arithmetic safety explicit | Completed | No size arithmetic in the shim: layouts pass through to the core, which owns the checked math (grep: 0 arithmetic-discipline sites needed, 0 raw `as` on lengths) | |
 | H-18 | ★ No `unwrap`/`expect`/panic on untrusted paths; typed errors | Completed | grep 2026-08-19: 0 `unwrap()`, 0 `expect(` in src/ | |

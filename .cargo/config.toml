@@ -1,0 +1,56 @@
+# Committed build defaults (hardening gate H-04).
+#
+# Scope note: this crate ships RLIBs, so most binary-hardening decisions
+# belong to the downstream binary. What is set here is what a library can
+# legitimately fix for the artifacts this repo does link (the LD_PRELOAD
+# cdylib, test binaries, and anything built in-tree).
+
+# --- Linker hardening, x86-64 Linux -----------------------------------------
+# full RELRO (-z relro -z now): the GOT is mapped read-only after relocation,
+# so a write primitive cannot retarget a PLT entry. Free for us: we resolve
+# our own symbols at load time anyway.
+# noexecstack: no executable stack. We never need one; asserting it stops the
+# linker inferring otherwise from an object that omits the annotation.
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    "-C", "link-arg=-Wl,-z,relro,-z,now",
+    "-C", "link-arg=-Wl,-z,noexecstack",
+]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = [
+    "-C", "link-arg=-Wl,-z,relro,-z,now",
+    "-C", "link-arg=-Wl,-z,noexecstack",
+]
+
+# --- Windows ----------------------------------------------------------------
+# /NXCOMPAT (DEP) and /DYNAMICBASE (ASLR) are MSVC defaults for the linker
+# rustc drives, and /CETCOMPAT is opt-in shadow-stack compatibility. Asserted
+# explicitly so a toolchain default change cannot silently drop them.
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-C", "link-arg=/NXCOMPAT",
+    "-C", "link-arg=/DYNAMICBASE",
+    "-C", "link-arg=/CETCOMPAT",
+]
+
+# --- Frame pointers: DELIBERATELY NOT SET, and this is measured -------------
+# The usual hardening default is `-C force-frame-pointers=yes` for profiling
+# and post-mortem unwinding. It is NOT set here, because on this codebase it
+# is not a small cost: forcing a frame pointer reinstates the `push rbp` /
+# `mov rbp,rsp` prologue in every function, which is precisely what four
+# separate optimisation bricks (M13, M16, and the 2026-08-19 fast-path
+# campaign) removed from `malloc` and `free`.
+#
+# Measured 2026-08-19, callgrind Ir/op via bench/opscan.sh, same binary shape
+# with and without the flag:
+#
+#   op          default   +frame-pointers   delta
+#   batch_lifo    59.17        65.31        +6.14  (+10.4%)
+#   small         78.38        89.39       +11.01  (+14.0%)
+#   mixed        139.07       149.22       +10.15  (+7.3%)
+#
+# The gate's INTENT is post-mortem debuggability, and that is already met by
+# a different mechanism: `[profile.release] debug = true` ships full DWARF,
+# so unwinders and profilers have CFI without reserving a register on the
+# hottest path in the process. Revisit if we ever ship stripped.

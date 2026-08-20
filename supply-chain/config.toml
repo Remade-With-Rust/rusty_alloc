@@ -1,0 +1,98 @@
+
+# cargo-vet config file
+
+[cargo-vet]
+version = "0.10"
+
+[imports.bytecode-alliance]
+url = "https://raw.githubusercontent.com/bytecodealliance/wasmtime/main/supply-chain/audits.toml"
+
+[imports.embark-studios]
+url = "https://raw.githubusercontent.com/EmbarkStudios/rust-ecosystem/main/audits.toml"
+
+[imports.google]
+url = "https://raw.githubusercontent.com/google/rust-crate-audits/main/audits.toml"
+
+[imports.isrg]
+url = "https://raw.githubusercontent.com/divviup/libprio-rs/main/supply-chain/audits.toml"
+
+[imports.mozilla]
+url = "https://raw.githubusercontent.com/mozilla/supply-chain/main/audits.toml"
+
+[policy.rusty_alloc]
+audit-as-crates-io = false
+
+[policy.rusty_alloc-api]
+audit-as-crates-io = false
+
+[[exemptions.aho-corasick]]
+version = "1.1.5"
+criteria = "safe-to-run"
+
+[[exemptions.cc]]
+version = "1.4.0"
+criteria = "safe-to-run"
+
+[[exemptions.find-msvc-tools]]
+version = "0.1.9"
+criteria = "safe-to-run"
+
+[[exemptions.generator]]
+version = "0.8.9"
+criteria = "safe-to-run"
+
+[[exemptions.libloading]]
+version = "0.8.9"
+criteria = "safe-to-run"
+
+[[exemptions.log]]
+version = "0.4.33"
+criteria = "safe-to-run"
+
+[[exemptions.loom]]
+version = "0.7.2"
+criteria = "safe-to-run"
+
+[[exemptions.memchr]]
+version = "2.8.3"
+criteria = "safe-to-run"
+
+[[exemptions.pin-project-lite]]
+version = "0.2.17"
+criteria = "safe-to-run"
+
+[[exemptions.regex-automata]]
+version = "0.4.18"
+criteria = "safe-to-run"
+
+[[exemptions.regex-syntax]]
+version = "0.8.11"
+criteria = "safe-to-run"
+
+[[exemptions.rustversion]]
+version = "1.0.23"
+criteria = "safe-to-run"
+
+[[exemptions.shlex]]
+version = "2.0.1"
+criteria = "safe-to-run"
+
+[[exemptions.thread_local]]
+version = "1.1.10"
+criteria = "safe-to-run"
+
+[[exemptions.tracing]]
+version = "0.1.44"
+criteria = "safe-to-run"
+
+[[exemptions.tracing-core]]
+version = "0.1.36"
+criteria = "safe-to-run"
+
+[[exemptions.tracing-subscriber]]
+version = "0.3.23"
+criteria = "safe-to-run"
+
+[[exemptions.valuable]]
+version = "0.1.1"
+criteria = "safe-to-run"

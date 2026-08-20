@@ -320,10 +320,10 @@ unsafe fn span_mark_free(seg: *mut Segment, idx: usize, len: usize) {
 unsafe fn span_list_remove(seg: *mut Segment, span: *mut Page) {
     // SAFETY: caller contract.
     unsafe {
-        if !(*span).prev.is_null() {
-            (*(*span).prev).next = (*span).next;
-        } else {
+        if (*span).prev.is_null() {
             (*seg).free_spans = (*span).next;
+        } else {
+            (*(*span).prev).next = (*span).next;
         }
         if !(*span).next.is_null() {
             (*(*span).next).prev = (*span).prev;

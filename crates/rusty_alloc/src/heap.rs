@@ -330,9 +330,8 @@ impl Heap {
         };
         // SAFETY: heap lock held; segments list is owned by this heap.
         unsafe {
-            let (p, fresh) = match self.span_from_segments(slices) {
-                Some(v) => v,
-                None => return ptr::null_mut(),
+            let Some((p, fresh)) = self.span_from_segments(slices) else {
+                return ptr::null_mut();
             };
             (*p).block_size = bsize;
             (*p).reserved = ((slices * SEGMENT_SLICE_SIZE) / bsize) as u32;
@@ -366,6 +365,10 @@ impl Heap {
     /// # Safety
     /// Heap lock held.
     unsafe fn span_from_segments(&mut self, slices: usize) -> Option<(*mut Page, bool)> {
+        /// Stall guard, NOT a reclaim budget: a huge orphan backlog must not
+        /// let a single allocation walk the whole abandoned list.
+        const MAX_ADOPT: usize = 32;
+
         // SAFETY: heap lock held; segments list is owned by this heap.
         unsafe {
             let mut seg = self.segments;
@@ -393,8 +396,7 @@ impl Heap {
             // taken is the one most likely to have room — and the loop stops as
             // soon as the request is met or the list is empty. The cap only
             // exists so a huge orphan backlog cannot stall one allocation; it
-            // is not a reclaim budget.
-            const MAX_ADOPT: usize = 32;
+            // is not a reclaim budget (see MAX_ADOPT at the top of the fn).
             for _ in 0..MAX_ADOPT {
                 let aseg = crate::init::abandoned_pop();
                 if aseg.is_null() {
@@ -1289,10 +1291,10 @@ unsafe fn queue_push_front(q: *mut PageQueue, page: *mut Page) {
     unsafe {
         (*page).prev = ptr::null_mut();
         (*page).next = (*q).first;
-        if !(*q).first.is_null() {
-            (*(*q).first).prev = page;
-        } else {
+        if (*q).first.is_null() {
             (*q).last = page;
+        } else {
+            (*(*q).first).prev = page;
         }
         (*q).first = page;
     }
@@ -1305,15 +1307,15 @@ unsafe fn queue_push_front(q: *mut PageQueue, page: *mut Page) {
 unsafe fn queue_remove(q: *mut PageQueue, page: *mut Page) {
     // SAFETY: caller contract.
     unsafe {
-        if !(*page).prev.is_null() {
-            (*(*page).prev).next = (*page).next;
-        } else {
+        if (*page).prev.is_null() {
             (*q).first = (*page).next;
-        }
-        if !(*page).next.is_null() {
-            (*(*page).next).prev = (*page).prev;
         } else {
+            (*(*page).prev).next = (*page).next;
+        }
+        if (*page).next.is_null() {
             (*q).last = (*page).prev;
+        } else {
+            (*(*page).next).prev = (*page).prev;
         }
         (*page).next = ptr::null_mut();
         (*page).prev = ptr::null_mut();

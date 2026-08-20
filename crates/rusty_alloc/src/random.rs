@@ -59,7 +59,7 @@ impl Random {
             // Fallback mixing: clock, a stack address, a heap-ish address,
             // thread id, and a global counter (documented weaker path).
             static COUNTER: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
-            let stack = &key as *const _ as usize as u64;
+            let stack = std::ptr::from_ref(&key) as usize as u64;
             let mut acc = crate::prim::clock_now()
                 ^ stack.rotate_left(17)
                 ^ (crate::prim::thread_id() as u64).rotate_left(33)

@@ -92,7 +92,7 @@ pub unsafe fn block_next(page: *const Page, b: *const Block) -> *mut Block {
                 dec.is_multiple_of(crate::types::MAX_ALIGN_SIZE.min(8)),
                 "rusty_alloc: corrupted free list (secure mode)"
             );
-            crate::ptr_with_addr(b as *mut Block, dec)
+            crate::ptr_with_addr(b.cast_mut(), dec)
         }
     }
 }
@@ -305,7 +305,7 @@ pub static EMPTY_PAGE: EmptyPage = EmptyPage(Page::empty_sentinel());
 /// Pointer to the shared empty page, for `Heap::direct` slots with no page.
 #[inline]
 pub const fn empty_page_ptr() -> *mut Page {
-    &raw const EMPTY_PAGE.0 as *mut Page
+    (&raw const EMPTY_PAGE.0).cast_mut()
 }
 
 /// Pop a block off the fast list. Returns null when dry (→ generic path).

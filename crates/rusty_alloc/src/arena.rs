@@ -96,6 +96,11 @@ pub fn reserve_os_memory_ex(
 /// `mi_manage_os_memory_ex`: adopt caller-provided memory (never freed by us).
 /// The SEGMENT_SIZE-aligned interior is used; ragged edges are ignored.
 #[allow(clippy::result_unit_err)] // C error-code mapping at the FFI edge
+#[allow(
+    clippy::fn_params_excessive_bools,
+    reason = "mirrors mi_manage_os_memory_ex's C signature 1:1; grouping the \
+              flags into a struct would break the ABI parity this crate exists for"
+)]
 pub fn manage_os_memory_ex(
     start: *mut u8,
     size: usize,

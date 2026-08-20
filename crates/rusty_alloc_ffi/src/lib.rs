@@ -664,7 +664,7 @@ pub unsafe extern "C" fn mi_reallocarr(ptrp: *mut c_void, count: usize, size: us
     // SAFETY: slot valid per contract; realloc contract forwarded.
     unsafe {
         let np = alloc::reallocn((*slot).cast(), count, size);
-        if np.is_null() && count.checked_mul(size).map(|t| t > 0).unwrap_or(true) {
+        if np.is_null() && count.checked_mul(size).is_none_or(|t| t > 0) {
             return 12; // ENOMEM (or overflow)
         }
         slot.write(np.cast());
@@ -1672,13 +1672,13 @@ pub extern "C" fn mi_option_disable(option: c_int) {
 /// `mi_option_set_enabled`.
 #[unsafe(no_mangle)]
 pub extern "C" fn mi_option_set_enabled(option: c_int, enable: bool) {
-    rusty_alloc::options::set(option.max(0) as usize, enable as i64);
+    rusty_alloc::options::set(option.max(0) as usize, i64::from(enable));
 }
 
 /// `mi_option_set_enabled_default`.
 #[unsafe(no_mangle)]
 pub extern "C" fn mi_option_set_enabled_default(option: c_int, enable: bool) {
-    rusty_alloc::options::set_default(option.max(0) as usize, enable as i64);
+    rusty_alloc::options::set_default(option.max(0) as usize, i64::from(enable));
 }
 
 /// `mi_option_get`.
@@ -1988,13 +1988,11 @@ pub unsafe extern "C" fn mi_realpath(
         return core::ptr::null_mut();
     }
     // SAFETY: fname NUL-terminated per contract.
-    let path = match unsafe { core::ffi::CStr::from_ptr(fname) }.to_str() {
-        Ok(s) => s,
-        Err(_) => return core::ptr::null_mut(),
+    let Ok(path) = (unsafe { core::ffi::CStr::from_ptr(fname) }).to_str() else {
+        return core::ptr::null_mut();
     };
-    let canon = match std::fs::canonicalize(path) {
-        Ok(p) => p,
-        Err(_) => return core::ptr::null_mut(),
+    let Ok(canon) = std::fs::canonicalize(path) else {
+        return core::ptr::null_mut();
     };
     let bytes = canon.to_string_lossy().into_owned().into_bytes();
     let out = if resolved_name.is_null() {

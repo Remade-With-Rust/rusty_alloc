@@ -79,7 +79,7 @@ const DEFAULTS: [i64; OPTION_COUNT] = [
     32,      // max_warnings
     10,      // max_segment_reclaim (%)
     0,       // destroy_on_exit
-    1048576, // arena_reserve (KiB = 1 GiB)
+    1_048_576, // arena_reserve (KiB = 1 GiB)
     10,      // arena_purge_mult
     1,       // purge_extend_delay
     1,       // abandoned_reclaim_on_free

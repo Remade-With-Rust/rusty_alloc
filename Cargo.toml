@@ -36,8 +36,64 @@ categories = ["memory-management", "no-std", "development-tools"]
 unsafe_op_in_unsafe_fn = "deny"
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
 
+# Lint policy (hardening gate H-15). `pedantic` and `nursery` are ENABLED at
+# workspace level and the build is clean under them, because every group
+# member we do not enforce is listed below WITH ITS REASON. That is the point
+# of the exercise: ~95 additional lints are now enforced, and the ones we
+# decline are a deliberate, readable list rather than an unexamined
+# `#![allow(clippy::pedantic)]`.
+#
+# Measured 2026-08-19: switching both groups on raised 481 warnings across
+# ~25 distinct lints. Every one was triaged into the table below.
 [workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
 undocumented_unsafe_blocks = "deny"
+
+# --- Declined: DOCUMENTATION STYLE ------------------------------------------
+# This crate's docs deliberately read as prose explaining a mechanism (why a
+# brick exists, what a measurement showed). These lints police house style in
+# a way that fights that, and none of them can catch a defect.
+doc_markdown = "allow"                  # 63x: backticks around identifiers in prose
+too_long_first_doc_paragraph = "allow"  # 26x: our first paragraphs state a mechanism
+missing_errors_doc = "allow"            # 26x: errors are documented in prose, not a section
+missing_panics_doc = "allow"            # 13x
+missing_safety_doc = "allow"            # covered far more strictly by undocumented_unsafe_blocks
+
+# --- Declined: API SHAPE ----------------------------------------------------
+must_use_candidate = "allow"            # 58x: `#[must_use]` is applied where IGNORING the
+                                        # value is a BUG (the 0.4.0 UAF family), not everywhere
+                                        # a value is returned - blanket use dilutes that signal
+module_name_repetitions = "allow"       # 37x: `page::PageQueue` etc. mirror upstream mimalloc's
+                                        # names on purpose; this is a 1:1 remake
+missing_const_for_fn = "allow"          # 23x: const-ness is an API promise; adding it wholesale
+                                        # freezes internals we still reshape per measurement
+
+# --- Declined: NUMERIC CASTS — audited, bounded by construction -------------
+# 2026-08-19: all 24 cast sites in the SHIPPED library code were read
+# individually (H-17). Every one narrows a value bounded by a compile-time
+# constant (HEADER_SLICES, SLICES_PER_SEGMENT=512, MAX_ARENAS) or an already
+# sign-clamped option (`get(..).max(0)`). NONE narrows an untrusted length,
+# which is the failure this lint family exists to catch, and the geometry
+# bounds are additionally enforced by const asserts in `segment.rs`.
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+cast_ptr_alignment = "allow"            # allocator metadata IS the alignment authority
+
+# --- Declined: STYLE PREFERENCES --------------------------------------------
+option_if_let_else = "allow"            # nursery; `if let/else` reads better in unsafe blocks
+redundant_closure_for_method_calls = "allow"
+single_match_else = "allow"
+explicit_iter_loop = "allow"
+use_self = "allow"
+many_single_char_names = "allow"        # `p`, `b`, `q` are the allocator's own vocabulary
+too_many_lines = "allow"                # the segment/page state machines are cohesive
+semicolon_if_nothing_returned = "allow"
+iter_with_drain = "allow"
+borrow_as_ptr = "allow"                 # `&raw` is used where it matters; this fires on tests
+inline_always = "allow"                 # `#[inline(always)]` here is measured, not decorative
 
 [profile.release]
 lto = "thin"

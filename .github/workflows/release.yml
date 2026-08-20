@@ -1,0 +1,59 @@
+name: release
+
+# H-12/H-38: a tag is not a release until the artifacts that make it
+# auditable exist. Pushing a `v*` tag generates a CycloneDX SBOM for each
+# PUBLISHED crate and attaches it to the GitHub release, so anyone can answer
+# "what was in this version" without trusting a lockfile they cannot see.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build artifacts for"
+        required: true
+
+permissions:
+  contents: write # required to upload release assets
+
+jobs:
+  sbom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+      - name: install cargo-cyclonedx (pinned)
+        run: cargo install cargo-cyclonedx --version 0.5.9 --locked
+
+      # One SBOM per published crate. The committed Cargo.lock (H-07) is what
+      # makes this reproducible: the document describes the exact dependency
+      # set the release was built against, not whatever resolves on the day
+      # someone asks.
+      - name: generate SBOMs
+        run: |
+          mkdir -p sbom
+          cargo cyclonedx --manifest-path crates/rusty_alloc/Cargo.toml \
+            --format json --all-features --spec-version 1.5
+          cargo cyclonedx --manifest-path crates/rusty_alloc_api/Cargo.toml \
+            --format json --all-features --spec-version 1.5
+          mv crates/rusty_alloc/rusty_alloc.cdx.json sbom/
+          mv crates/rusty_alloc_api/rusty_alloc-api.cdx.json sbom/
+          ls -la sbom/
+
+      - name: attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          gh release view "$tag" >/dev/null 2>&1 || \
+            gh release create "$tag" --title "$tag" --generate-notes
+          gh release upload "$tag" sbom/*.cdx.json --clobber
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sbom
+          path: sbom/

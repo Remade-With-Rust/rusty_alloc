@@ -55,7 +55,7 @@ fact.
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
 | H-03 | Toolchain pinned (`rust-toolchain.toml`) | Completed | `channel = "1.97.1"` + components + tier-1 targets; CI pins the same version | |
-| H-04 | Committed `.cargo/config.toml` hardening defaults | Incomplete | Absent | |
+| H-04 | Committed `.cargo/config.toml` hardening defaults | Completed | `.cargo/config.toml` (2026-08-19): full RELRO (`-z relro -z now`) + `-z noexecstack` on both Linux targets, `/NXCOMPAT /DYNAMICBASE /CETCOMPAT` on MSVC. VERIFIED IN THE ARTIFACT, not assumed — `readelf` on the shipped cdylib shows `GNU_RELRO`, `FLAGS: BIND_NOW`, and `GNU_STACK RW` (non-exec). Frame pointers DELIBERATELY excluded and measured: +6.14 Ir/op batch (+10.4%), +11.01 small (+14.0%) — they reinstate the prologues M13/M16/the 2026-08-19 campaign removed; the debuggability intent is met by `debug = true` shipping full DWARF instead. Deviation stated in the file | |
 | H-05 | ★ Release profile hardened (overflow-checks, LTO, panic policy) | Incomplete | LTO/cgu/panic deliberate; `overflow-checks = true` MEASURED at +7.1% batch / +11% mixed (core plan H-05) — waiver proposed on that number, owner decision pending | |
 | H-06 | Security toolchain available to CI and developers | Completed | CI installs version-pinned cargo-deny 0.20.2, cargo-audit 0.22.2, cargo-fuzz 0.13.2, miri, clippy, rustfmt | |
 
@@ -66,17 +66,17 @@ fact.
 | H-07 | ★ `Cargo.lock` committed | Completed | `.gitignore` entry removed; lockfile tracked as of 2026-08-19 | |
 | H-08 | ★ `deny.toml` policy present and enforced | Completed | `cargo deny check` = all four checks ok (2026-08-19); per-PR in CI; the ban policy caught dev-only `cc` (loom→generator) on its first run — scoped exception with written justification | |
 | H-09 | ★ Vulnerability scan clean (`cargo audit`) | Completed | Clean over 46 lockfile deps (2026-08-19); per-PR + weekly cron in CI | |
-| H-10 | ★ `cargo vet` coverage complete | Incomplete | No `supply-chain/` | |
-| H-11 | Unsafe inventory measured and trending down (geiger) | Incomplete | Not run; member static baselines recorded 2026-08-19 (core 347/226, api 14) | |
-| H-12 | ★ SBOM generated and published with releases | Incomplete | v0.7.0 released without an SBOM | |
+| H-10 | ★ `cargo vet` coverage complete | Completed | `cargo vet` exits 0 (2026-08-19): **22 fully audited, 18 exempted**, and every crate that SHIPS is in the audited set — `libc` via trusted publisher rust-lang-owner (ISRG/Mozilla/Bytecode-Alliance independently trust the same publisher) and the whole `windows-*` family via kennykerr. Imported audit sets: google, mozilla, bytecode-alliance, embark, isrg. Remaining exemptions are DEV-ONLY (loom's build tree) and pinned at `safe-to-run`, never `safe-to-deploy`, so vet fails if one ever becomes a runtime dep. Our own crates are marked first-party (`audit-as-crates-io = false`) rather than circularly vetting ourselves. Runs per-PR in CI | |
+| H-11 | Unsafe inventory measured and trending down (geiger) | Incomplete | `cargo install cargo-geiger` FAILS TO COMPILE on the pinned 1.97.1 toolchain (2026-08-19) — a tool defect, not a finding. The trend function is served meanwhile by `UNSAFE.md`'s per-module census with a dated baseline (361 occurrences: core 347, api 14), which is the number a later pass compares against. Revisit when geiger builds | |
+| H-12 | ★ SBOM generated and published with releases | Completed | CycloneDX 1.5 SBOMs for both published crates are ATTACHED to the v0.7.0 GitHub release (`rusty_alloc.cdx.json`, `rusty_alloc-api.cdx.json`, verified via `gh release view`), generated from the committed lockfile. `.github/workflows/release.yml` regenerates and attaches them on every `v*` tag, so this cannot silently lapse | |
 | H-13 | Git deps pinned; no unknown registries or sources | Completed | Zero git deps; `[sources]` in `deny.toml` denies unknown, crates.io-only allow-list; `sources ok` | |
-| H-14 | Dependency freshness reviewed, human-in-the-loop updates | Incomplete | No Renovate/Dependabot config | |
+| H-14 | Dependency freshness reviewed, human-in-the-loop updates | Completed | `.github/dependabot.yml` (2026-08-19): weekly cargo, monthly for the separate `/fuzz` workspace (which would otherwise never update), monthly github-actions so the SHA pins do not become permanently stale. No auto-merge — every update PR runs the full hardening gate and needs review | |
 
 ### Phase 3 — Code level
 
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
-| H-15 | ★ Workspace lint policy set and clean | Incomplete | `[workspace.lints]`: `unsafe_op_in_unsafe_fn = deny`, `clippy::undocumented_unsafe_blocks = deny`; `cargo clippy --workspace --all-targets --all-features -- -D warnings` exit 0 (2026-08-19 + per-PR CI). Pedantic/nursery posture undecided | |
+| H-15 | ★ Workspace lint policy set and clean | Completed | `clippy::pedantic` AND `clippy::nursery` are enabled workspace-wide and `cargo clippy --workspace --all-targets --all-features -- -D warnings` is CLEAN under them (2026-08-19). Method: turning both groups on raised 481 warnings across ~25 lints; each was triaged, the ~20 declined categories are listed in `Cargo.toml` WITH A REASON EACH (doc style, API shape, and the audited cast family), and the rest were FIXED — literal separators, `let...else`, hoisted consts, `cast_mut`/`&raw` conversions. Net: ~95 additional lints now enforced. Per-PR in CI | |
 | H-16 | ★ `unsafe` isolated, SAFETY-commented, inventoried | N/A | virtual workspace root — no src/; audited per member (core: lint-enforced SAFETY comments, `UNSAFE.md` missing) | |
 | H-17 | Arithmetic safety explicit | N/A | virtual workspace root — audited per member | |
 | H-18 | ★ No `unwrap`/`expect`/panic on untrusted paths; typed errors | N/A | virtual workspace root — audited per member (core has one real lead: `init.rs:499`) | |
@@ -103,7 +103,7 @@ fact.
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
 | H-26 | ★ Fuzz target per public parser, decoder, or message handler | Completed | `fuzz/` (alloc_ops + xthread, seeded corpora, canary discipline); 628k smoke execs under ASan, 0 findings; per-PR smoke in CI — details in the core plan | |
-| H-27 | ★ Continuous fuzzing with no open crashes | Incomplete | Targets live; the ≥30-day soak has not elapsed — start the clock | |
+| H-27 | ★ Continuous fuzzing with no open crashes | Scheduled | The MECHANISM now exists and is the part that was missing: `.github/workflows/fuzz.yml` runs both targets nightly, **carries the corpus forward through the actions cache** (without that the coverage never compounds), uploads any crasher as an artifact and opens a labelled issue. Zero crashers to date across 628k smoke execs + an in-progress local soak. The gate needs >=30 days of elapsed coverage-guided fuzzing — a calendar quantity, not a task | 2026-09-19 (30 days from the nightly job's first run) |
 | H-28 | Property tests cover the documented invariants | Incomplete | Audited per member; no proptest/quickcheck anywhere | |
 | H-29 | Mutation and/or differential testing on critical modules | Completed | The workspace's whole gate design is differential: the vendored C mimalloc oracle (G2 semantic trace diff), the 3-arm byte-identity real-world sweep (144/144, 2026-08-19), the 19-config corpus sweep — see core plan H-29 | |
 

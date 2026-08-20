@@ -1,0 +1,36 @@
+# H-14: dependency freshness with a human in the loop. Updates arrive as PRs
+# that must pass the full hardening gate (deny + audit + vet + Miri + fuzz
+# smoke) and be reviewed — never auto-merged. The surface is tiny by design,
+# so the weekly cadence is not noisy.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "security"]
+    commit-message:
+      prefix: "deps"
+
+  # The fuzz crate is a separate workspace (nightly + libFuzzer), so it needs
+  # its own entry or its dependencies silently never update.
+  - package-ecosystem: cargo
+    directory: "/fuzz"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 2
+    labels: ["dependencies", "fuzz"]
+    commit-message:
+      prefix: "deps(fuzz)"
+
+  # Pinned action SHAs (H-37) are only safe if something tells us when they
+  # move; without this, "pinned" becomes "permanently stale".
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    labels: ["dependencies", "ci"]
+    commit-message:
+      prefix: "ci"

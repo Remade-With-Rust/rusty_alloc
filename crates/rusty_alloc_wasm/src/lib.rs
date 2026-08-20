@@ -33,6 +33,10 @@ const SIZES: [usize; 12] = [1, 8, 15, 16, 24, 64, 100, 512, 1024, 4096, 20000, 1
 /// # Safety
 /// None for callers — this owns every pointer it creates and frees them all.
 pub fn selftest() -> i32 {
+    /// Large-block size: above the binned cutoff, so this exercises the
+    /// span path rather than a bin.
+    const BIG: usize = 600_000;
+
     // 1. Small/medium allocations across bins: write a size-derived pattern,
     //    read it back, and check the usable extent is at least what we asked.
     let mut live: [*mut u8; SIZES.len()] = [core::ptr::null_mut(); SIZES.len()];
@@ -109,7 +113,6 @@ pub fn selftest() -> i32 {
     unsafe { free(q) };
 
     // 4. A large block — crosses out of the binned path into a span.
-    const BIG: usize = 600_000;
     let b = malloc(BIG);
     if b.is_null() {
         return E_LARGE_NULL;
