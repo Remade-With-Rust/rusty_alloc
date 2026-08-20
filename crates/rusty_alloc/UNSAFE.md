@@ -38,6 +38,21 @@ unsafe in DEPENDENCIES, and ours are `libc` plus bindings-only `windows-sys`.
 | `random.rs` | 2 | OS entropy seeding via the prim layer | 2026-08-08 |
 | `types.rs`, `bins.rs`, `segment_map.rs`, `lib.rs` | 0 | safe | — |
 
+### The `publish = false` crates
+
+Not published, but not unaudited either — they were covered by nobody until
+2026-08-20, when the workspace-root plan's "audited per member" claim turned
+out to be true of only 2 of 6 members. All four inherit `[lints] workspace =
+true`, so every `unsafe` block in them already carries a lint-enforced SAFETY
+comment, and all four are in the H-11 ratchet's baseline.
+
+| Module | Count | What the `unsafe` is for | Last audit |
+|---|---:|---|---|
+| `rusty_alloc_ffi/src/lib.rs` | 348 | **The workspace's untrusted boundary**: 157 `extern "C"` entry points receiving caller pointers and sizes. Every out-parameter writer null-guards; `mi_posix_memalign` validates alignment (power of two, ≥ `sizeof(void*)`) and returns EINVAL/ENOMEM; all 8 `count × size` sites use `checked_mul`. Panics cannot unwind into C (edition 2024 aborts on `extern "C"` unwind; release is `panic = "abort"`) | 2026-08-20 (first audit) |
+| `rusty_alloc_override/src/lib.rs` | 49 | `malloc`/`free`/`operator new` interposition for `LD_PRELOAD` — thin forwarding to `alloc::*`, plus the `free_inline` export that carries the fast-path body. No state of its own | 2026-08-20 (first audit) |
+| `rusty_alloc_bench/src/*.rs` | 29 | Tier-B kernels and the `.ratrace` replayer. The trace parser's `unwrap`s are infallible by TYPE (`Record::decode` takes `&[u8; RECORD_SIZE]`), and the one genuinely-invalid field returns `InvalidData` | 2026-08-20 (first audit) |
+| `rusty_alloc_wasm/src/lib.rs` | 21 | The `ra_selftest` cdylib fixture: raw block writes and read-back checks that prove the wasm build actually allocates | 2026-08-20 (first audit) |
+
 ## The four `unsafe impl`s (H-21)
 
 | Impl | Where | Justification |
