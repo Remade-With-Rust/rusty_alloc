@@ -70,7 +70,7 @@ jobs:
 
       - name: file an issue on a crasher
         if: failure()
-        uses: actions/github-script@10b53a9ec6c222bb4ce97aa6bd2b5f739696b536 # v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
         with:
           script: |
             github.rest.issues.create({
