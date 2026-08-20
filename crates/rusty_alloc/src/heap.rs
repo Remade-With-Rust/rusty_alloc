@@ -731,6 +731,20 @@ impl Heap {
         // SAFETY: delayed points into our own live HeapBox; blocks on it are
         // dead blocks of pages we own.
         unsafe {
+            // Peek with a plain LOAD before the swap. This runs on every
+            // slow-path allocation (the heartbeat's first duty), and on any
+            // thread that never receives a cross-thread free — the common
+            // single-threaded case, and the steady state of most others — the
+            // list is empty. An atomic LOAD is a bare `mov`; the `swap` that
+            // drains it is a LOCKed read-modify-write (~an order of magnitude
+            // dearer, and it dirties the cache line). Only pay the swap when
+            // there is actually a block to take. A push that races in after an
+            // empty peek is simply processed on the next heartbeat — frees on
+            // this list are drained at heartbeat cadence by design, never
+            // synchronously, so deferring one is already the contract.
+            if (*self.delayed).head.load(Ordering::Acquire) == 0 {
+                return;
+            }
             let mut b = (*self.delayed).head.swap(0, Ordering::AcqRel) as *mut Block;
             while !b.is_null() {
                 let next = (*b).next;

@@ -31,6 +31,7 @@ are to try.
 | 6 | Batch-op gap → traced to free's `used--` codegen | 3 | batch loss | **CLOSED as a codegen floor (refuted)** |
 | 7 | `wait_no_remote_in_flight` 512-slot scan | 3 | latency | **LANDED — bounded to the carved region** |
 | 8 | Collect-loop double `block_next` | — | batch loss | **banked (landed)** |
+| 9 | `process_delayed` swaps an empty list every slow-path alloc | 3 | slow path | **LANDED — load-before-swap** |
 
 ---
 
@@ -217,6 +218,33 @@ loom-modeled cross-thread protocol test plus `stress_mt` / `teardown_reclaim` /
 
 ---
 
+## Found during the Tier 3 hunt
+
+### 9. `process_delayed` drains an empty list with a locked swap — LANDED
+
+**Where:** [heap.rs:727](../crates/rusty_alloc/src/heap.rs#L727)
+
+`process_delayed` is the heartbeat's first duty — it runs on **every slow-path
+allocation** (`malloc_generic`) to drain the heap's cross-thread delayed-free
+list. It did so with an unconditional `head.swap(0, AcqRel)` — a LOCKed
+read-modify-write — even when the list was empty, which it is on any thread that
+never receives a cross-thread free (the common single-threaded case, and the
+steady state of most others).
+
+**Fix (2026-08-20):** peek with a plain `Acquire` LOAD first; only pay the swap
+when there is actually a block to take. A push that races in after an empty peek
+is drained on the next heartbeat — these frees are processed at heartbeat
+cadence by design, never synchronously, so deferring one is already the
+contract. Correctness rests on the loom-modeled cross-thread protocol, which
+stays green.
+
+**Measured:** big/large **−1.00 Ir/op** each (171 → 170), mixed **−0.72**
+(140.07 → 139.35), calloc/med tiny, fast-path ops (small 79.37) unchanged — no
+regressions. And the Ir count *understates* it: a locked `xchg` is a full
+barrier (~20 cycles, dirties the cache line) where a load is ~4 — so the
+wall-clock saving on every slow-path alloc is larger than the −1 Ir suggests.
+Both an instruction win and a deterministic-latency win.
+
 ## Banked
 
 ### 8. Collect-loop double `block_next` — LANDED 2026-08-20
@@ -244,6 +272,7 @@ flat or negative result is a finding.
 | 2026-08-20 | 5 | **LANDED — calloc 152.62 → 132.00 (−20.62 Ir/op)** | `Heap::zalloc` pops the block and zeroes it with the page IN HAND, using `(*p).block_size` for the usable extent instead of `zero_block`'s `usable_size(p)` re-resolution (segment mask + page resolve + kind check + unalign) on every recycled block. calloc 0.949x → **0.820x** vs mimalloc. Every other op byte-identical (small 79.38, batch 60.17, realloc 379.53 unchanged) — plain malloc/free untouched. Full-extent zeroing contract preserved (the `zalloc_is_zero_across_the_whole_usable_extent` property still passes). Workspace release + all-features clippy clean. |
 | 2026-08-20 | 4 | **ASSESSED — not worth it** | Premise false: `bin_size(bin)` is `bin << 3` for the common `bin <= 8`, and `bin_size(bin-1)` only runs for `bin > 8`. Replacing the shift with a table/stored load reintroduces a `panic_bounds_check` (bin from `bins::bin` is unbounded to LLVM) that costs more than it saves. The `.min` clamp that would bound it was tried under #3 and changed nothing. Left as-is. |
 | 2026-08-20 | 7 | **LANDED — segment-release scan bounded to actual use** | Fixed O(512) sweep on every segment release → `[HEADER_SLICES, next_free_slice)`, i.e. only the carved region; never-carved slots are guaranteed-idle (`xthread_free == 0`). A segment that carved 10 slices scans 10, not 512. Deterministic-latency win, bounded by use. Loom + stress_mt + teardown_reclaim + abandon_rss green; the aligned-op profile incidentally reconfirmed we already BEAT mimalloc there (ra 172/op vs mi 190/op — mimalloc burns 63/op in `_mi_page_retire`), so no parity gap to chase in the aligned path. |
+| 2026-08-20 | 9 | **LANDED — locked swap → load on the empty slow path** | `process_delayed` (runs on every `malloc_generic`) drained the cross-thread list with an unconditional locked `swap`, even when empty. Peek-with-load first. big/large −1.00 Ir/op, mixed −0.72, fast path unchanged; and it removes a ~20-cycle locked barrier from every slow-path alloc, a wall-clock win the Ir count understates. Loom protocol green. A fresh find during the Tier-3 hunt, not one of the original 8. |
 
 ### Refutation banked (do not retry the wrong way)
 
