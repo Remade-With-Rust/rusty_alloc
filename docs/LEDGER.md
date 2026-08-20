@@ -30,6 +30,20 @@ naming the consequence, and the one caller now releases only what it unlinked.
 This is the same lesson the 0.4.0 entry already records — *put the outcome in
 the type, not in a comment* — applied to the site that was missed.
 
+**And this time the fix is REPRODUCED, not merely reasoned.** The standing
+complaint against the 0.3.2-era repairs is in this ledger already:
+`teardown_reclaim.rs` "passes 4/4 with the bug deliberately reintroduced", so
+it guards nothing. To avoid repeating that, the walk was split into
+`try_unlink_huge_segment` (the decision, no diagnostic) and
+`remove_huge_segment` (decision + `debug_assert!`) — because with the assert
+inline, a test build panics on the not-found path and the `false` return, the
+entire point of the fix, can never be observed. `heap::unlink_tests` then
+checks the decision directly, and was verified BOTH WAYS: reintroducing the
+bug (`true` instead of `false` on the not-found path) makes it fail with the
+message naming defect #3; restoring the fix makes it pass. The +3 `unsafe`
+occurrences from the split were documented in `UNSAFE.md` and re-baselined,
+which is the ratchet working as designed.
+
 **Also from this pass, each an instrument run for the first time:**
 
 - **Kani (H-30):** five harnesses, all `VERIFICATION: SUCCESSFUL`. The one

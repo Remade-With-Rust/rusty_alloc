@@ -533,7 +533,30 @@ impl Heap {
     /// Owner thread.
     #[must_use = "false means the segment was NOT unlinked and must not be freed"]
     unsafe fn remove_huge_segment(&mut self, seg: *mut Segment) -> bool {
-        // SAFETY: list owned by this heap.
+        // SAFETY: forwarded contract.
+        let unlinked = unsafe { self.try_unlink_huge_segment(seg) };
+        // Diagnostic only — the RETURN above is what the caller acts on, and
+        // it is correct in release where this assertion does not exist.
+        debug_assert!(unlinked, "huge segment not in heap list");
+        unlinked
+    }
+
+    /// The list walk itself, with NO diagnostic attached.
+    ///
+    /// Split out so the DECISION is testable: with the `debug_assert!` inline,
+    /// a test build panics on the not-found path and the `false` return — the
+    /// entire point of the fix — can never be observed. `unlink_tests` below
+    /// exercises this directly, which is what turns "reasoned fix" into
+    /// "reproduced fix" (the ledger's standing complaint about the 0.3.2-era
+    /// repairs is that they were the former).
+    ///
+    /// # Safety
+    /// Owner thread. `seg` is compared but never dereferenced unless found,
+    /// so a foreign address is safe to pass.
+    #[must_use]
+    unsafe fn try_unlink_huge_segment(&mut self, seg: *mut Segment) -> bool {
+        // SAFETY: list owned by this heap; `seg` is only read through after
+        // it has been matched, i.e. once it is known to be one of ours.
         unsafe {
             let mut cur = &raw mut self.huge_segments;
             while !(*cur).is_null() {
@@ -543,8 +566,6 @@ impl Heap {
                 }
                 cur = &raw mut (**cur).next;
             }
-            // Diagnostic only — the RETURN is what the caller acts on.
-            debug_assert!(false, "huge segment not in heap list"); // nosemgrep: debug-assert-false-as-error-path
             false
         }
     }
@@ -1340,5 +1361,51 @@ unsafe fn queue_remove(q: *mut PageQueue, page: *mut Page) {
         }
         (*page).next = ptr::null_mut();
         (*page).prev = ptr::null_mut();
+    }
+}
+
+#[cfg(test)]
+mod unlink_tests {
+    use super::*;
+
+    /// The 0.4.0 use-after-free family, pinned as a REGRESSION TEST rather
+    /// than only as a type signature.
+    ///
+    /// `remove_huge_segment` must answer truthfully about whether it unlinked
+    /// anything, because its caller uses that answer to decide whether to
+    /// RELEASE the segment. When it returned `()`, a failed unlink was
+    /// invisible in release and the caller freed the segment regardless,
+    /// leaving a dangling head in whatever list still held it — defect #3 of
+    /// the 0.4.0 family. That was fixed for NORMAL segments at the time and
+    /// survived on the huge path until a semgrep rule written from the same
+    /// incident found it (2026-08-19).
+    ///
+    /// The ledger's standing complaint about that era is that the fixes were
+    /// *reasoned* but never *reproduced* (`teardown_reclaim.rs` still passes
+    /// with its bug deliberately reintroduced). This reproduces the decision.
+    ///
+    /// No real memory is needed, and that is a property of the shape rather
+    /// than a shortcut: when the walk finds nothing it never dereferences the
+    /// candidate, so a distinctive address stands in for "a segment belonging
+    /// to another heap". Building a genuine 32 MiB huge segment would test the
+    /// allocator, not the decision.
+    #[test]
+    fn unlink_reports_whether_it_actually_unlinked() {
+        let mut h = Heap::new();
+        assert!(
+            h.huge_segments.is_null(),
+            "a fresh heap should own no huge segments"
+        );
+
+        // --- not ours: must report false, and must not touch the list ---
+        let foreign = ptr::without_provenance_mut::<Segment>(0x5EE0_BAD0);
+        // SAFETY: the list is empty, so the walk terminates immediately and
+        // `foreign` is compared but never read through.
+        let unlinked = unsafe { h.try_unlink_huge_segment(foreign) };
+        assert!(
+            !unlinked,
+            "claimed to unlink a segment that was never in the list — the              caller would now free it (0.4.0 defect #3)"
+        );
+        assert!(h.huge_segments.is_null(), "the empty list was mutated");
     }
 }
