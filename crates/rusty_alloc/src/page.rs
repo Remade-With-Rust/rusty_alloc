@@ -59,9 +59,38 @@ pub struct Block {
     /// oracle's release default). Under `secure` it is ENCODED — see
     /// [`block_set_next`]/[`block_next`]: `enc = (next + key2) ^ key1`, so an
     /// overflow that overwrites the link cannot steer the allocator without
-    /// knowing both per-page keys, and a corrupted link is caught by the
-    /// alignment check on decode.
+    /// knowing both per-page keys, and a link that decodes outside the
+    /// carrying block's own segment, or off block alignment, aborts instead of
+    /// being followed.
+    ///
+    /// Note the DEFAULT build performs neither the encoding nor the check —
+    /// a link overwrite steers it freely. That is deliberate parity with the
+    /// oracle's release default, and it makes enabling `secure` a security
+    /// decision rather than a performance one. See `docs/threat-model.md`.
     pub next: *mut Block,
+}
+
+/// Could `dec` be a genuine free-list link stored in a block at `b_addr`?
+///
+/// Split out of [`block_next`] so the PREDICATE can be tested exhaustively
+/// in-process (`link_tests` below) while the fault PATH — which aborts, and so
+/// needs a child process — is tested separately in `tests/corruption.rs`.
+/// Testing an abort end-to-end proves the wiring; it cannot enumerate the
+/// boundary cases, and the boundary is where a bounds check earns its keep.
+///
+/// Both conditions are two ALU ops with no memory access, so this stays cheap
+/// enough for the free-list walk it guards.
+///
+/// Compiled in every configuration (only the CALL SITE is `secure`-gated) and
+/// public so `fuzz_targets/corruption.rs` can differentially check the
+/// `(a ^ b) < SEGMENT_SIZE` identity against a naive reference over arbitrary
+/// inputs. That identity is the one clever line here, and clever is exactly
+/// what wants a fuzzer pointed at it. Not part of the supported API.
+#[inline]
+#[doc(hidden)]
+pub fn link_is_plausible(dec: usize, b_addr: usize) -> bool {
+    dec.is_multiple_of(crate::types::MAX_ALIGN_SIZE.min(8))
+        && (dec ^ b_addr) < crate::types::SEGMENT_SIZE
 }
 
 /// Read a free-list link (decoding under `secure`).
@@ -85,13 +114,29 @@ pub unsafe fn block_next(page: *const Page, b: *const Block) -> *mut Block {
             }
             let keys = (*page).keys;
             let dec = (enc ^ keys[0]).wrapping_sub(keys[1]);
-            // A decoded link must be block-aligned inside a segment; anything
-            // else means the list was corrupted (overflow/UAF) — fail loudly
-            // instead of following it.
-            assert!(
-                dec.is_multiple_of(crate::types::MAX_ALIGN_SIZE.min(8)),
-                "rusty_alloc: corrupted free list (secure mode)"
-            );
+            // A decoded link must be a block-aligned address inside the SAME
+            // segment as the block carrying it — anything else means the list
+            // was corrupted (overflow/UAF) and must not be followed.
+            //
+            // Same-segment is the tight invariant: a page is a slice-span
+            // within ONE 32 MiB segment, so every block of a page — and hence
+            // every link in its free list — shares that segment. Because
+            // segments are SEGMENT_SIZE-aligned and SEGMENT_SIZE is a power of
+            // two, `(a ^ b) < SEGMENT_SIZE` IS "same segment", in two ALU ops
+            // with no memory access. That is both cheaper than asking the
+            // global segment map (an atomic load) and strictly stronger than
+            // it: the map would accept any segment we own, this accepts only
+            // the one the link must be in.
+            //
+            // Alignment alone — what this checked before — stops accidental
+            // corruption (a stray ASCII overflow fails it 7 times in 8) but
+            // barely inconveniences a deliberate attacker, since every target
+            // worth steering an allocator at is already pointer-aligned. The
+            // segment bound is what removes the out-of-heap targets (GOT
+            // entries, vtables, saved return addresses) from reach.
+            if !link_is_plausible(dec, b.addr()) {
+                corrupt_free_list_abort();
+            }
             crate::ptr_with_addr(b.cast_mut(), dec)
         }
     }
@@ -409,6 +454,23 @@ pub(crate) fn double_free_abort() -> ! {
     std::process::abort()
 }
 
+/// A corrupted free-list link was detected on decode (`secure` builds).
+///
+/// Aborts, and deliberately says nothing on the way out. The obvious thing —
+/// `assert!` with a message, which is what this path used to do — is wrong
+/// twice over for a fault detected INSIDE the allocator: formatting a panic
+/// message can allocate, re-entering the very allocator that just found its
+/// own metadata corrupted, and the unwind would cross `extern "C"` frames on
+/// the FFI path. A silent abort has neither failure mode, and it keeps the
+/// crate's "no logging outside the bench CLI" property (hardening gate H-20)
+/// intact. The signal is the diagnostic; `tests/corruption.rs` reads it.
+#[cold]
+#[inline(never)]
+#[cfg(feature = "secure")]
+pub(crate) fn corrupt_free_list_abort() -> ! {
+    std::process::abort()
+}
+
 /// Remote (non-owner) free — the loom-modeled protocol.
 ///
 /// # Safety
@@ -629,4 +691,73 @@ pub unsafe fn page_extend(page: *mut Page, area: *mut u8) {
 pub unsafe fn page_all_free(page: *mut Page) -> bool {
     // SAFETY: owner-only field.
     unsafe { (*page).used == 0 }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+    use crate::types::SEGMENT_SIZE;
+
+    /// A synthetic SEGMENT_SIZE-aligned base. No memory is touched and no heap
+    /// is built: the predicate is pure arithmetic on addresses, which is
+    /// precisely why it can be pinned this exactly. The end-to-end proof that
+    /// a bad link actually ABORTS lives in `tests/corruption.rs`.
+    const BASE: usize = 0x0000_4000_0000_0000;
+    /// A block sitting 1 MiB into that segment.
+    const B: usize = BASE + 0x10_0000;
+
+    #[test]
+    fn accepts_genuine_links_anywhere_in_the_same_segment() {
+        assert!(link_is_plausible(BASE, B), "segment's first block");
+        assert!(link_is_plausible(B, B), "self-link");
+        assert!(link_is_plausible(B + 4096, B), "forward link");
+        assert!(link_is_plausible(B - 4096, B), "backward link");
+        assert!(
+            link_is_plausible(BASE + SEGMENT_SIZE - 16, B),
+            "last aligned slot in the segment"
+        );
+    }
+
+    #[test]
+    fn rejects_every_misalignment() {
+        for off in 1..8usize {
+            assert!(!link_is_plausible(B + off, B), "misaligned by {off}");
+        }
+    }
+
+    /// The case the old alignment-only check let through, and the whole reason
+    /// the segment bound exists: a deliberate attacker picks an ALIGNED
+    /// target, because every address worth steering an allocator at — GOT
+    /// entries, vtables, function pointers, saved return addresses — already
+    /// is one. Alignment alone filters accidents, not adversaries.
+    #[test]
+    fn rejects_aligned_targets_outside_the_segment() {
+        assert!(
+            !link_is_plausible(BASE + SEGMENT_SIZE, B),
+            "first byte of the NEXT segment"
+        );
+        assert!(
+            !link_is_plausible(BASE - 16, B),
+            "last slot of the PREVIOUS segment"
+        );
+        assert!(
+            !link_is_plausible(0x0000_7fff_ffff_e000, B),
+            "a stack-shaped address"
+        );
+        assert!(
+            !link_is_plausible(0x0000_0000_0040_1000, B),
+            "a GOT-shaped address"
+        );
+    }
+
+    /// The bound must be exact on BOTH sides. Too tight and valid links abort
+    /// in normal operation (a crash we would ship); too loose and the first
+    /// slot of the neighbouring segment is reachable.
+    #[test]
+    fn the_segment_bound_is_exact() {
+        assert!(link_is_plausible(BASE + SEGMENT_SIZE - 16, B));
+        assert!(!link_is_plausible(BASE + SEGMENT_SIZE, B));
+        assert!(link_is_plausible(BASE, B));
+        assert!(!link_is_plausible(BASE - 16, B));
+    }
 }

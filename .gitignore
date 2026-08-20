@@ -1,4 +1,7 @@
 /target
+# The fuzz crate is a STANDALONE workspace, so the root-only `/target` rule
+# above does not reach its build directory.
+/fuzz/target/
 /oracle/out/
 /corpus/run/results/
 *.ratrace

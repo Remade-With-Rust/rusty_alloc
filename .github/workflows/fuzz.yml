@@ -25,7 +25,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [alloc_ops, xthread]
+        # `corruption` is pointed at the free-list link CHECK rather than at a
+        # workload, so it is the one target that needs `secure` — without it
+        # the check is not compiled in and the target has nothing to hunt
+        # false positives in.
+        include:
+          - target: alloc_ops
+            features: ""
+          - target: xthread
+            features: ""
+          - target: corruption
+            features: "--features secure"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -48,7 +58,7 @@ jobs:
       - name: fuzz
         run: |
           mins="${{ github.event.inputs.minutes || '30' }}"
-          cargo +nightly fuzz run ${{ matrix.target }} -- \
+          cargo +nightly fuzz run ${{ matrix.target }} ${{ matrix.features }} -- \
             -max_total_time=$((mins * 60)) -print_final_stats=1
 
       - name: save corpus

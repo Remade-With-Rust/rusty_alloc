@@ -11,6 +11,13 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 rusty_alloc = { path = "../crates/rusty_alloc" }
 
+# Passthrough so `cargo fuzz run corruption --features secure` reaches the
+# allocator. The `corruption` target needs it: without it the free-list link
+# check is not compiled in, and part 2 of that target (the false-positive
+# hunt) has nothing to hunt in.
+[features]
+secure = ["rusty_alloc/secure"]
+
 # Standalone workspace: the fuzz crate needs nightly + libFuzzer and must not
 # drag those requirements into the main workspace's Windows/stable builds.
 [workspace]
@@ -25,6 +32,16 @@ bench = false
 [[bin]]
 name = "xthread"
 path = "fuzz_targets/xthread.rs"
+test = false
+doc = false
+bench = false
+
+# Points at the free-list link CHECK rather than at a workload. Run it with
+# `--features secure`, or part 2 (the false-positive hunt) has no check to
+# hunt for false positives in.
+[[bin]]
+name = "corruption"
+path = "fuzz_targets/corruption.rs"
 test = false
 doc = false
 bench = false

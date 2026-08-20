@@ -57,7 +57,7 @@ least every 12 months (next: 2027-08-19 or earlier per the audit cadence in
 |---|---|---|
 | **S**poofing | A recycled thread id impersonating a dead owner | Dying threads abandon segments (id → 0) before the TCB can be recycled; TLS storage is the thread's own block (`.tdata` image), so a recycled TCB cannot inherit a live heap pointer |
 | **T**ampering | T1: `free()` on a forged/foreign pointer — `page_of` trusts `slice_offset` read from the pointer's own 32 MiB window (upstream mimalloc parity) | Partial: `secure` feature encrypts free-list links (corruption detected on decode) and adds guard pages; double frees abort on both local and remote paths; full pointer validation (segment-map membership on the free path) is a residual risk — R-001, and the reason `secure` exists for hostile-input services |
-| | T2: free-list poisoning via a caller write primitive | `secure`: per-page keyed link encoding + alignment check on decode; default build matches upstream's posture |
+| | T2: free-list poisoning via a caller write primitive — the classic heap-exploitation move, where an overwritten link makes the next allocation return an attacker-chosen address and every write through it an arbitrary write | `secure`: per-page keyed link encoding, plus a decode check requiring the link to be block-aligned AND inside the SAME segment as the block carrying it (`page::link_is_plausible`), aborting silently rather than following it. The segment bound is what constrains a DELIBERATE attacker — alignment alone filters accidents, since every address worth steering an allocator at is already pointer-aligned. Both arms are adversarially tested (`tests/corruption.rs` poisons a real free list and asserts SIGABRT, not SIGSEGV) and fuzzed (`fuzz_targets/corruption.rs`). **The default build performs neither the encoding nor the check** — upstream parity, and the reason enabling `secure` is a security decision rather than a performance one |
 | **R**epudiation | (not applicable — no authentication or audit domain of its own) | N/A |
 | **I**nformation disclosure | Recycled blocks leaking prior contents through the zero guarantee | `free_is_zero` is conservatively cleared on purge/reuse; the zalloc invariant is G1-gated on 1M-op traces; the Darwin decommit contract violation that could have stale-exposed pages was found and fixed in 0.4.0 |
 | **D**enial of service | Forced abort or hang from reachable inputs | Double-free abort is a deliberate policy (corruption beats availability). Known gap: heap-creation OOM aborts instead of null-returning (`init.rs:499`, R-003). The init CAS winner aborts rather than hangs on TLS-slot failure (audited 2026-08-06) |
@@ -66,9 +66,21 @@ least every 12 months (next: 2027-08-19 or earlier per the audit cadence in
 ## What the `secure` feature adds (opt-in, measured 4–7%)
 
 Guard pages around guarded-sampled objects, per-page encrypted free-list
-links (corrupt links detected on decode), and guarded-object sampling.
-Services facing untrusted input should enable it; the default build matches
-upstream mimalloc's release posture plus double-free detection.
+links, a same-segment bound on every decoded link, and guarded-object
+sampling. Services facing untrusted input should enable it; the default build
+matches upstream mimalloc's release posture plus double-free detection.
+
+**These mitigations are tested for EFFICACY, not merely for function.** That
+distinction was a real gap until 2026-08-20: the tests in `secure.rs` all
+write strictly inside legitimately-allocated blocks, so nothing in the crate
+had ever been observed to fire. `tests/corruption.rs` now poisons a genuine
+free list two ways — blunt overflow filler, and a high-bit flip that keeps the
+decoded pointer perfectly ALIGNED so it defeats every alignment-based defence
+— and asserts the process dies of SIGABRT rather than SIGSEGV. The signal is
+the whole assertion: SIGSEGV would mean the allocator decoded the attacker's
+bytes and followed them, and a test asserting only "the child died" would pass
+in exactly the case the mitigation failed. Confirmed by disabling the check
+and watching the signal flip.
 
 ## Residual risks
 
