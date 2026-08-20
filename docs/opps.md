@@ -26,7 +26,7 @@ are to try.
 | 1 | `page_index` division on the refill path | 1 | batch loss | **LANDED — whole-program win, not the batch one** |
 | 2 | `stat_realloc` re-resolves the heap per realloc | 1 | realloc | **LANDED — realloc −14.16 Ir/op** |
 | 3 | Emitted-bounds-check audit of the hot paths | 2 | unknown | **DONE — fast paths already bounds-check-free** |
-| 4 | `update_direct` recomputes `bin_size` twice | 2 | batch loss | proposed |
+| 4 | `update_direct` recomputes `bin_size` twice | 2 | batch loss | **ASSESSED — premise false, the cheap version is already there** |
 | 5 | `zero_block` re-resolves `usable_size` (calloc) | 2 | calloc | **LANDED — calloc 152.62 → 132.00, −20.62 Ir/op** |
 | 6 | Batch-op gap → traced to free's `used--` codegen | 3 | batch loss | **CLOSED as a codegen floor (refuted)** |
 | 7 | `wait_no_remote_in_flight` 512-slot scan | 3 | latency | proposed |
@@ -94,24 +94,47 @@ sqlite as the realloc-heavy real workloads.
 
 ## Tier 2 — real but smaller, or needs a probe first
 
-### 3. Emitted-bounds-check audit of the hot paths
+### 3. Emitted-bounds-check audit of the hot paths — DONE
 
-`cargo rustc --release -p rusty_alloc --lib -- --emit asm`, then attribute
-`panic_bounds_check` call sites to symbols by line range. Not yet run. The
-cheapest way to find a *surprise* hot-path check — the `rusty-unsafe-optimizations`
-case study found the "obvious" candidates emitted zero checks while one
-unglamorous site owned 13% of a codec's encode. One command; may reorder
-everything below it. Deterministic, needs no quiet box.
+**Result (2026-08-20): the shipped hot paths are already bounds-check-free.**
 
-### 4. `update_direct` recomputes `bin_size` twice per refill
+`cargo rustc --release --emit asm` reports **39** `panic_bounds_check` sites
+across the whole lib. Attributed to symbols, then cross-checked by
+disassembling the shipped override `.so`:
 
-**Where:** [heap.rs:1180](../crates/rusty_alloc/src/heap.rs#L1180),
-[heap.rs:1197](../crates/rusty_alloc/src/heap.rs#L1197)
+- **`malloc`, `free`, `calloc` exported fast paths: ZERO** bounds checks / panics
+  (confirmed directly on the `.so`).
+- The 39 are all on slow/cold paths: `span_alloc` 6, `span_free` 5,
+  `visit_segment_blocks` 3, `adopt_segment` 3, arena management 7, thread
+  teardown, guarded sampling, and **2 on the `malloc_generic` refill path**.
 
-Computes `bin_size(bin)` and `bin_size(bin-1)` (shift/mask arithmetic) on every
-refill. The `w_lo`/`w_hi` wsize bounds are a pure function of `bin` and could be
-a small const table indexed by bin, turning arithmetic into a load. Heartbeat
-cadence, so modest.
+So there is no hot-path bounds-check tax to remove — the safe-Rust allocator
+runs check-free exactly where it matters, the same result the
+`rusty-unsafe-optimizations` h264 case study found. The 2 refill checks resisted
+a `.min(MAX_NORMAL_BIN)` clamp on `bin` (count unchanged), sit on a cold path,
+and are not worth chasing further; recorded here so the dead end is not
+re-explored.
+
+### 4. `update_direct` recomputes `bin_size` twice per refill — ASSESSED, premise false
+
+**Verdict (2026-08-20):** not worth doing; the recompute is already the cheap
+option on the hot path.
+
+The premise was that `bin_size(bin)` and `bin_size(bin-1)` are costly arithmetic
+worth precomputing into a table. On inspection:
+
+- `bin_size(bin)` for `bin <= 8` — the common small-allocation bins — is
+  literally `bin * INTPTR_SIZE`, i.e. `bin << 3`, a single shift.
+- `bin_size(bin-1)` runs ONLY in the `w_lo` match's `_ =>` arm, which is reached
+  only for `bin > 8` (larger, rarer allocations).
+
+So on the hot path there is no expensive recompute to remove. And the proposed
+fix makes it worse: a const table `T[bin]` or `self.pages[bin].block_size`
+replaces a register shift with an **array load that carries a `panic_bounds_check`**
+(`bin` comes from `bins::bin`, whose bit arithmetic LLVM cannot bound — the same
+reason #3's refill checks survive a `.min(MAX_NORMAL_BIN)` clamp, which was tried
+and changed the count by zero). Trading a proven-safe shift for a bounds-checked
+load is a net loss. Left as-is.
 
 ### 5. `zero_block` re-resolves `usable_size` for recycled blocks (calloc)
 
@@ -203,6 +226,7 @@ flat or negative result is a finding.
 | 2026-08-20 | 6 | **REFUTED — codegen floor, nothing shipped** | Traced the batch gap to free's `used--` (5 insns vs mimalloc's `subw; je` = 2) + the thread-compare (`mov fs:0` + cmp vs mimalloc's `cmp reg, fs:0`). malloc is at parity; free is ours 27 / mi 24 executed insns. The push/decrement split meant to trigger `dec [mem]; jle` produced BYTE-IDENTICAL asm. Both folds need inline asm on the hottest path — declined. The gap is a Rust-vs-C instruction-selection floor, not algorithmic. A NOTE at the decrement records this so it is not retried. |
 | 2026-08-20 | 3 | **AUDIT — hot paths already clean** | 39 `panic_bounds_check` sites lib-wide, but **zero** reachable from the shipped `malloc` / `free` / `calloc` fast paths (confirmed on the override `.so`). All 39 are on slow/cold paths (segment alloc/free 11, visitors/adopt 6, arena 7, teardown, and 2 on the `malloc_generic` refill). The safe-Rust hot path pays NO bounds-check tax — the h264-skill lesson holds. Refill-path removal tracked below. |
 | 2026-08-20 | 5 | **LANDED — calloc 152.62 → 132.00 (−20.62 Ir/op)** | `Heap::zalloc` pops the block and zeroes it with the page IN HAND, using `(*p).block_size` for the usable extent instead of `zero_block`'s `usable_size(p)` re-resolution (segment mask + page resolve + kind check + unalign) on every recycled block. calloc 0.949x → **0.820x** vs mimalloc. Every other op byte-identical (small 79.38, batch 60.17, realloc 379.53 unchanged) — plain malloc/free untouched. Full-extent zeroing contract preserved (the `zalloc_is_zero_across_the_whole_usable_extent` property still passes). Workspace release + all-features clippy clean. |
+| 2026-08-20 | 4 | **ASSESSED — not worth it** | Premise false: `bin_size(bin)` is `bin << 3` for the common `bin <= 8`, and `bin_size(bin-1)` only runs for `bin > 8`. Replacing the shift with a table/stored load reintroduces a `panic_bounds_check` (bin from `bins::bin` is unbounded to LLVM) that costs more than it saves. The `.min` clamp that would bound it was tried under #3 and changed nothing. Left as-is. |
 
 ### Refutation banked (do not retry the wrong way)
 
