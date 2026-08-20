@@ -57,8 +57,17 @@ a microbenchmark. Upstream mimalloc reads these flags non-atomically, does not
 pay the instruction, and has the race. The README now says 11-of-13 rather
 than 13-of-13 and explains why in place.
 
+**The fuzz soak that followed, and it is the number H-27 will be built on:**
+5,047,688 executions of `alloc_ops` and 1,940,317 of `xthread` — **~7.0
+million inputs through the full public surface under ASan, zero crashes**.
+The runs added 2,951 and 883 new corpus units; `cargo fuzz cmin` minimized
+those to **431 + 164 files (1.2 MB) preserving 515 + 446 coverage edges**,
+now committed. Committing the minimized corpus rather than only the seeds is
+the point: the nightly job carries coverage forward through the actions
+cache, and a cache eviction would otherwise restart discovery from zero.
+
 **Also landed in the same sanitizer/dynamic pass:** ASan clean over the core
-suites (13 tests) and both fuzz targets (628k+ inputs, 0 findings);
+suites (13 tests) and both fuzz targets;
 `cargo careful test` green (21 tests); and `tests/properties.rs` — 8 proptest
 properties over the documented invariants, including "live blocks never
 overlap" checked only after every block is live, so an overlap cannot be
