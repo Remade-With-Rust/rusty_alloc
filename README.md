@@ -14,8 +14,8 @@ does not offer.
 ## ⚡ The headline
 
 - **At-or-below mimalloc on instructions retired** on real programs under
-  `LD_PRELOAD` (lua 0.98×, perl 1.00×, sqlite 1.00×), and ~17% fewer than
-  glibc.
+  `LD_PRELOAD` (lua 0.97×, perl 1.00×, sqlite 1.00×), **2–15% under jemalloc**
+  (lua 0.85×, perl 0.90×, sqlite 0.98×), and ~17% under glibc.
 - **A double free aborts instead of corrupting.** Upstream mimalloc accepts it
   silently in release builds; we detect it on both the local and the
   cross-thread path and abort.
@@ -23,7 +23,7 @@ does not offer.
   implementation as a differential oracle on every change.
 - **Runs on WebAssembly** with no C toolchain and no emscripten.
 
-> **Status: `0.7.0` — a 0.x release; the API is not frozen.**
+> **Status: `1.0.0` — the API is frozen; changes follow semver from here.**
 > Upgrading from 0.3.x or earlier is mandatory, not optional: 0.4.0 fixed
 > three platform-independent use-after-frees, so **treat 0.3.2 and earlier as
 > unsound on every target.**
@@ -33,21 +33,22 @@ does not offer.
 Instructions retired under callgrind, x86-64 Linux, `LD_PRELOAD`, repeats to
 4–6 significant figures. Real programs:
 
-| workload | vs mimalloc | vs glibc |
-|---|---:|---:|
-| lua | **0.98** | 0.83 |
-| perl | **1.00** | 0.82 |
-| sqlite | **1.00** | 0.99 |
+| workload | vs mimalloc | vs jemalloc | vs glibc |
+|---|---:|---:|---:|
+| lua | **0.97** | **0.85** | 0.83 |
+| perl | **1.00** | **0.90** | 0.82 |
+| sqlite | **1.00** | **0.98** | 0.99 |
 
-Per-operation (`bench/opscan.sh`, one neutral C driver, all arms preloaded —
-**11 of 13 operations at-or-below mimalloc**, one tied, batch 0.8% behind):
+jemalloc is 5.3.0; all four arms are the same neutral binary under `LD_PRELOAD`,
+same callgrind method. Per-operation (`bench/opscan.sh` — **11 of 13 operations
+at-or-below mimalloc**, one tied, batch 0.8% behind):
 
 | op | ra/mi | op | ra/mi |
 |---|---:|---|---:|
 | small / med | 0.71 | batch lifo/fifo | 1.008 |
 | big / large | 0.77 | aligned | 0.90 |
-| realloc | 0.79 | mixed | 0.89 |
-| huge | 0.01 | calloc | 0.95 |
+| realloc | 0.76 | mixed | 0.88 |
+| huge | 0.01 | calloc | 0.82 |
 
 **Why batch went from 0.99 to 1.008**, since a number moving the wrong way
 deserves its reason in the open: ThreadSanitizer found a genuine data race on
@@ -73,8 +74,8 @@ configuration with flat, measured RSS (a 6-minute thread-churn soak held
 
 Every change runs Windows + Linux suites (all features), `clippy -D warnings`,
 Miri over the whole target, a 640-thread churn probe, a wasm VM self-test, and
-deterministic instruction A/Bs against the C oracle. On top of that, 0.7.0 was
-validated against real workloads:
+deterministic instruction A/Bs against the C oracle. On top of that, the
+allocator is validated against real workloads:
 
 - **Real programs, byte-identical output:** jq, sqlite3, python3, git, xz,
   zstd, lua and perl each produce bit-for-bit identical output under
@@ -96,11 +97,36 @@ including the changes reverted for being flat or slower.
 
 ## Security
 
-The threat model is [docs/threat-model.md](docs/threat-model.md); the
-`unsafe` inventory is [crates/rusty_alloc/UNSAFE.md](crates/rusty_alloc/UNSAFE.md);
-vulnerability reports go through [SECURITY.md](SECURITY.md) (private GitHub
-advisories, 3-business-day acknowledgement). The gate-by-gate hardening
-status is the table at the bottom of this README.
+Audited against the `use-protection-please` 41-gate hardening standard —
+**14 of 15 v1.0.0 gates met**. The one open gate, H-27, is the 30-day
+continuous-fuzz soak: the nightly mechanism is live and the corpus is committed
+as a floor; the soak completes 2026-09-19 and ships under a time-bound owner
+waiver. The residual-risk register (R-001..R-005) is owner-accepted; both
+release waivers (H-05 release overflow-checks, H-27 soak) are time-bounded. The
+gate-by-gate table is at the bottom of this README.
+
+Default build:
+
+- **A double free aborts** instead of handing one block to two owners — on the
+  owner and cross-thread paths both.
+- **Memory-safe core:** `unsafe` isolated with a stated invariant per block,
+  `undocumented_unsafe_blocks` and `unsafe_op_in_unsafe_fn` denied
+  workspace-wide, Miri-clean over the whole target, a loom-verified cross-thread
+  protocol.
+- **Mitigations verified for efficacy, not just presence:** `tests/corruption.rs`
+  poisons a real free list and requires SIGABRT (detected-and-refused), not
+  SIGSEGV (followed the poisoned link) — a mitigation nobody has watched fire is
+  a claim, not a defence.
+
+Opt-in for hostile input: **`secure`** (encrypted free-list links + a
+same-segment link bound; flat ~15 instr/alloc) and **`blockmap`** (a per-page
+block-liveness map that closes R-005 — a forged link handed out as a live block
+— off by default on cost).
+
+Threat model: [docs/threat-model.md](docs/threat-model.md) · `unsafe` inventory:
+[crates/rusty_alloc/UNSAFE.md](crates/rusty_alloc/UNSAFE.md) · reports:
+[SECURITY.md](SECURITY.md) (private GitHub advisories, 3-business-day
+acknowledgement).
 
 ## What is this?
 
@@ -121,8 +147,11 @@ abandonment and adoption, first-class heaps, arenas, huge allocations, aligned
 allocation with interior-pointer recovery, and the full realloc family.
 
 **Safety** — double-free detection on both the owner and cross-thread paths;
-Miri-clean; `debug_checks` for full invariant validation; `secure` for guard
-pages, encrypted free lists and guarded-object sampling (measured cost 4–7%).
+Miri-clean; `debug_checks` for full invariant validation; `secure` for encrypted
+free-list links with a same-segment link bound (flat ~15 instr/alloc); `blockmap`
+for a per-page block-liveness map that closes the read-primitive residual R-005
+(off by default on cost). Mitigations are tested for efficacy — the corruption
+suite asserts the allocator *aborts* on a poisoned free list.
 
 **Portability** — x86-64 and aarch64, Linux, macOS and Windows, plus
 `wasm32-unknown-unknown` via `memory.grow`.
@@ -131,7 +160,7 @@ pages, encrypted free lists and guarded-object sampling (measured cost 4–7%).
 
 ```toml
 [dependencies]
-rusty_alloc-api = "0.7"
+rusty_alloc-api = "1.0"
 ```
 
 | crate | docs | what |
@@ -199,14 +228,14 @@ rebuilt in Rust, memory-safe by construction, measured rather than asserted.
 <!-- HARDENING-TABLE:BEGIN generated by use-protection-please — edit docs/plans/use-protection-please.md, not this block -->
 ## Hardening status
 
-**Tier** critical-path · **Audited** 2026-08-20 (survey) · **v1.0.0 gates** 12/15 · [Full checklist](docs/plans/use-protection-please.md)
+**Tier** critical-path · **Audited** 2026-08-20 (survey) · **v1.0.0 gates** 14/15 · [Full checklist](docs/plans/use-protection-please.md)
 
-`█████████████████░░░` **89%** &nbsp;·&nbsp; 31 Completed · 1 Scheduled · 3 Incomplete · 20 N/A
+`██████████████████░░` **94%** &nbsp;·&nbsp; 33 Completed · 1 Scheduled · 1 Incomplete · 20 N/A
 
 | Phase | ✅ Completed | 🗓 Scheduled | ⬜ Incomplete | · N/A |
 |---|--:|--:|--:|--:|
 | 0 — Threat modeling | 2 | 0 | 0 | 0 |
-| 1 — Toolchain | 3 | 0 | 1 | 0 |
+| 1 — Toolchain | 4 | 0 | 0 | 0 |
 | 2 — Supply chain | 8 | 0 | 0 | 0 |
 | 3 — Code level | 6 | 0 | 0 | 1 |
 | 4 — Static analysis | 1 | 0 | 0 | 0 |
@@ -216,9 +245,9 @@ rebuilt in Rust, memory-safe by construction, measured rather than asserted.
 | 8 — Build and binary | 0 | 0 | 0 | 2 |
 | 9 — Runtime privilege | 0 | 0 | 0 | 1 |
 | 10 — Cryptography | 1 | 0 | 0 | 2 |
-| 11 — CI/CD, release, and operations | 3 | 0 | 2 | 0 |
+| 11 — CI/CD, release, and operations | 4 | 0 | 1 | 0 |
 | 12 — Compliance controls | 0 | 0 | 0 | 14 |
-| **Total** | **31** | **1** | **3** | **20** |
+| **Total** | **33** | **1** | **1** | **20** |
 
 **Next up** — H-27 Continuous fuzzing with no open crashes (2026-09-19 (30 days from the nightly job's first run))
 

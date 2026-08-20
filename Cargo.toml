@@ -10,18 +10,19 @@ members = [
 ]
 
 [workspace.package]
-# 0.x: the API is not frozen. The allocator is complete and gated; the
-# wall-clock half of the performance evidence still needs a quiet box. The
-# README says so under "What is and isn't measured"; keep it there and current.
+# 1.0.0: the API is frozen; changes follow semver from here. The allocator is
+# complete and gated; the wall-clock half of the performance evidence still
+# needs a quiet box, so only instruction-count claims are made (README says so).
 #
-# 0.7.0: the 2026-08-19 fast-path campaign (docs/LEDGER.md). Every operation
-# of the per-op scan and all three real-program arms now measure at-or-below
-# mimalloc on instructions retired; the full mimalloc-bench corpus and the
-# 10-program real-world sweep run clean (correctness). Public API changed
-# under 0.x rules: `page_push_local` returns the post-decrement count,
-# `Heap::malloc_generic` is crate-visible, and the TLS slot's empty state is
-# a sentinel rather than null.
-version = "0.7.0"
+# 1.0.0: API frozen. The 2026-08-20 optimization campaign (docs/opps.md)
+# sharpened the per-op margins — calloc 0.95->0.82, realloc 0.79->0.76,
+# big/large/mixed nudged down — on top of the 0.7.0 fast-path work, and the
+# `use-protection-please` security audit reached 14/15 v1.0.0 gates with a
+# time-bound owner waiver on H-27 (the 30-day fuzz soak, mechanism live,
+# completes 2026-09-19). Every op of the per-op scan is at-or-below mimalloc
+# except batch (a measured safe-Rust codegen floor, +0.8%); all three
+# real-program arms and the full mimalloc-bench corpus run clean.
+version = "1.0.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/remade-with-rust/rusty_alloc"

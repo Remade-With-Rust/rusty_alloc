@@ -56,7 +56,7 @@ fact.
 |---|---|---|---|---|
 | H-03 | Toolchain pinned (`rust-toolchain.toml`) | Completed | `channel = "1.97.1"` + components + tier-1 targets; CI pins the same version | |
 | H-04 | Committed `.cargo/config.toml` hardening defaults | Completed | `.cargo/config.toml` (2026-08-19): full RELRO (`-z relro -z now`) + `-z noexecstack` on both Linux targets, `/NXCOMPAT /DYNAMICBASE /CETCOMPAT` on MSVC. VERIFIED IN THE ARTIFACT, not assumed — `readelf` on the shipped cdylib shows `GNU_RELRO`, `FLAGS: BIND_NOW`, and `GNU_STACK RW` (non-exec). Frame pointers DELIBERATELY excluded and measured: +6.14 Ir/op batch (+10.4%), +11.01 small (+14.0%) — they reinstate the prologues M13/M16/the 2026-08-19 campaign removed; the debuggability intent is met by `debug = true` shipping full DWARF instead. Deviation stated in the file | |
-| H-05 | ★ Release profile hardened (overflow-checks, LTO, panic policy) | Incomplete | LTO/cgu/panic deliberate; `overflow-checks = true` MEASURED at +7.1% batch / +11% mixed (core plan H-05) — waiver proposed on that number, owner decision pending | |
+| H-05 | ★ Release profile hardened (overflow-checks, LTO, panic policy) | Completed | LTO/cgu/panic deliberate; `overflow-checks = true` MEASURED at +7.1% batch / +11% mixed (core plan H-05) — WAIVED by the owner (Tim) 2026-08-20, time-bounded in the core plan Waivers table (untrusted-size arithmetic is `checked_*`; debug/test/Miri run with checks on) | |
 | H-06 | Security toolchain available to CI and developers | Completed | CI installs version-pinned cargo-deny 0.20.2, cargo-audit 0.22.2, cargo-fuzz 0.13.2, miri, clippy, rustfmt | |
 
 ### Phase 2 — Supply chain
@@ -142,7 +142,7 @@ fact.
 | H-38 | Releases signed, attested, and changelogged for security | Incomplete | Machine-side DONE (2026-08-19): `release.yml` now emits `SHA256SUMS.txt` alongside the SBOMs and calls `actions/attest-build-provenance`, so every `v*` tag produces a signed, GitHub-attested statement of what built the artifacts and from which commit. Security-relevant changes are recorded per-milestone in `docs/LEDGER.md`. **The remaining half needs a human key**: tags are unsigned (`v0.4.0`, `v0.7.0`), and only the owner can hold the signing key — configure `user.signingkey` + `tag.gpgSign`, or adopt sigstore. Left Incomplete rather than claimed | |
 | H-39 | ★ `SECURITY.md` with a coordinated disclosure process | Completed | Present at the repo root: private GitHub advisories, 3-business-day ack, 90-day coordinated disclosure, scope + supported versions | |
 | H-40 | Advisory monitoring and scheduled re-audit | Completed | cargo-audit per-PR + weekly CI cron; quarterly re-audit (Next review 2026-11-19) | |
-| H-41 | ★ Residual risks listed and accepted; waivers time-bounded | Incomplete | Register below; acceptance pending the owner | |
+| H-41 | ★ Residual risks listed and accepted; waivers time-bounded | Completed | R-001..R-005 accepted by the owner (Tim) 2026-08-20; the two release waivers (H-05, H-27) are time-bounded in the core plan Waivers table | |
 
 ### Phase 12 — Compliance controls
 

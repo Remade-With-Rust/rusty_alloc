@@ -52,7 +52,7 @@ violated precondition; the core's double-free abort and Miri are the nets.
 |---|---|---|---|---|
 | H-03 | Toolchain pinned (`rust-toolchain.toml`) | Completed | Workspace pin `1.97.1` | |
 | H-04 | Committed `.cargo/config.toml` hardening defaults | Completed | `.cargo/config.toml` (2026-08-19): full RELRO (`-z relro -z now`) + `-z noexecstack` on both Linux targets, `/NXCOMPAT /DYNAMICBASE /CETCOMPAT` on MSVC. VERIFIED IN THE ARTIFACT, not assumed — `readelf` on the shipped cdylib shows `GNU_RELRO`, `FLAGS: BIND_NOW`, and `GNU_STACK RW` (non-exec). Frame pointers DELIBERATELY excluded and measured: +6.14 Ir/op batch (+10.4%), +11.01 small (+14.0%) — they reinstate the prologues M13/M16/the 2026-08-19 campaign removed; the debuggability intent is met by `debug = true` shipping full DWARF instead. Deviation stated in the file | |
-| H-05 | ★ Release profile hardened (overflow-checks, LTO, panic policy) | Incomplete | Inherits the workspace profile; `overflow-checks` measured + waiver proposed (core plan H-05) | |
+| H-05 | ★ Release profile hardened (overflow-checks, LTO, panic policy) | Completed | Inherits the workspace profile; `overflow-checks` WAIVED by the owner (Tim) 2026-08-20 on the measured +7.1% batch / +11% mixed cost, time-bounded in the core plan Waivers table | |
 | H-06 | Security toolchain available to CI and developers | Completed | Workspace CI: version-pinned deny/audit/fuzz/miri/clippy/rustfmt | |
 
 ### Phase 2 — Supply chain
@@ -138,7 +138,7 @@ violated precondition; the core's double-free abort and Miri are the nets.
 | H-38 | Releases signed, attested, and changelogged for security | Incomplete | Machine-side DONE (2026-08-19): `release.yml` now emits `SHA256SUMS.txt` alongside the SBOMs and calls `actions/attest-build-provenance`, so every `v*` tag produces a signed, GitHub-attested statement of what built the artifacts and from which commit. Security-relevant changes are recorded per-milestone in `docs/LEDGER.md`. **The remaining half needs a human key**: tags are unsigned (`v0.4.0`, `v0.7.0`), and only the owner can hold the signing key — configure `user.signingkey` + `tag.gpgSign`, or adopt sigstore. Left Incomplete rather than claimed | |
 | H-39 | ★ `SECURITY.md` with a coordinated disclosure process | Completed | Repo-root `SECURITY.md` covers both published crates | |
 | H-40 | Advisory monitoring and scheduled re-audit | Completed | Workspace monitoring (per-PR + weekly cron); quarterly re-audit | |
-| H-41 | ★ Residual risks listed and accepted; waivers time-bounded | Incomplete | Register below listed; acceptance pending the owner | |
+| H-41 | ★ Residual risks listed and accepted; waivers time-bounded | Completed | R-001..R-005 accepted by the owner (Tim) 2026-08-20; the two release waivers (H-05, H-27) are time-bounded in the core plan | |
 
 ### Phase 12 — Compliance controls
 
