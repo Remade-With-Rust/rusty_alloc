@@ -11,7 +11,7 @@ two published crates mirror their own crate READMEs (see the member plans)
 **Compliance**: none — no framework declared in scope
 **Architect**: Tim — Mata Network
 **Audit depth**: survey, plus the tool probes genuinely executed on 2026-08-19
-**Audited**: 2026-08-19 by Claude Fable 5 (session audit) · **Next review**: 2026-11-19
+**Audited**: 2026-08-20 by Claude Opus 5 (workspace Phase 3 pass; 2026-08-19 by Claude Fable 5 before it) · **Next review**: 2026-11-19
 
 > Source of truth for this unit's hardening status. The README's status table is
 > **generated from this file** — edit here, then run the renderer.
@@ -210,4 +210,5 @@ nothing is Scheduled until both are filled.
 | Date | Depth | Auditor | Completed / Scheduled / Incomplete | ★ met | Note |
 |---|---|---|---|---|---|
 | 2026-08-19 | survey+cited tools | Claude Fable 5 | 2 / 0 / 28 (25 N/A) | 1/13 | first pass; ★ blockers: H-01 H-05 H-07 H-08 H-09 H-10 H-12 H-15 H-26 H-27 H-39 H-41 |
+| 2026-08-20 | deep (per-member audit) | Claude Opus 5 | 31 / 1 / 3 (20 N/A) | 12/15 | workspace Phase 3: the `N/A - audited per member` justification was one-third true, since only 2 of 6 members have a plan file. Audited the other four - `-ffi` (2,130 loc / 348 unsafe, 157 `extern "C"` entry points), `-bench` (1,187), `-override` (221), `-wasm` (197), 3,735 lines nobody had read. Found sound: every out-param writer null-guards, `mi_posix_memalign` validates alignment, all 8 count x size sites use `checked_mul`, 0 unwrap/expect across the C surface, zero manual Send/Sync. H-16/17/18/19/21 N/A -> Completed; H-20 kept N/A deliberately (no secret material, no leak channel - an honest N/A beats a fake pass) |
 | 2026-08-19 | deep (tools executed) | Claude Fable 5 | 14 / 0 / 16 (25 N/A) | 7/13 | same-day execution pass. ★ blockers left: H-05(waiver) H-10 H-12 H-15 H-27(soak) H-41(owner) |

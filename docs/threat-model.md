@@ -88,7 +88,38 @@ was roughly 3–4× too pessimistic:
   free-list operations.
 - **+0.6% to +1.8% whole-program** on lua / perl / sqlite.
 
-**Why it stays opt-in:** that is still enough to forfeit mimalloc parity — the
+## What `blockmap` adds (opt-in, and expensive: ~+58 instructions per allocation)
+
+A per-page liveness bit for every block, checked on allocation and cleared on
+free. **It is the only thing in the crate that answers R-005**, and it works by
+refusing to play the game the encoding loses: rather than trying to stop a link
+being FORGED, it detects what a forgery is FOR — the allocator handing out a
+block that is already live. It therefore does not care how the link was
+produced, and it carries no key for a read primitive to recover.
+
+Verified to stop both corruption scenarios **unaided** — no `secure`, no
+`linkcheck` — with SIGABRT in debug and release, across 637,602 fuzz executions
+with no false positives.
+
+It is OFF by default because of the cost: **+58 Ir/op** on the small and batch
+ops (batch_lifo 60.17 → 118.33, very nearly double), +171 on realloc, and
+**+2.2% to +5.0% whole-program** on lua/perl/sqlite. That is roughly three
+times `secure`, which was itself declined at 1.7%. Memory is ~0.8%, taken as
+fewer blocks per page rather than extra allocation.
+
+Two limits worth stating plainly. The map lives at the END of the page payload
+rather than the front, so a forward overflow out of the last block can reach
+it; the front is the better place on security grounds but the payload start is
+not ours to move (`page_area` has eight consumers). And remote frees clear
+their bit at the next collect rather than immediately, so a recently
+remote-freed block reads as live for a window — the conservative direction, and
+what keeps the map owner-only and free of atomics.
+
+**Because it is off by default, R-005 still stands for anyone running the
+default or `secure` build.** The mitigation exists and is one flag away; it is
+not in force.
+
+**Why the bounds stay opt-in:** that is still enough to forfeit mimalloc parity — the
 headline result of the optimization campaign — on real programs, not merely on
 synthetic loops. perl 0.9991 → 1.0160, sqlite 1.0003 → 1.0061, calloc 0.949 →
 1.041, batch_lifo 1.008 → 1.259. Services facing untrusted input should enable
@@ -216,5 +247,6 @@ mitigates), R-002 bespoke ChaCha8 for hardening randomness (vetted against RFC
 8439 vectors as of 2026-08-19 — see H-34), R-003 OOM abort in heap creation,
 R-004 no coverage-guided fuzzing yet (targets landing; the soak is scheduled
 work), R-005 free-list encoding does not survive a read primitive, so an
-attacker holding read AND write can forge intra-page links (see the
-side-channel analysis above).
+attacker holding read AND write can forge intra-page links — mitigable with
+`blockmap` but NOT mitigated by default, since that costs ~3x `secure` (see
+the side-channel analysis above).
