@@ -4,6 +4,67 @@ One entry per milestone/brick: what landed, the numbers with their method lines,
 what was reverted and **which kind** of revert (measured-worse vs within-noise).
 Newest first.
 
+## HARDENING — ThreadSanitizer found a real data race on the free fast path (2026-08-19)
+
+The `use-protection-please` audit's H-24 (sanitizers) had never been run in
+this project's life. Running it produced the session's most valuable result.
+
+**The finding.** `cargo +nightly test -Zbuild-std -Zsanitizer=thread` on
+`stress_mt` reported a data race, twice, at the same site:
+
+| | where | what |
+|---|---|---|
+| **Read**, 1 byte | `alloc.rs` free fast path | `let flags = (*pg).flags` — routes the free |
+| **Previous write**, same byte | `heap.rs` `adopt_segment` | `(*slot).flags &= !IN_FULL` — a non-atomic read-modify-write |
+
+A thread ADOPTING an abandoned segment rewrites each page's flags while
+another thread can be inside `free()` reading that same byte to decide the
+free's shape. Both are plain, non-atomic accesses to the same location from
+two threads: a data race, which is undefined behaviour regardless of what
+today's codegen happens to do with it.
+
+**It was benign in outcome, which is exactly why it survived.** `IN_FULL` is
+part of `SLOW_FREE`, so a racing reader either takes the fast path or
+`free_general` — and for a non-local free both routes end in `remote_free`
+with the same block. Nothing was ever observed to break. But this is the same
+abandon → adopt path that produced the 0.4.0 use-after-free family, and this
+project has already been taught once (aarch64's first execution) what
+"harmless on x86-TSO" looks like immediately before it stops being harmless
+on weakly-ordered hardware.
+
+**Fix: `Page::flags` is an `AtomicU8`, all 15 access sites `Relaxed`.**
+Relaxed is correct and sufficient — the byte carries no happens-before
+obligation of its own; the segment's `thread_id` Acquire load already orders
+what the free path needs. **TSan now exits 0 with zero warnings.**
+
+**The cost, measured rather than asserted: exactly +1.00 Ir/op, everywhere.**
+A plain field read let LLVM fold the load into the test's memory operand
+(`test BYTE PTR [pg+0x4d],0xf`); it will not fold an *atomic* load, so the
+sequence becomes `movzx` + `test`.
+
+| op | before | after | vs mimalloc |
+|---|---:|---:|---:|
+| batch_lifo / fifo | 59.17 | **60.17** | 0.991 → **1.008** |
+| small | 78.38 | 79.38 | 0.713 |
+| mixed | 139.07 | 140.07 | 0.888 |
+| lua / perl / sqlite | — | — | **0.980 / 0.999 / 1.000** (unchanged) |
+
+So the two synthetic batch ops go from 0.9% ahead of mimalloc to 0.8% behind,
+and real programs do not move. **Kept.** It is the same trade already made for
+double-free detection (~0.4%, kept deliberately): an allocator whose premise
+is memory safety does not keep a data race on its hottest path to win 1.7% of
+a microbenchmark. Upstream mimalloc reads these flags non-atomically, does not
+pay the instruction, and has the race. The README now says 11-of-13 rather
+than 13-of-13 and explains why in place.
+
+**Also landed in the same sanitizer/dynamic pass:** ASan clean over the core
+suites (13 tests) and both fuzz targets (628k+ inputs, 0 findings);
+`cargo careful test` green (21 tests); and `tests/properties.rs` — 8 proptest
+properties over the documented invariants, including "live blocks never
+overlap" checked only after every block is live, so an overlap cannot be
+masked by a later write. Non-vacuous by construction: runtime scales with
+`PROPTEST_CASES` (0.02 s at 256 → 0.46 s at 8192).
+
 ## The batch gap CLOSED — every opscan op now at-or-ahead of mimalloc (2026-08-19)
 
 The 0.4.0 re-baseline (fresh oracle + fresh override build, sha256-matched to

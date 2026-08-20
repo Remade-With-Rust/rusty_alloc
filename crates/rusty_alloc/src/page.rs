@@ -18,7 +18,7 @@
 //! owning thread (`Segment::thread_id` gates entry in `alloc::free`).
 
 use core::ptr;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 /// `Page::flags` bits. The FREE fast path must answer one question — "is this
 /// a plain binned page I can just push onto?" — and it used to answer it with
@@ -186,7 +186,33 @@ pub struct Page {
     pub bin: u8,
     /// Fast-path flag byte (see [`pflags`]): any bit set ⇒ the free fast path
     /// must take the general route.
-    pub flags: u8,
+    ///
+    /// **Atomic because it is genuinely raced, and ThreadSanitizer proved it**
+    /// (2026-08-19, hardening gate H-24). A thread ADOPTING an abandoned
+    /// segment clears `IN_FULL` on each of its pages (`adopt_segment`) while
+    /// another thread can concurrently be in `free()` reading this byte to
+    /// route the free. Both readings lead to the same outcome for a remote
+    /// free — so the bug never manifested — but a non-atomic read racing a
+    /// non-atomic read-modify-write is undefined behaviour regardless of
+    /// whether today's codegen is kind about it, and this crate's own history
+    /// (the aarch64 first-execution defects) is what a "benign on x86-TSO"
+    /// race looks like right before it stops being benign.
+    ///
+    /// `Relaxed` is the correct and sufficient ordering: this byte carries no
+    /// happens-before obligation of its own — the segment's `thread_id`
+    /// Acquire load already orders everything the free path needs.
+    ///
+    /// **It costs exactly one instruction on the free fast path, measured.**
+    /// A plain field read let LLVM fold the load into the test's memory
+    /// operand (`test BYTE PTR [pg+0x4d], 0xf`); it will not fold an ATOMIC
+    /// load, so the sequence becomes `movzx` + `test`. Cost: batch_lifo
+    /// 59.17 → 60.17 Ir/op, and every other operation +1.00 exactly. That is
+    /// the same trade this crate already made for double-free detection
+    /// (~0.4%, kept deliberately): an allocator whose premise is memory
+    /// safety does not keep a data race on its hottest path to win 1.7% of a
+    /// synthetic microbenchmark. Upstream mimalloc reads these flags
+    /// non-atomically and does not pay the instruction — and has the race.
+    pub flags: AtomicU8,
     /// The un-extended tail AND current free list are known zero.
     pub free_is_zero: bool,
     /// This span's memory was PURGED (decommitted/reset) while free. It must
@@ -279,7 +305,7 @@ impl Page {
             slice_count: 1,
             slice_offset: 0,
             bin: 0,
-            flags: 0,
+            flags: AtomicU8::new(0),
             free_is_zero: false,
             purged: false,
             heap_tag: 0,

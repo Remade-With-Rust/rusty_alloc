@@ -2,8 +2,9 @@
 
 The safe Rust surface over [`rusty_alloc`](https://crates.io/crates/rusty_alloc),
 a pure-Rust remake of mimalloc that measures at-or-below mimalloc on
-instructions retired — on real programs and on every operation of the per-op
-scan — while detecting double frees that upstream silently accepts.
+instructions retired for real programs (lua 0.98x, perl 1.00x, sqlite 1.00x),
+while detecting double frees that upstream silently accepts and carrying no
+data race on its free path.
 
 **Status: `0.7.0` — a 0.x release.** See the
 [`rusty_alloc`](https://crates.io/crates/rusty_alloc) crate page for the
@@ -51,7 +52,7 @@ MIT. See `LICENSE` at the repository root.
 
 **Tier** standard · **Audited** 2026-08-19 (survey) · **v1.0.0 gates** 10/12 · [Full checklist](https://github.com/remade-with-rust/rusty_alloc/blob/main/crates/rusty_alloc_api/docs/plans/use-protection-please.md)
 
-`████████████████░░░░` **82%** &nbsp;·&nbsp; 18 Completed · 0 Scheduled · 4 Incomplete · 33 N/A
+`█████████████████░░░` **86%** &nbsp;·&nbsp; 19 Completed · 0 Scheduled · 3 Incomplete · 33 N/A
 
 | Phase | ✅ Completed | 🗓 Scheduled | ⬜ Incomplete | · N/A |
 |---|--:|--:|--:|--:|
@@ -61,14 +62,14 @@ MIT. See `LICENSE` at the repository root.
 | 3 — Code level | 4 | 0 | 0 | 3 |
 | 4 — Static analysis | 0 | 0 | 0 | 1 |
 | 5 — Dynamic analysis | 1 | 0 | 0 | 2 |
-| 6 — Fuzzing and properties | 0 | 0 | 1 | 3 |
+| 6 — Fuzzing and properties | 1 | 0 | 0 | 3 |
 | 7 — Formal verification | 0 | 0 | 0 | 1 |
 | 8 — Build and binary | 0 | 0 | 0 | 2 |
 | 9 — Runtime privilege | 0 | 0 | 0 | 1 |
 | 10 — Cryptography | 0 | 0 | 0 | 3 |
 | 11 — CI/CD, release, and operations | 3 | 0 | 2 | 0 |
 | 12 — Compliance controls | 0 | 0 | 0 | 14 |
-| **Total** | **18** | **0** | **4** | **33** |
+| **Total** | **19** | **0** | **3** | **33** |
 
 **Architect** — Tim — Mata Network
 <!-- HARDENING-TABLE:END -->

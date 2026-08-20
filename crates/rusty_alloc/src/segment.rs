@@ -18,7 +18,7 @@
 //! purge policy work of M7.
 
 use core::ptr;
-use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::os;
 use crate::page::Page;
@@ -473,7 +473,7 @@ pub unsafe fn span_free(seg: *mut Segment, page: *mut Page) -> bool {
         (*page).used = 0;
         (*page).capacity = 0;
         (*page).reserved = 0;
-        (*page).flags = 0;
+        (*page).flags.store(0, Ordering::Relaxed);
         (*page).free_is_zero = false;
 
         // Merge right: the slot at idx+len (if carved) is a span START.
@@ -653,7 +653,10 @@ pub fn huge_alloc(
         (*page).reserved = 1;
         (*page).slice_count = (SLICES_PER_SEGMENT - 1) as u16;
         (*page).slice_offset = 0;
-        (*page).flags = crate::page::pflags::HUGE_SEGMENT | crate::page::pflags::SINGLE_BLOCK;
+        (*page).flags.store(
+            crate::page::pflags::HUGE_SEGMENT | crate::page::pflags::SINGLE_BLOCK,
+            Ordering::Relaxed,
+        );
         (*page).free_is_zero = b.is_zero;
         let mut j = 2;
         while j < SLICES_PER_SEGMENT {

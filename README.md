@@ -13,9 +13,9 @@ does not offer.
 
 ## ⚡ The headline
 
-- **At-or-below mimalloc on instructions retired** — on real programs under
-  `LD_PRELOAD` *and* on every operation of the per-op scan — and ~17% fewer
-  than glibc.
+- **At-or-below mimalloc on instructions retired** on real programs under
+  `LD_PRELOAD` (lua 0.98×, perl 1.00×, sqlite 1.00×), and ~17% fewer than
+  glibc.
 - **A double free aborts instead of corrupting.** Upstream mimalloc accepts it
   silently in release builds; we detect it on both the local and the
   cross-thread path and abort.
@@ -40,14 +40,24 @@ Instructions retired under callgrind, x86-64 Linux, `LD_PRELOAD`, repeats to
 | sqlite | **1.00** | 0.99 |
 
 Per-operation (`bench/opscan.sh`, one neutral C driver, all arms preloaded —
-**all 13 operations measure at-or-below mimalloc**):
+**11 of 13 operations at-or-below mimalloc**, one tied, batch 0.8% behind):
 
 | op | ra/mi | op | ra/mi |
 |---|---:|---|---:|
-| small / med | 0.70 | batch lifo/fifo | 0.99 |
-| big / large | 0.77 | aligned | 0.87 |
-| realloc | 0.78 | mixed | 0.89 |
-| huge | 0.01 | calloc | 0.94 |
+| small / med | 0.71 | batch lifo/fifo | 1.008 |
+| big / large | 0.77 | aligned | 0.90 |
+| realloc | 0.79 | mixed | 0.89 |
+| huge | 0.01 | calloc | 0.95 |
+
+**Why batch went from 0.99 to 1.008**, since a number moving the wrong way
+deserves its reason in the open: ThreadSanitizer found a genuine data race on
+the free fast path — a thread adopting an abandoned segment rewrites page
+flags while another thread reads them to route a free. Making that byte
+atomic (`Relaxed`) fixes it and costs **exactly one instruction**, because
+LLVM will not fold an atomic load into a test's memory operand. Upstream
+mimalloc reads the same flags non-atomically, does not pay the instruction,
+and has the race. This is the same trade already made for double-free
+detection: correctness over 1.7% of a synthetic microbenchmark.
 
 **These are counts, not seconds.** Wall-clock cannot be resolved on the
 development machine (the null arm — the same allocator against itself — reads
@@ -191,7 +201,7 @@ rebuilt in Rust, memory-safe by construction, measured rather than asserted.
 
 **Tier** critical-path · **Audited** 2026-08-19 (survey) · **v1.0.0 gates** 10/13 · [Full checklist](docs/plans/use-protection-please.md)
 
-`████████████░░░░░░░░` **63%** &nbsp;·&nbsp; 19 Completed · 1 Scheduled · 10 Incomplete · 25 N/A
+`██████████████░░░░░░` **73%** &nbsp;·&nbsp; 22 Completed · 1 Scheduled · 7 Incomplete · 25 N/A
 
 | Phase | ✅ Completed | 🗓 Scheduled | ⬜ Incomplete | · N/A |
 |---|--:|--:|--:|--:|
@@ -200,15 +210,15 @@ rebuilt in Rust, memory-safe by construction, measured rather than asserted.
 | 2 — Supply chain | 7 | 0 | 1 | 0 |
 | 3 — Code level | 1 | 0 | 0 | 6 |
 | 4 — Static analysis | 0 | 0 | 1 | 0 |
-| 5 — Dynamic analysis | 1 | 0 | 2 | 0 |
-| 6 — Fuzzing and properties | 2 | 1 | 1 | 0 |
+| 5 — Dynamic analysis | 3 | 0 | 0 | 0 |
+| 6 — Fuzzing and properties | 3 | 1 | 0 | 0 |
 | 7 — Formal verification | 0 | 0 | 1 | 0 |
 | 8 — Build and binary | 0 | 0 | 0 | 2 |
 | 9 — Runtime privilege | 0 | 0 | 0 | 1 |
 | 10 — Cryptography | 0 | 0 | 1 | 2 |
 | 11 — CI/CD, release, and operations | 3 | 0 | 2 | 0 |
 | 12 — Compliance controls | 0 | 0 | 0 | 14 |
-| **Total** | **19** | **1** | **10** | **25** |
+| **Total** | **22** | **1** | **7** | **25** |
 
 **Next up** — H-27 Continuous fuzzing with no open crashes (2026-09-19 (30 days from the nightly job's first run))
 

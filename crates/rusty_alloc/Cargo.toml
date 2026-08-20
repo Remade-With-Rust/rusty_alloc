@@ -36,6 +36,10 @@ libc = { version = "0.2", default-features = false }
 
 [dev-dependencies]
 loom = "0.7"
+# H-28: the documented invariants get PROPERTIES, not just examples. Kept
+# dev-only and vet-exempted at safe-to-run — it can never reach a published
+# artifact.
+proptest = { version = "1", default-features = false, features = ["std"] }
 
 [lints]
 workspace = true

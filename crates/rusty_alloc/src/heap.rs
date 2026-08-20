@@ -297,7 +297,7 @@ impl Heap {
                 // a parked page is invisible to scans (loom-modeled).
                 let next = (*p).next;
                 queue_remove(q, p);
-                (*p).flags |= pflags::IN_FULL;
+                (*p).flags.fetch_or(pflags::IN_FULL, Ordering::Relaxed);
                 page_set_flag(p, XFLAG_DELAYED);
                 queue_push_front(&raw mut self.pages[BIN_FULL], p);
                 p = next;
@@ -340,7 +340,7 @@ impl Heap {
             (*p).free = ptr::null_mut();
             (*p).local_free = ptr::null_mut();
             (*p).bin = bin as u8;
-            (*p).flags = 0;
+            (*p).flags.store(0, Ordering::Relaxed);
             // Bump-fresh spans of an eager-committed zero mapping are zero;
             // RECLAIMED spans are recycled memory and are not.
             (*p).free_is_zero = fresh;
@@ -444,7 +444,7 @@ impl Heap {
             (*p).free = ptr::null_mut();
             (*p).local_free = ptr::null_mut();
             (*p).bin = BIN_HUGE as u8; // marker: unqueued single-block span
-            (*p).flags = pflags::SINGLE_BLOCK; // unqueued single-block span
+            (*p).flags.store(pflags::SINGLE_BLOCK, Ordering::Relaxed); // unqueued single-block span
             (*p).free_is_zero = fresh;
             // Unqueued → never scanned → remote frees must go via the
             // delayed list (same rule as parked-full pages).
@@ -485,7 +485,7 @@ impl Heap {
             let p = guard.sub(size.max(1));
             let seg = segment_of(block);
             let pg: *mut Page = &raw mut (*seg).pages[1];
-            (*pg).flags |= pflags::HAS_ALIGNED;
+            (*pg).flags.fetch_or(pflags::HAS_ALIGNED, Ordering::Relaxed);
             (p, true)
         }
     }
@@ -499,7 +499,8 @@ impl Heap {
                 unsafe {
                     let pg: *mut Page = &raw mut (*seg).pages[1];
                     (*pg).xheap.store(self.delayed as usize, Ordering::Release);
-                    (*pg).flags |= pflags::HUGE_SEGMENT | pflags::SINGLE_BLOCK;
+                    (*pg).flags
+                        .fetch_or(pflags::HUGE_SEGMENT | pflags::SINGLE_BLOCK, Ordering::Relaxed);
                     page_set_flag(pg, XFLAG_DELAYED);
                     (*seg).next = self.huge_segments;
                     self.huge_segments = seg;
@@ -609,7 +610,7 @@ impl Heap {
             unsafe {
                 let seg = segment_of(block);
                 let pg = segment::page_of(seg, block);
-                (*pg).flags |= pflags::HAS_ALIGNED;
+                (*pg).flags.fetch_or(pflags::HAS_ALIGNED, Ordering::Relaxed);
             }
         }
         // A fresh-zero block is zero at every interior position too.
@@ -784,7 +785,7 @@ impl Heap {
                         .xheap
                         .store(self.delayed as usize, Ordering::Release);
                     if ((*slot).bin as usize) <= MAX_NORMAL_BIN {
-                        (*slot).flags &= !pflags::IN_FULL;
+                        (*slot).flags.fetch_and(!pflags::IN_FULL, Ordering::Relaxed);
                         (*slot).next = ptr::null_mut();
                         (*slot).prev = ptr::null_mut();
                         page_set_flag(slot, XFLAG_NORMAL);
@@ -970,10 +971,10 @@ impl Heap {
                     if (used_now as i32) < 0 {
                         crate::page::double_free_abort();
                     }
-                    if (*pg).flags & pflags::IN_FULL != 0 {
+                    if (*pg).flags.load(Ordering::Relaxed) & pflags::IN_FULL != 0 {
                         // Un-park: it has space again; back to NORMAL remote
                         // pushes (page is scannable once more).
-                        (*pg).flags &= !pflags::IN_FULL;
+                        (*pg).flags.fetch_and(!pflags::IN_FULL, Ordering::Relaxed);
                         queue_remove(&raw mut self.pages[BIN_FULL], pg);
                         page_set_flag(pg, XFLAG_NORMAL);
                         let bin = (*pg).bin as usize;

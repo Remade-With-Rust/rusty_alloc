@@ -100,7 +100,7 @@ violated precondition; the core's double-free abort and Miri are the nets.
 |---|---|---|---|---|
 | H-26 | ★ Fuzz target per public parser, decoder, or message handler | N/A | tier `crit` only — no parser/decoder/message surface; fuzzing lands in the core | |
 | H-27 | ★ Continuous fuzzing with no open crashes | N/A | tier `crit` only | |
-| H-28 | Property tests cover the documented invariants | Incomplete | No property tests in the crate | |
+| H-28 | Property tests cover the documented invariants | Completed | `tests/properties.rs` (proptest, dev-only): 8 properties over generated sizes/alignments spanning every routing decision (small bins → medium → the 64 KiB cutoff → large spans → huge segments). Each is a claim the crate makes in prose — `usable_size` ≥ request and stable; `zalloc` zero across the FULL usable extent (dirtying a same-class block first so recycled memory is the likely case); aligned blocks actually aligned; `realloc` preserves `min(old,new)` across a move; **live blocks never overlap** (per-block tags verified only after ALL are live, so an overlap cannot be masked by a later write); `good_size` idempotent and never shrinking; `usable_size` agrees with `good_size`; `free(null)`/`malloc(0)` edges. Non-vacuous: runtime scales with `PROPTEST_CASES` (0.02s at 256 → 0.46s at 8192). Runs under MIRI TOO (8/8 passed, 20.8s interpreted, 4 cases each): proptest's file failure-persistence needs `getcwd`, which Miri isolation denies, so it is disabled in the config — the properties are now UB-checked rather than skipped. | |
 | H-29 | Mutation and/or differential testing on critical modules | N/A | tier `crit` only | |
 
 ### Phase 7 — Formal verification

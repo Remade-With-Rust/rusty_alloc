@@ -7,6 +7,7 @@
 //! while the block is live).
 
 use core::ptr;
+use core::sync::atomic::Ordering;
 
 use crate::heap::Heap;
 use crate::init;
@@ -22,7 +23,7 @@ use crate::types::{BIN_HUGE, SMALL_SIZE_MAX};
 unsafe fn unalign(pg: *mut Page, p: *mut u8) -> *mut u8 {
     // SAFETY: page fields are stable while any of its blocks are live.
     unsafe {
-        if (*pg).flags & (pflags::HAS_ALIGNED | pflags::SINGLE_BLOCK) == 0 {
+        if (*pg).flags.load(Ordering::Relaxed) & (pflags::HAS_ALIGNED | pflags::SINGLE_BLOCK) == 0 {
             return p;
         }
         let seg = segment_of(p);
@@ -496,7 +497,7 @@ pub unsafe fn free_inline(p: *mut u8) {
         // page_of works for both kinds: a huge segment's interior slices all
         // offset back to slot 1.
         let pg = page_of(seg, p);
-        let flags = (*pg).flags;
+        let flags = (*pg).flags.load(Ordering::Relaxed);
         // ONE test decides the whole shape of the free (upstream's
         // `page->flags.full_aligned == 0`). A clear byte means: binned page in
         // a Normal segment, queued, exact pointer — so the general path's
@@ -615,7 +616,7 @@ unsafe fn free_general(p: *mut u8) {
         // flags we read cannot predate an adoption.
         let owner_tid = (*seg).thread_id.load(core::sync::atomic::Ordering::Acquire);
         let pg = page_of(seg, p);
-        let flags = (*pg).flags;
+        let flags = (*pg).flags.load(Ordering::Relaxed);
         // Interior-pointer recovery is needed only for aligned-at blocks in a
         // NORMAL segment; a huge segment's block is the exact pointer we
         // returned, and a plain binned page never adjusts.

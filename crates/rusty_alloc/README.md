@@ -38,7 +38,10 @@ Measured deterministically via callgrind instructions retired, x86-64 Linux,
 
 The per-operation scan (small/med/big/large/huge, calloc, realloc, aligned,
 usable, batch and mixed working-set ops) measures **at-or-below mimalloc on
-all 13 operations**. Wall-clock time is deliberately not claimed: the
+11 of 13 operations**, ties one, and is 0.8% behind on batch — the cost of
+making the free path's flags byte atomic after ThreadSanitizer found a real
+data race there (one instruction; upstream mimalloc has the race and does not
+pay it). Wall-clock time is deliberately not claimed: the
 measurement box cannot resolve it above its own noise floor, and instructions
 are not seconds.
 
@@ -83,7 +86,7 @@ MIT. See `LICENSE` at the repository root.
 
 **Tier** critical-path · **Audited** 2026-08-19 (survey) · **v1.0.0 gates** 12/15 · [Full checklist](https://github.com/remade-with-rust/rusty_alloc/blob/main/crates/rusty_alloc/docs/plans/use-protection-please.md)
 
-`█████████████░░░░░░░` **66%** &nbsp;·&nbsp; 23 Completed · 1 Scheduled · 11 Incomplete · 20 N/A
+`██████████████░░░░░░` **74%** &nbsp;·&nbsp; 26 Completed · 1 Scheduled · 8 Incomplete · 20 N/A
 
 | Phase | ✅ Completed | 🗓 Scheduled | ⬜ Incomplete | · N/A |
 |---|--:|--:|--:|--:|
@@ -92,15 +95,15 @@ MIT. See `LICENSE` at the repository root.
 | 2 — Supply chain | 7 | 0 | 1 | 0 |
 | 3 — Code level | 5 | 0 | 1 | 1 |
 | 4 — Static analysis | 0 | 0 | 1 | 0 |
-| 5 — Dynamic analysis | 1 | 0 | 2 | 0 |
-| 6 — Fuzzing and properties | 2 | 1 | 1 | 0 |
+| 5 — Dynamic analysis | 3 | 0 | 0 | 0 |
+| 6 — Fuzzing and properties | 3 | 1 | 0 | 0 |
 | 7 — Formal verification | 0 | 0 | 1 | 0 |
 | 8 — Build and binary | 0 | 0 | 0 | 2 |
 | 9 — Runtime privilege | 0 | 0 | 0 | 1 |
 | 10 — Cryptography | 0 | 0 | 1 | 2 |
 | 11 — CI/CD, release, and operations | 3 | 0 | 2 | 0 |
 | 12 — Compliance controls | 0 | 0 | 0 | 14 |
-| **Total** | **23** | **1** | **11** | **20** |
+| **Total** | **26** | **1** | **8** | **20** |
 
 **Next up** — H-27 Continuous fuzzing with no open crashes (2026-09-19 (30 days from the nightly job's first run))
 
