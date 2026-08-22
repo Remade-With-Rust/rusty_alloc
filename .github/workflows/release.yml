@@ -15,6 +15,14 @@ on:
 
 permissions:
   contents: write # required to upload release assets
+  # `actions/attest-build-provenance` mints an OIDC token to sign the
+  # provenance statement, and needs both of these. Without `id-token: write`
+  # the step dies with "Unable to get ACTIONS_ID_TOKEN_REQUEST_URL" — which is
+  # exactly how the v1.0.1 run failed, the first time this workflow ever ran.
+  # The SBOMs upload fine before it, so the symptom is a red release with its
+  # artifacts already attached and no attestation.
+  id-token: write
+  attestations: write
 
 jobs:
   sbom:
