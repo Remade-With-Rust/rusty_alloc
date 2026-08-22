@@ -22,8 +22,21 @@ members = [
 # completes 2026-09-19). Every op of the per-op scan is at-or-below mimalloc
 # except batch (a measured safe-Rust codegen floor, +0.8%); all three
 # real-program arms and the full mimalloc-bench corpus run clean.
-version = "1.0.0"
+# 1.0.1 — patch. No API change. `free`'s fast path went 27 instructions to 21
+# (mimalloc's is 25): the `used--` codegen floor `docs/opps.md` #6 recorded as
+# unreachable from safe Rust is closed, the thread-id read is folded into its
+# compare, and resolving a pointer to its page dropped from nine instructions
+# to five on a per-slice owner table in the segment header. Allocator-only
+# ratios against mimalloc on real programs moved lua 0.75->0.66, perl
+# 0.95->0.83, sqlite 0.98->0.85; every op of the per-op scan is now BELOW
+# mimalloc, batch included.
+version = "1.0.1"
 edition = "2024"
+# MSRV. Declared for the first time in 1.0.1 because this release genuinely
+# needs it: `asm!` label blocks (`asm_goto`, stable 1.87) carry the free path's
+# memory-destination decrement, and a let-chain needs 1.88. Without this an
+# older toolchain fails with a syntax error instead of a version message.
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/remade-with-rust/rusty_alloc"
 # Portfolio convention (matches rusty_h264): homepage is Mata Network, the
