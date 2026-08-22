@@ -202,6 +202,14 @@ struct AtomicUsize2 {
 }
 
 impl AtomicUsize2 {
+    /// The FUNCTION pointer alone. `load` reads both halves; a caller that
+    /// only needs to know whether a hook is registered at all should not pay
+    /// for the argument it is not going to use.
+    #[inline]
+    fn load_fun(&self) -> *mut c_void {
+        self.f.load(Ordering::Acquire)
+    }
+
     const fn new() -> Self {
         AtomicUsize2 {
             f: AtomicPtr::new(core::ptr::null_mut()),
@@ -271,6 +279,26 @@ pub fn error(err: i32) {
 
 /// Fire the deferred-free hook (called from the allocation heartbeat).
 pub fn deferred_free(force: bool) {
+    // Peek at the FUNCTION pointer alone first. `mi_register_deferred_free` is
+    // unregistered in nearly every process, and this runs on every slow-path
+    // allocation — loading the argument pointer too, only to discard it when
+    // there is no hook, is an atomic load spent on nothing.
+    if DEFERRED_FUN.load_fun().is_null() {
+        return;
+    }
+    fire_deferred(force);
+}
+
+/// Actually call the registered hook.
+///
+/// Out of line because it is an INDIRECT call, and `deferred_free` inlines
+/// into `Heap::malloc_generic`: an indirect call with values live across it
+/// forces the whole heartbeat's caller to preserve callee-saved registers, on
+/// every slow-path allocation, for a hook that is unregistered in nearly every
+/// process. The peek above is all the common path executes.
+#[cold]
+#[inline(never)]
+fn fire_deferred(force: bool) {
     let (f, a) = DEFERRED_FUN.load();
     if !f.is_null() {
         let hb = HEARTBEAT.fetch_add(1, Ordering::Relaxed);

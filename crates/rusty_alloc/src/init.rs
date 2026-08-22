@@ -20,7 +20,9 @@ use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 use crate::heap::Heap;
-use crate::page::{DelayedList, XFLAG_NEVER, page_collect, page_set_flag};
+use crate::page::{
+    DelayedList, XFLAG_NEVER, page_collect, page_collect_and_set_flag, page_set_flag,
+};
 use crate::segment::{self, Segment};
 use crate::{os, prim};
 
@@ -681,15 +683,28 @@ pub unsafe fn thread_done(hb: *mut HeapBox) {
             let next = (*seg).next;
             let end = (*seg).next_free_slice as usize;
             let mut idx = segment::HEADER_SLICES;
+            // Running pointer, not `pages[idx]`: `Page` is not a power-of-two
+            // size, so indexing costs a multiply plus a bounds check on every
+            // carved slice of every segment a dying thread owns.
+            let base: *mut crate::page::Page = (&raw mut (*seg).pages).cast();
+            let mut slot: *mut crate::page::Page = base.add(idx);
             while idx < end {
-                let slot = &raw mut (*seg).pages[idx];
                 let len = ((*slot).slice_count as usize).max(1);
                 if (*slot).block_size > 0 {
-                    page_collect(slot);
-                    page_set_flag(slot, XFLAG_NEVER);
+                    // ONE locked read-modify-write, not two: taking the
+                    // cross-thread chain and publishing NEVER are the same
+                    // word, and doing them separately paid two CAS loops per
+                    // live page of every segment a dying thread owns.
+                    page_collect_and_set_flag(slot, XFLAG_NEVER);
                     (*slot).xheap.store(0, Ordering::Release);
                 }
                 idx += len;
+                // `wrapping_add`, not `add`: the pointer is only ever
+                // DEREFERENCED while `idx < end` holds, which the span-partition
+                // invariant makes in-bounds — but the final advance of the loop
+                // computes a pointer that may be one past the carved region, and
+                // forming that with `add` would be UB even unread.
+                slot = slot.wrapping_add(len);
             }
             if (*seg).used_pages == 0 {
                 let _ = segment::segment_free(seg);
@@ -813,14 +828,21 @@ pub unsafe fn heap_destroy(hb: *mut HeapBox) {
         while !seg.is_null() {
             let end = (*seg).next_free_slice as usize;
             let mut idx = segment::HEADER_SLICES;
+            // Same running-pointer walk as `thread_done`'s — the sibling site,
+            // checked because a defect in one slice walk is a defect in every
+            // slice walk. Not exercised by `mleak` (this is `heap_destroy`, not
+            // thread teardown), so it carries no measurement of its own; it is
+            // the identical transformation on identical code.
+            let base: *mut crate::page::Page = (&raw mut (*seg).pages).cast();
+            let mut slot: *mut crate::page::Page = base.add(idx);
             while idx < end {
-                let slot = &raw mut (*seg).pages[idx];
                 let len = ((*slot).slice_count as usize).max(1);
                 if (*slot).block_size > 0 {
                     page_set_flag(slot, XFLAG_NEVER);
                     (*slot).xheap.store(0, Ordering::Release);
                 }
                 idx += len;
+                slot = slot.wrapping_add(len);
             }
             let next = (*seg).next;
             let _ = segment::segment_free(seg);

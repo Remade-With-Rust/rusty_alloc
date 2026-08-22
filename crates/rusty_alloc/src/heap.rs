@@ -10,18 +10,32 @@ use core::sync::atomic::Ordering;
 use crate::bins::{self, BIN_COUNT, PAGES_DIRECT};
 use crate::page::{
     Block, DelayedList, Page, XFLAG_DELAYED, XFLAG_NORMAL, block_next, page_all_free, page_collect,
-    page_extend, page_pop, page_push_local, page_set_flag, pflags,
+    page_collect_and_set_flag, page_extend, page_pop, page_push_local, page_set_flag, pflags,
 };
 use crate::segment::{
     self, Segment, SegmentKind, huge_free, page_area, segment_of, span_alloc, span_free,
 };
 use crate::types::{
     BIN_FULL, BIN_HUGE, LARGE_OBJ_SIZE_MAX, MEDIUM_OBJ_SIZE_MAX, MEDIUM_PAGE_SLICES,
-    SEGMENT_SLICE_SIZE, SMALL_OBJ_SIZE_MAX, SMALL_SIZE_MAX, wsize_from_size,
+    SEGMENT_SLICE_SIZE, SMALL_OBJ_SIZE_MAX, SMALL_SIZE_MAX, SMALL_WSIZE_MAX, wsize_from_size,
 };
 
 /// Largest bin index actually reachable from a size (rest are M3 large pages).
 pub const MAX_NORMAL_BIN: usize = bins_max();
+
+/// Largest bin whose block size still fits the `direct[]` fast-path table.
+///
+/// `update_direct` returns immediately for anything above this, so the
+/// wholesale rebuild in `adopt_segment` was calling it MAX_NORMAL_BIN times to
+/// do nothing for the upper half of the range. Const-evaluated from the same
+/// `bin_size` the check itself uses, so the two cannot drift apart.
+pub const MAX_DIRECT_BIN: usize = {
+    let mut b = 1;
+    while b < MAX_NORMAL_BIN && bins::bin_size(b + 1) <= SMALL_SIZE_MAX {
+        b += 1;
+    }
+    b
+};
 
 const fn bins_max() -> usize {
     // const-eval of bins::bin(MEDIUM_OBJ_SIZE_MAX)
@@ -103,6 +117,24 @@ impl Stats {
     }
 }
 
+/// Immortal, permanently-empty delayed-free list.
+///
+/// `Heap::default()` used to leave `delayed` NULL, so the allocation heartbeat
+/// had to test for null on every slow-path allocation before it could even
+/// peek at the list — three instructions, 2.56 M times on `cfrac`, to rule out
+/// a case that cannot arise. The ONLY heap left holding the default value is
+/// the immortal EMPTY heap, and it owns no pages, so nothing can ever push
+/// here; every real heap has `delayed` repointed at its own HeapBox during
+/// init before it is reachable.
+///
+/// This is the same immortal-sentinel arrangement `direct[]` already uses with
+/// `empty_page_ptr()`, for the same reason: a fast path that can read through
+/// a sentinel unconditionally beats one that must first prove it is safe to
+/// read. Note the sentinel is deliberately NOT a HeapBox — `xheap` doubles as
+/// the HeapBox address (see `box_of_xheap`), and the empty heap never stores
+/// `delayed` into a page because it never owns one.
+static EMPTY_DELAYED: DelayedList = DelayedList::new();
+
 impl Default for Heap {
     fn default() -> Self {
         Self::new()
@@ -147,25 +179,44 @@ pub struct Heap {
     pub stats: Stats,
 }
 
+/// The page-queue table every heap starts from, with each bin's block size
+/// already filled in.
+///
+/// This is a `const` ITEM, not a loop inside `Heap::new`. `Heap::new` is a
+/// `const fn`, but it is CALLED at runtime by `create_heap`, and a `const fn`
+/// called at runtime just runs — so every thread that started re-derived all
+/// MAX_NORMAL_BIN block sizes through `bins::bin_size`'s shift-and-mask
+/// arithmetic. A `const` item is guaranteed to be evaluated at compile time,
+/// so the table becomes a static blob the thread copies.
+const EMPTY_QUEUES: [PageQueue; BIN_COUNT] = {
+    let mut pages = [PageQueue {
+        first: ptr::null_mut(),
+        last: ptr::null_mut(),
+        block_size: 0,
+    }; BIN_COUNT];
+    let mut i = 1;
+    while i <= MAX_NORMAL_BIN {
+        pages[i].block_size = bins::bin_size(i);
+        i += 1;
+    }
+    pages
+};
+
 impl Heap {
     /// Const-init empty heap (static bootstrap: usable before any OS call).
     pub const fn new() -> Heap {
-        let mut pages = [PageQueue {
-            first: ptr::null_mut(),
-            last: ptr::null_mut(),
-            block_size: 0,
-        }; BIN_COUNT];
-        let mut i = 1;
-        while i <= MAX_NORMAL_BIN {
-            pages[i].block_size = bins::bin_size(i);
-            i += 1;
-        }
         Heap {
-            pages,
+            pages: EMPTY_QUEUES,
+            // NOT hoisted to a `const` blob like EMPTY_QUEUES above. REFUTED
+            // 2026-08-21: doing so cuts 126k Ir out of this crate's symbols and
+            // adds 129k to libc's `memcpy` — the whole-program count gets
+            // WORSE. A repeated-element fill LLVM already turns into a tight
+            // store loop is not worth trading for a rodata copy; EMPTY_QUEUES
+            // wins because its elements are COMPUTED, not repeated.
             direct: [crate::page::empty_page_ptr(); PAGES_DIRECT],
             segments: ptr::null_mut(),
             empty_segments: 0,
-            delayed: ptr::null(),
+            delayed: &raw const EMPTY_DELAYED,
             huge_segments: ptr::null_mut(),
             arena_id: -1,
             tag: 0,
@@ -236,6 +287,51 @@ impl Heap {
                 // SAFETY: p live per above.
                 return (b, unsafe { (*p).free_is_zero });
             }
+        } else if size <= MEDIUM_OBJ_SIZE_MAX {
+            return self.malloc_in_bin(size, bins::bin(size));
+        }
+        self.malloc_generic(size)
+    }
+
+    /// [`Heap::malloc`] for a MEDIUM size whose bin the caller already knows.
+    ///
+    /// # Safety note
+    /// `bin` must be `bins::bin(size)` and `size` in the medium range; the
+    /// peek reads the bin's queue front and falls through to the generic path
+    /// on any miss, so a wrong bin would mis-size a block rather than fault —
+    /// hence the debug assertion.
+    fn malloc_in_bin(&mut self, size: usize, bin: usize) -> (*mut u8, bool) {
+        debug_assert_eq!(bin, bins::bin(size), "malloc_in_bin: bin/size disagree");
+        // MEDIUM sizes get a fast path too.
+        //
+        // `direct[]` is indexed by word size and stops at SMALL_WSIZE_MAX, so
+        // everything from 1 KiB to 64 KiB used to fall straight through to
+        // `malloc_generic` — the heartbeat, the queue walk, the full-page
+        // parking, `update_direct` — on EVERY allocation, even when the bin's
+        // front page had a block ready. `rptest` allocates 8..4000 bytes and
+        // paid that on 29% of its allocations; upstream has the same hole.
+        //
+        // The bin's queue front is one indirection further than a `direct[]`
+        // entry and answers the same question. A null queue or a dry page
+        // fails the single "did we get a block?" test and falls through
+        // exactly as before.
+        //
+        // NOTE the shape this is NOT: peeking here from `alloc::malloc_slow`,
+        // on the plain-malloc path, is a large REGRESSION (`big`/`large`
+        // +25.00 Ir/op) — a tight alloc/free loop frees onto `local_free`, so
+        // the queue front's `free` list is always dry and the peek can never
+        // hit. It pays only where a populated free list is actually left
+        // behind, which is why it lives here and not there.
+        let p = self.pages[bin].first;
+        if !p.is_null() {
+            // SAFETY: queue members are live pages of this heap and we hold
+            // the heap lock.
+            let b = unsafe { page_pop(p) };
+            if !b.is_null() {
+                self.stat_alloc();
+                // SAFETY: p live per above.
+                return (b, unsafe { (*p).free_is_zero });
+            }
         }
         self.malloc_generic(size)
     }
@@ -293,16 +389,23 @@ impl Heap {
     /// The slow path — mimalloc's heartbeat: runs when a fast list is dry, so
     /// deferred work (collect, extend, fresh pages; later: purge, deferred
     /// frees) happens at a regular allocation cadence.
+    // NOTE (2026-08-21): threading the bin through — `malloc_in_bin` derives
+    // `bins::bin(size)` to pick the queue it peeks, and on a miss this
+    // function derived the very same bin again — was measured and reverted.
+    // It is worth −36,918 Ir on `rptest` (−0.35%) and costs `small` +0.02 and
+    // `batch_lifo` +0.06 Ir/op, because the "bin not yet known" marker is a
+    // compare every generic call pays, including the small ones that never had
+    // a bin to pass. The const-generic form that would fold the check away
+    // duplicates this whole function; not worth it for 0.35% of one benchmark.
     pub(crate) fn malloc_generic(&mut self, size: usize) -> (*mut u8, bool) {
         self.stats.generic += 1;
         // Guarded objects (secure/guarded builds): sampled allocations get a
         // dedicated segment whose trailing page is PROT_NONE, so an overflow
         // faults immediately instead of corrupting a neighbour.
-        if self.guarded_rate != 0 && self.guarded_should_sample(size) {
-            let (p, z) = self.guarded_alloc(size);
-            if !p.is_null() {
-                return (p, z);
-            }
+        if self.guarded_rate != 0
+            && let Some(r) = self.try_guarded(size)
+        {
+            return r;
         }
         // Heartbeat: process cross-thread delayed frees at slow-path cadence
         // (this is what un-parks full pages whose blocks died remotely), and
@@ -318,6 +421,110 @@ impl Heap {
             };
         }
         let bin = bins::bin(size);
+        let w = wsize_from_size(size);
+        // SAFETY: `bin` indexes `self.pages`; the queue's first page, if any,
+        // is a live page of this heap.
+        unsafe {
+            let q: *mut PageQueue = &raw mut self.pages[bin];
+            let p = (*q).first;
+            if !p.is_null() {
+                page_collect(p);
+                if !(*p).free.is_null() {
+                    // Already the queue head, so the reorder the walk performs
+                    // is a no-op here and is left out of this frame.
+                    //
+                    // `update_direct` re-derives the bin's block size, its top
+                    // word index and the front page before discovering that
+                    // nothing moved — ten instructions to confirm a no-op, on
+                    // the path 99.5% of generic allocations take. `direct[]`
+                    // is only ever written as a whole bin-range, so ANY one
+                    // slot of this bin answers for all of them, and the
+                    // request's own word size is such a slot: `bins::bin`
+                    // above already computed it, so reusing it is free.
+                    if w > SMALL_WSIZE_MAX || self.direct[w] != p {
+                        self.update_direct(bin);
+                    }
+                    let b = page_pop(p);
+                    self.stat_alloc();
+                    return (b, (*p).free_is_zero);
+                }
+                if (*p).capacity < (*p).reserved {
+                    return self.grow_front(bin, w, p);
+                }
+            }
+        }
+        // SAFETY: as above.
+        unsafe { self.malloc_generic_walk(bin) }
+    }
+
+    /// The queue front has no block but has not been fully carved yet:
+    /// extend it and serve from the new run.
+    ///
+    /// Out of line for a reason invisible in the source. Everything on the
+    /// fast path above returns or tail-calls, so nothing of ours is live
+    /// across a call — except here: `page_extend` had `self`, `bin` and `p`
+    /// live across it, and that ALONE forced `malloc_generic` to preserve two
+    /// callee-saved registers, on every generic allocation, for an arm that
+    /// most of them never reach.
+    ///
+    /// This is a MEASURED TRADE, taken deliberately, not a free win:
+    ///
+    /// ```text
+    ///     cfrac allocator   4,030,751,631 -> 4,010,286,980   -20,464,651
+    ///     opscan big/large      -6.00/op  ->     -14.00/op        -8.00
+    ///     opscan mixed          -4.03/op  ->      -9.81/op        -5.78
+    ///     perl                776,511,765 ->   776,690,628      +178,863
+    /// ```
+    ///
+    /// perl pays one call per extend and it carves constantly, so the arm
+    /// marked `#[cold]` here is genuinely warm in that one workload — the same
+    /// shape as the fresh-page split refuted on alloc-test at +145,129 perl.
+    /// It is accepted anyway because the ratio is 114:1 in instructions and
+    /// the gain is corpus-wide (every `opscan` op improves, several by more
+    /// than double), where the loss is 0.023% of a single program. If perl-like
+    /// carve-heavy workloads ever become the priority, THIS is the line to
+    /// flip, and the numbers above are what it costs to flip it.
+    ///
+    /// # Safety
+    /// `bin` indexes `self.pages`; `w` is the request's word size; `p` is the
+    /// live front page of that queue, with `free` empty and
+    /// `capacity < reserved`.
+    #[cold]
+    #[inline(never)]
+    unsafe fn grow_front(&mut self, bin: usize, w: usize, p: *mut Page) -> (*mut u8, bool) {
+        // SAFETY: forwarded contract.
+        unsafe {
+            page_extend(p, (*p).area);
+            self.stats.extends += 1;
+            if (*p).free.is_null() {
+                return self.malloc_generic_walk(bin);
+            }
+            if w > SMALL_WSIZE_MAX || self.direct[w] != p {
+                self.update_direct(bin);
+            }
+            let b = page_pop(p);
+            self.stat_alloc();
+            (b, (*p).free_is_zero)
+        }
+    }
+
+    /// The rest of [`Heap::malloc_generic`]: park the pages that cannot serve,
+    /// walk the queue, and carve a fresh page if none can.
+    ///
+    /// Split off so the overwhelmingly common outcome — the queue's FRONT page
+    /// has a block, or can grow one — does not pay a frame sized for the walk,
+    /// the fresh-page carve and the OOM arm. That frame cost eight
+    /// instructions of push and nine of pop on EVERY generic allocation, 20%
+    /// of the function, for machinery most calls never reach.
+    ///
+    /// The first queue page is re-collected here rather than threaded in: the
+    /// collect is idempotent, and re-doing it keeps the two frames
+    /// independent of each other's register needs, which is the whole point.
+    ///
+    /// # Safety
+    /// `bin` indexes `self.pages`.
+    #[inline(never)]
+    unsafe fn malloc_generic_walk(&mut self, bin: usize) -> (*mut u8, bool) {
         // SAFETY: all page/queue manipulation below happens under the heap
         // lock on pages owned by this heap; raw pointers are used so no two
         // Rust references to the same Page coexist.
@@ -325,7 +532,9 @@ impl Heap {
             let q: *mut PageQueue = &raw mut self.pages[bin];
             let mut p = (*q).first;
             while !p.is_null() {
-                page_collect(p);
+                if (*p).free.is_null() {
+                    page_collect(p);
+                }
                 if (*p).free.is_null() && (*p).capacity < (*p).reserved {
                     // `(*p).area` is the cached payload start (see `Page::area`);
                     // it replaces `segment_of + page_index + page_area` — a mask,
@@ -334,6 +543,18 @@ impl Heap {
                     self.stats.extends += 1;
                 }
                 if !(*p).free.is_null() {
+                    // REFUTED (larson-sized, 2026-08-21): this branch is DEAD.
+                    // Every iteration below ends by removing `p` from this
+                    // queue before advancing, so the page the loop is looking
+                    // at is always the front already, and a `debug_assert_eq!`
+                    // in its place ran the whole `debug_checks` suite without
+                    // firing. Deleting it nonetheless measured WORSE —
+                    // 52.920 -> 52.945 Ir/op on an instrument exact to the
+                    // unit — because the compare is free in practice and its
+                    // removal perturbs register allocation around the return.
+                    // Kept, both for the invariant it documents and because it
+                    // is the cheaper of the two forms. Do not "clean this up"
+                    // without re-measuring.
                     if p != (*q).first {
                         queue_remove(q, p);
                         queue_push_front(q, p);
@@ -343,10 +564,22 @@ impl Heap {
                     self.stat_alloc();
                     return (b, (*p).free_is_zero);
                 }
-                // Truly full: park it so the queue front stays useful. The
-                // DELAYED flag makes remote frees nudge our delayed list —
-                // a parked page is invisible to scans (loom-modeled).
+                // Truly full: park it so the queue front stays useful.
                 let next = (*p).next;
+                // Park it — deliberately INLINE. Outlining this as a
+                // `#[cold]` helper was a −2,415,021 win on `cfrac` when
+                // `malloc_generic` was one large function; once the walk was
+                // split out (`malloc_generic_walk`), the same change turned
+                // into a LOSS on every workload measured — cfrac +117,465,
+                // perl +23,521, sh6bench +1,553,862 — because this code now
+                // sits inside a function that is ALREADY out of line and
+                // entered on 0.53% of generic calls. Outlining it again only
+                // nests a second call inside the rare path.
+                //
+                // A win can expire the same way a refutation can. Re-measure
+                // an outlining decision whenever the function around it is
+                // restructured; the frequency that justified it is a property
+                // of the enclosing frame, not of this code.
                 queue_remove(q, p);
                 (*p).flags.fetch_or(pflags::IN_FULL, Ordering::Relaxed);
                 page_set_flag(p, XFLAG_DELAYED);
@@ -369,6 +602,36 @@ impl Heap {
         }
     }
 
+    // NOTE (2026-08-21): outlining the large/huge tail as a `#[cold]`
+    // `malloc_generic_big`, to keep its register needs out of the binned
+    // refill path's prologue, measured FLAT (+28 Ir on alloc-test's 2.2G).
+    // Its sibling — outlining the fresh-page tail — was worse than flat; see
+    // below.
+
+    // NOTE (2026-08-21): the no-usable-page tail was ALSO outlined here, as
+    // `malloc_generic_fresh`, on the same "shrink the frame" reasoning as
+    // `malloc_generic_big` above. It gained alloc-test 0.58M Ir and cost PERL
+    // **+145,129** — perl carves fresh pages constantly, where alloc-test
+    // carves a few hundred against 100M operations, so the call and argument
+    // setup are paid on a path that is only cold in one of the two. Reverted:
+    // a split is only worth it where the outlined arm is genuinely rare.
+
+    /// The guarded-object sampling arm of [`Heap::malloc_generic`].
+    ///
+    /// `guarded_rate` is 0 unless the `guarded_max` option is set, so in the
+    /// shipped default this never runs at all — but its call to
+    /// `guarded_alloc`, which carves a dedicated segment with a PROT_NONE
+    /// trailing page, put its register needs in `malloc_generic`'s prologue
+    /// and epilogue regardless.
+    #[cold]
+    #[inline(never)]
+    fn try_guarded(&mut self, size: usize) -> Option<(*mut u8, bool)> {
+        if !self.guarded_should_sample(size) {
+            return None;
+        }
+        let (p, z) = self.guarded_alloc(size);
+        if p.is_null() { None } else { Some((p, z)) }
+    }
     /// Carve a fresh page for `bin` from the segment list (new segment if all
     /// are exhausted) and push it to the queue front.
     fn fresh_page(&mut self, bin: usize, bsize: usize) -> *mut Page {
@@ -648,20 +911,39 @@ impl Heap {
         align: usize,
         offset: usize,
     ) -> (*mut u8, bool) {
-        if !align.is_power_of_two() || align > crate::types::SEGMENT_SIZE / 2 {
-            return (ptr::null_mut(), false);
-        }
-        if align <= 8 && offset == 0 {
-            return self.malloc(size);
-        }
-        // Upstream's aligned fast path (`mi_heap_malloc_zero_aligned_at_fast`):
-        // don't PROVE alignment from the bin geometry — peek the bin's next
-        // free block and test its ACTUAL address with one AND. The opscan put
-        // our aligned op 25.5 Ir/op behind mimalloc, and the whole difference
-        // was proving via `good_size` + re-walking `malloc`; the peek costs a
-        // mask on top of the plain malloc fast path and hits whenever the
-        // block happens to satisfy the constraint (always, for natural fits).
-        if offset == 0 && size <= SMALL_SIZE_MAX {
+        // HOT: upstream's aligned fast path (`mi_heap_malloc_zero_aligned_at_fast`)
+        // — don't PROVE alignment from the bin geometry, peek the bin's next
+        // free block and test its ACTUAL address with one AND.
+        //
+        // Everything else — the size/alignment bound, the natural-fit search
+        // through `good_size`, huge placement and oversize-and-adjust — lives
+        // in `malloc_aligned_at_slow`. It is not the branches that cost: it is
+        // that sharing a frame with them made this function spill callee-saved
+        // registers, and the prologue and epilogue that entailed measured
+        // 20.00 Ir/op — 40% of the whole function — on a path that uses almost
+        // no registers at all.
+        //
+        // BOTH halves of the validation stay on this side. `is_power_of_two`
+        // because `align - 1` is only a correct mask for a power of two — a
+        // caller passing 3 would otherwise be handed a block satisfying
+        // `& 2 == 0`. And the upper bound because leaving it to the cold half
+        // changes OBSERVABLE behaviour: an `align` past SEGMENT_SIZE/2, which
+        // this allocator documents as refused, would otherwise be served
+        // whenever a block's address happened to satisfy the mask, making the
+        // refusal depend on address luck. One compare against a constant.
+        //
+        // The power-of-two test is written as the bare `align & (align - 1)`
+        // rather than `is_power_of_two`, which is `count_ones() == 1` and
+        // expands to a non-zero test AND that `and`. Dropping the non-zero
+        // half is sound HERE and only here: `align == 0` makes the mask
+        // `usize::MAX`, which no non-null block address can satisfy, so a zero
+        // alignment still falls through to the full validation below and is
+        // still refused — it just takes the cold road to get there.
+        if offset == 0
+            && size <= SMALL_SIZE_MAX
+            && align & align.wrapping_sub(1) == 0
+            && align <= crate::types::SEGMENT_SIZE / 2
+        {
             let w = crate::types::wsize_from_size(size);
             let p = self.direct[w];
             // SAFETY: direct entries point at a live page of this heap or the
@@ -677,17 +959,53 @@ impl Heap {
                 return (b, unsafe { (*p).free_is_zero });
             }
         }
+        self.malloc_aligned_at_slow(size, align, offset)
+    }
+
+    /// Everything `malloc_aligned_at`'s peek could not serve: an invalid or
+    /// oversized alignment, a non-zero offset, a size past the small classes,
+    /// a dry fast list, or a block whose address does not happen to satisfy
+    /// the constraint. Cold and out of line so the peek carries none of its
+    /// register needs.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn malloc_aligned_at_slow(
+        &mut self,
+        size: usize,
+        align: usize,
+        offset: usize,
+    ) -> (*mut u8, bool) {
+        if !align.is_power_of_two() || align > crate::types::SEGMENT_SIZE / 2 {
+            return (ptr::null_mut(), false);
+        }
+        if align <= 8 && offset == 0 {
+            return self.malloc(size);
+        }
+        // NO PEEK HERE. Every caller of this function reaches it only
+        // because an IDENTICAL peek has just failed — `malloc_aligned_at`
+        // above, and `alloc::malloc_aligned_slow`, both run the same guard
+        // against the same heap, the same page and the same free list, with
+        // nothing in between. Repeating it could only fail again, so the copy
+        // that used to sit here was pure cold-path tax.
         // Natural fit: only sound when the offset keeps block starts aligned.
         if offset.is_multiple_of(align)
             && size <= MEDIUM_OBJ_SIZE_MAX
             && align <= SEGMENT_SLICE_SIZE
         {
-            if bins::good_size(size).is_multiple_of(align) {
-                return self.malloc(size);
+            // The bin is derived ONCE and handed on. `good_size(size)` is
+            // `bin_size(bin(size))`, and the `malloc` it decides to call then
+            // re-derived the very same bin to reach the same queue —
+            // `bins::bin` is a leading-zeros and a pair of shifts, paid twice
+            // per aligned allocation that lands here (29% of them on
+            // `rptest`).
+            let b = bins::bin(size);
+            if bins::bin_size(b).is_multiple_of(align) {
+                return self.malloc_in_bin(size, b);
             }
             let asize = (size.max(1) + align - 1) & !(align - 1);
-            if bins::good_size(asize).is_multiple_of(align) {
-                return self.malloc(asize);
+            let ab = bins::bin(asize);
+            if bins::bin_size(ab).is_multiple_of(align) {
+                return self.malloc_in_bin(asize, ab);
             }
         }
         self.stats.generic += 1;
@@ -725,9 +1043,7 @@ impl Heap {
     /// # Safety
     /// Caller must be this heap's owning thread.
     pub unsafe fn process_delayed(&mut self) {
-        if self.delayed.is_null() {
-            return;
-        }
+        debug_assert!(!self.delayed.is_null(), "every heap has a delayed list");
         // SAFETY: delayed points into our own live HeapBox; blocks on it are
         // dead blocks of pages we own.
         unsafe {
@@ -745,9 +1061,39 @@ impl Heap {
             if (*self.delayed).head.load(Ordering::Acquire) == 0 {
                 return;
             }
+            self.drain_delayed();
+        }
+    }
+
+    /// The draining half of [`Heap::process_delayed`], out of line.
+    ///
+    /// The heartbeat runs on EVERY slow-path allocation and, on the common
+    /// outcome, the peek above finds nothing and returns. But this loop calls
+    /// `free_local`, and a call with values live across it is what forces the
+    /// caller to preserve callee-saved registers — so the whole of
+    /// `malloc_generic` paid the push/pop for a list that is almost always
+    /// empty. On `cfrac` that is 2.56 M calls against an empty list.
+    ///
+    /// Splitting this off measured EXACTLY FLAT the first time it was tried,
+    /// because `page_extend` was then also live-across in the same frame and
+    /// held the registers on its own. It only pays once that one is gone —
+    /// see `grow_front`.
+    ///
+    /// # Safety
+    /// `self.delayed` is non-null and its head is non-zero.
+    #[cold]
+    #[inline(never)]
+    unsafe fn drain_delayed(&mut self) {
+        // SAFETY: forwarded contract — blocks on the list are dead blocks of
+        // pages we own.
+        unsafe {
             let mut b = (*self.delayed).head.swap(0, Ordering::AcqRel) as *mut Block;
             while !b.is_null() {
                 let next = (*b).next;
+                // (Calling `free_local_at` directly with the segment and page
+                // resolved here, to skip `free_local`'s null test, measured
+                // EXACTLY flat: LLVM already inlines `free_local` and proves
+                // the block non-null from this loop's own condition.)
                 self.free_local(b.cast());
                 self.stats.delayed_frees += 1;
                 b = next;
@@ -826,8 +1172,12 @@ impl Heap {
             let _ = force;
             self.process_delayed();
             let mut bin = 1;
+            // Running queue pointer: `self.pages[bin]` re-indexed the array
+            // (and re-borrowed `self`) on every one of the MAX_NORMAL_BIN
+            // steps, on every collect.
+            let qbase: *mut PageQueue = (&raw mut self.pages).cast::<PageQueue>();
+            let mut q: *mut PageQueue = qbase.add(1);
             while bin <= MAX_NORMAL_BIN {
-                let q: *mut PageQueue = &raw mut self.pages[bin];
                 let mut p = (*q).first;
                 while !p.is_null() {
                     let next = (*p).next;
@@ -844,6 +1194,7 @@ impl Heap {
                     p = next;
                 }
                 bin += 1;
+                q = q.wrapping_add(1);
             }
         }
     }
@@ -877,8 +1228,7 @@ impl Heap {
                 // free, release if its block already died.
                 let pg: *mut Page = &raw mut (*seg).pages[1];
                 (*pg).xheap.store(self.delayed as usize, Ordering::Release);
-                page_set_flag(pg, XFLAG_DELAYED);
-                page_collect(pg);
+                page_collect_and_set_flag(pg, XFLAG_DELAYED);
                 self.stats.reclaims += 1;
                 if (*pg).used == 0 {
                     let _ = huge_free(seg);
@@ -894,45 +1244,84 @@ impl Heap {
             self.stats.reclaims += 1;
             let end = (*seg).next_free_slice as usize;
             let mut idx = segment::HEADER_SLICES;
+            // Whether walk 1 saw a span that walk 2 could possibly act on. Walk
+            // 2 only ever retires a BIN_HUGE span, and BIN_HUGE > MAX_NORMAL_BIN,
+            // so every candidate it could find passes through the `else` arm
+            // below. Workloads that never allocate a large single-block span —
+            // which is most of them — skip the second full slice walk entirely.
+            let mut saw_large_span = false;
+            // Walk by a RUNNING POINTER, not by re-indexing `pages[idx]` every
+            // step. `Page` is 88 bytes — not a power of two — so each index
+            // costs a multiply plus the array's bounds check; advancing by
+            // `len` costs one add. The walk visits every carved slice, so this
+            // is paid on each one.
+            let base: *mut Page = (&raw mut (*seg).pages).cast::<Page>();
+            let mut slot: *mut Page = base.add(idx);
             while idx < end {
-                let slot: *mut Page = &raw mut (*seg).pages[idx];
                 let len = ((*slot).slice_count as usize).max(1);
                 if (*slot).block_size > 0 {
                     (*slot)
                         .xheap
                         .store(self.delayed as usize, Ordering::Release);
-                    if ((*slot).bin as usize) <= MAX_NORMAL_BIN {
+                    // `bin` is loaded ONCE: it decides the branch below and
+                    // then indexes the queue, and it was being re-read from the
+                    // page for the second use.
+                    let bin = (*slot).bin as usize;
+                    if bin <= MAX_NORMAL_BIN {
+                        // NOT load-guarded. REFUTED 2026-08-21: wrapping this
+                        // in `if flags & IN_FULL != 0` costs +1.97M Ir (+4.5% of
+                        // adopt) — exactly one instruction per page — because
+                        // `fetch_and` is a LEAF op with nothing to skip, so the
+                        // peek only adds a load and a branch. Same shape as the
+                        // `fetch_or(HAS_ALIGNED)` sibling rejected in
+                        // docs/opps.md #9. It IS a latency win (no lock prefix
+                        // on the common path); this project's metric is Ir.
                         (*slot).flags.fetch_and(!pflags::IN_FULL, Ordering::Relaxed);
-                        (*slot).next = ptr::null_mut();
-                        (*slot).prev = ptr::null_mut();
-                        page_set_flag(slot, XFLAG_NORMAL);
-                        page_collect(slot);
+                        // `next`/`prev` are NOT cleared here: `queue_push_front`
+                        // below writes both unconditionally (`prev = null`,
+                        // `next = q.first`), and nothing between here and there
+                        // reads either. Clearing them first was two dead stores
+                        // on every live page of every adopted segment.
+                        page_collect_and_set_flag(slot, XFLAG_NORMAL);
                         // Do NOT retire empty pages during this walk:
                         // span_free COALESCES, rewriting the span layout we
                         // are iterating, so the next step can land mid-span
                         // and queue a bogus page (rare corrupting race found
                         // by the M8 parallel gate). Empty pages are queued
                         // like any other and retired by the next collect.
-                        queue_push_front(&raw mut self.pages[(*slot).bin as usize], slot);
+                        queue_push_front(&raw mut self.pages[bin], slot);
                     } else {
                         // Large single-block span: stays unqueued; a dead one
                         // is retired by a later collect, same rule as above.
-                        page_set_flag(slot, XFLAG_DELAYED);
-                        page_collect(slot);
+                        page_collect_and_set_flag(slot, XFLAG_DELAYED);
+                        saw_large_span = true;
                     }
                 }
                 idx += len;
+                // `wrapping_add`, not `add`: the pointer is only ever
+                // DEREFERENCED while `idx < end` holds, which the span-partition
+                // invariant makes in-bounds — but the final advance of the loop
+                // computes a pointer that may be one past the carved region, and
+                // forming that with `add` would be UB even unread.
+                slot = slot.wrapping_add(len);
             }
             // Queue fronts changed wholesale — rebuild the small-bin table.
+            // REFUTED 2026-08-21: narrowing this to the bins the segment
+            // actually touched, by tracking a min/max bin in the walk above,
+            // is an Ir REGRESSION of +3.75M (+8.6% of adopt). The two compares
+            // it adds run once per QUEUED PAGE (~1.97M times over this
+            // benchmark) while the whole loop they save runs once per SEGMENT
+            // and costs ~444k. Per-page work to save per-segment work is the
+            // wrong direction here; bounding the loop's END (below) is not.
             let mut bin = 1;
-            while bin <= MAX_NORMAL_BIN {
+            while bin <= MAX_DIRECT_BIN {
                 self.update_direct(bin);
                 bin += 1;
             }
             // Adopted large spans that are already dead: retire them now that
             // the walk is over (the layout is ours to mutate again).
             let mut idx = segment::HEADER_SLICES;
-            while idx < (*seg).next_free_slice as usize {
+            while saw_large_span && idx < (*seg).next_free_slice as usize {
                 let slot: *mut Page = &raw mut (*seg).pages[idx];
                 let len = ((*slot).slice_count as usize).max(1);
                 if (*slot).block_size > 0
@@ -1042,11 +1431,18 @@ impl Heap {
             // churn is real (504 pages retired and re-carved per round) but it
             // is NOT the +18% gap. Reverted; do not re-try without a new
             // mechanism.
-            if !((*q).first == pg && (*q).last == pg) {
-                queue_remove(q, pg);
-                self.update_direct(bin);
-                let _ = self.retire_span(seg, pg); // `seg` unused after
-            }
+            // The keep-one-warm test is NOT repeated here. Both callers —
+            // `free`'s emptied branch and `retire_or_abort` — have already
+            // established that this page is not its queue's sole member,
+            // answering it from the page's own links without touching the
+            // heap, so re-deriving `q` to ask again is provably dead.
+            debug_assert!(
+                !((*q).first == pg && (*q).last == pg),
+                "retire_emptied: sole-member page should have been kept warm by the caller"
+            );
+            queue_remove(q, pg);
+            self.update_direct(bin);
+            let _ = self.retire_span(seg, pg); // `seg` unused after
         }
     }
 
@@ -1063,53 +1459,75 @@ impl Heap {
         debug_assert!(pg.is_null() || unsafe { pg == segment::page_of(seg, p) });
         // SAFETY: p is ours per the contract, so seg is a live segment header.
         unsafe {
+            // NOTE (2026-08-21): passing the caller's already-read `flags`
+            // byte in as a fifth argument — to route this `match` on
+            // `HUGE_SEGMENT` and to spare the IN_FULL re-read below — measured
+            // **+6.05 Ir/op** on the cross-thread proxy, and +6.06 with only
+            // the IN_FULL half. It is the ARGUMENT that costs: `free_general`
+            // gained two (`seg`, `pg`) for −7.01 because the caller had them
+            // live already, but a fifth here pushes this larger function over
+            // a register-allocation cliff. The M9 "threading all five through
+            // measured worse" result, reproduced at a different arity.
+            // REFUTED (2026-08-22): splitting the huge-segment arm, the
+            // un-park and the retire out as `#[cold]` tails, so the common
+            // path would carry nothing live across a call. It removes the
+            // frame — 6.91 Ir, a third of this function — and it is still a
+            // LOSS: `free_local_at` +215,880 on the cross-thread op and
+            // cfrac +232,152. The arms are not rare where this function is
+            // hot. A cross-thread free lands on the owner's delayed list, and
+            // when the owner drains it the pages it touches are exactly the
+            // ones that were parked or have just emptied — so the outlined
+            // call fires on most of them. Third time this document records it:
+            // "cold" is a property of the WORKLOAD, not of the code.
             match (*seg).kind {
                 SegmentKind::Huge => {
                     self.stat_free();
-                    // Release ONLY what we actually unlinked. Freeing a
-                    // segment still linked in some list leaves a dangling
-                    // head behind — the 0.4.0 defect-#3 shape.
                     if self.remove_huge_segment(seg) {
                         let _ = huge_free(seg); // terminal: seg is gone after this
                     }
                 }
                 SegmentKind::Normal => {
-                    // Page ALREADY resolved by alloc::free -- resolving it a
-                    // second time here was the single biggest remaining item
-                    // in the free path (page_of is the allocator's hottest
-                    // function; the profile showed free costing 2.7x
-                    // mimalloc's while our malloc was already at parity).
                     self.stat_free();
                     if (*pg).bin as usize == BIN_HUGE {
-                        // Large single-block span: retire immediately.
                         let _ = self.retire_span(seg, pg); // returns below
                         return;
                     }
-                    // The general path keeps the same double-free guarantee as
-                    // the fast path: a negative post-decrement count can only
-                    // be the 0 -> u32::MAX wrap.
                     let used_now = page_push_local(pg, p.cast());
                     if (used_now as i32) < 0 {
                         crate::page::double_free_abort();
                     }
                     if (*pg).flags.load(Ordering::Relaxed) & pflags::IN_FULL != 0 {
-                        // Un-park: it has space again; back to NORMAL remote
-                        // pushes (page is scannable once more).
                         (*pg).flags.fetch_and(!pflags::IN_FULL, Ordering::Relaxed);
                         queue_remove(&raw mut self.pages[BIN_FULL], pg);
                         page_set_flag(pg, XFLAG_NORMAL);
                         let bin = (*pg).bin as usize;
-                        queue_push_front(&raw mut self.pages[bin], pg);
-                        self.update_direct(bin);
+                        // `update_direct` is needed ONLY when the queue was
+                        // empty, because that is the only way a push to the
+                        // BACK can move the head the table tracks.
+                        let q: *mut PageQueue = &raw mut self.pages[bin];
+                        let was_empty = (*q).first.is_null();
+                        queue_push_back(q, pg);
+                        if was_empty {
+                            self.update_direct(bin);
+                        }
                     }
+                    // REFUTED (2026-08-22): `page_all_free` is `used == 0`
+                    // and `used_now` already holds that value, so this re-read
+                    // looks free to remove. It is +147,456 on the cross-thread
+                    // op — keeping `used_now` live across the un-park arm's
+                    // queue calls costs a register, and re-loading a field
+                    // that is already hot in L1 costs less than spilling.
                     if page_all_free(pg) {
-                        // Retire unless it is the queue's only page (keep one
-                        // warm — approximates upstream's retire delay).
                         let bin = (*pg).bin as usize;
                         let q: *mut PageQueue = &raw mut self.pages[bin];
-                        if !((*q).first == pg && (*q).last == pg) {
+                        // `first == pg` is also exactly the condition under
+                        // which `queue_remove` moves the head.
+                        let was_first = (*q).first == pg;
+                        if !(was_first && (*q).last == pg) {
                             queue_remove(q, pg);
-                            self.update_direct(bin);
+                            if was_first {
+                                self.update_direct(bin);
+                            }
                             let _ = self.retire_span(seg, pg); // `seg` unused after
                         }
                     }
@@ -1238,7 +1656,12 @@ impl Heap {
 
     /// Refresh the direct table for `bin` to its current queue front.
     fn update_direct(&mut self, bin: usize) {
-        let bsize = bins::bin_size(bin);
+        // The queue already CARRIES its block size (`PageQueue::block_size`,
+        // filled once at heap construction). Re-deriving it through
+        // `bins::bin_size`'s shift-and-mask arithmetic on every call was work
+        // the struct had already done — and the load is free, because the very
+        // next line touches `self.pages[bin]` anyway.
+        let bsize = self.pages[bin].block_size;
         if bsize > SMALL_SIZE_MAX {
             return;
         }
@@ -1249,14 +1672,37 @@ impl Heap {
             p => p,
         };
         let w_hi = bsize / crate::types::INTPTR_SIZE;
+        // Nothing to do when the range already points at this page. Every
+        // entry in `[w_lo, w_hi]` is written together by the loop below and
+        // this function is their only writer, so the top of the range answers
+        // for all of it in one load. The steady state — a bin whose queue
+        // front does not change between two slow-path allocations — then costs
+        // a compare instead of the `w_lo` derivation plus a store per wsize.
+        if self.direct[w_hi] == page {
+            return;
+        }
         // With ALIGN2W, bins ≤ 8 exist only at 1 and even indices; each even
         // bin also serves the odd wsize below it. Bins > 8 are contiguous.
         let w_lo = match bin {
             0 | 1 => 0,
             2 => 2,
             3..=8 => bin - 1,
-            _ => bins::bin_size(bin - 1) / crate::types::INTPTR_SIZE + 1,
+            // Stored, not recomputed — same reason as `bsize` above.
+            _ => self.pages[bin - 1].block_size / crate::types::INTPTR_SIZE + 1,
         };
+        // REFUTED (larson-sized, 2026-08-21): this loop is 32.17 Ir per queue
+        // walk — 21% of the walk — because the wide bins span up to 32 word
+        // sizes and it writes every slot. Both slice forms that would drop the
+        // per-element bound are WORSE, on an instrument exact to the unit:
+        //
+        //     indexed `while`                   53.105 Ir/op   (this)
+        //     `self.direct[w_lo..=w_hi].fill()` 53.360   +0.255
+        //     `for slot in &mut self.direct[..]` 53.375  +0.270
+        //
+        // LLVM already compiles the indexed form without a per-store check;
+        // what the slice forms add is the range's own bounds computation. Do
+        // not retry without changing the DATA STRUCTURE — the cost here is the
+        // width of a bin's word-size range, not the loop.
         let mut w = w_lo;
         while w <= w_hi {
             self.direct[w] = page;
@@ -1419,6 +1865,29 @@ unsafe fn queue_push_front(q: *mut PageQueue, page: *mut Page) {
             (*(*q).first).prev = page;
         }
         (*q).first = page;
+    }
+}
+
+/// Append `page` to the BACK of `q`.
+///
+/// The un-park path's enqueue. Keeping the queue HEAD stable is the whole
+/// point — see the call site in [`Heap::free_local_at`].
+///
+/// # Safety
+/// Heap lock held; `page` is a live slot not currently linked in any queue.
+unsafe fn queue_push_back(q: *mut PageQueue, page: *mut Page) {
+    // SAFETY: caller contract — page is a live slot.
+    unsafe { crate::page::debug_validate_page(page, "queue_push_back") };
+    // SAFETY: caller contract.
+    unsafe {
+        (*page).next = ptr::null_mut();
+        (*page).prev = (*q).last;
+        if (*q).last.is_null() {
+            (*q).first = page;
+        } else {
+            (*(*q).last).next = page;
+        }
+        (*q).last = page;
     }
 }
 

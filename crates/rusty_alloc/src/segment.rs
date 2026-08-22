@@ -69,8 +69,39 @@ pub struct Segment {
     pub next: *mut Segment,
     /// Head of the free-span list (slots inside `pages`).
     pub free_spans: *mut Page,
+    /// For each slice, the byte offset from THIS SEGMENT'S BASE to the `Page`
+    /// that owns it.
+    ///
+    /// It is the same fact `Page::slice_offset` already carries, in the one
+    /// form the free path can use in two instructions instead of five.
+    /// Resolving a pointer to its page used to mean: multiply the slice index
+    /// by `size_of::<Page>()` — 88, not a power of two, so a real `imul` —
+    /// add it to the slot array to reach the slot, load the slot's
+    /// `slice_offset`, and subtract it. Four dependent steps to reach a page
+    /// whose address is a pure function of the slice index. Indexed by a
+    /// `u32` array instead, the whole thing is
+    /// `mov off(%seg,%idx,4); lea (%seg,%off)`.
+    ///
+    /// `free` runs this on every call, so those two instructions are the
+    /// second-largest item in it. The table costs 2 KiB in a 32 MiB segment
+    /// header that has ~20 KiB spare (0.006% of the segment) and is written
+    /// only when a span is carved.
+    ///
+    /// It duplicates state, which is a real hazard, so `debug_validate_segment`
+    /// checks the two agree on every slice of every span it walks.
+    pub page_off: [u32; SLICES_PER_SEGMENT],
     /// One metadata slot per slice; a span's slot is its first slice.
     pub pages: [Page; SLICES_PER_SEGMENT],
+}
+
+/// Byte offset from a segment's base to its slot array — the base value stored
+/// in [`Segment::page_off`].
+pub const PAGES_OFFSET: usize = core::mem::offset_of!(Segment, pages);
+
+/// The byte offset a slice owned by the span starting at `start` must record.
+#[inline(always)]
+pub const fn page_off_for(start: usize) -> u32 {
+    (PAGES_OFFSET + start * core::mem::size_of::<Page>()) as u32
 }
 
 const _: () = assert!(
@@ -88,6 +119,11 @@ pub const USABLE_SLICES: usize = SLICES_PER_SEGMENT - HEADER_SLICES;
 /// provenance so the mask trick is miri-clean.
 #[inline]
 pub fn segment_of(p: *mut u8) -> *mut Segment {
+    // NOTE (2026-08-21): the GEP form `p.wrapping_sub(p.addr() & (SEGMENT_SIZE
+    // - 1))` — proposed because `with_addr` is an integer round-trip LLVM is
+    // conservative about — measured +1.00 Ir on EVERY malloc and free (small
+    // 59.32 -> 60.32, batch_lifo 59.53 -> 60.53). The round-trip is free here
+    // and the subtraction is not. Do not retry.
     p.with_addr(p.addr() & !(SEGMENT_SIZE - 1)).cast()
 }
 
@@ -98,6 +134,9 @@ pub fn segment_of(p: *mut u8) -> *mut Segment {
 /// `p` must point into a live segment owned by this allocator.
 #[inline]
 pub unsafe fn page_of(seg: *mut Segment, p: *mut u8) -> *mut Page {
+    // NOTE (2026-08-21): deriving this as `p.addr() & (SEGMENT_SIZE - 1)` —
+    // the same value without the subtraction, since `seg` is `p` masked —
+    // measured FLAT. LLVM already sees through the mask here.
     let idx = (p.addr() - seg.addr()) / SEGMENT_SLICE_SIZE;
     debug_assert!(
         idx < SLICES_PER_SEGMENT,
@@ -113,16 +152,26 @@ pub unsafe fn page_of(seg: *mut Segment, p: *mut u8) -> *mut Page {
     // provenance and the same address, with the check kept under
     // `debug_checks`.
     unsafe {
-        let base: *mut Page = (&raw mut (*seg).pages).cast();
-        let slot = base.add(idx);
-        // `slice_offset` is already in BYTES, so the follow-back is a single
-        // subtraction — no scaling by size_of::<Page>() on this path.
-        let off = (*slot).slice_offset as usize;
+        // ONE scale-4 load and an add. The table records, per slice, the byte
+        // offset from this segment's base to the page that owns it, so the
+        // slot address, the `imul` by `size_of::<Page>()` and the
+        // `slice_offset` follow-back all disappear — see `Segment::page_off`.
+        let tab: *const u32 = (&raw const (*seg).page_off).cast();
+        let off = *tab.add(idx) as usize;
+        // The two representations must agree. This is the check that makes the
+        // duplicated state safe to keep, and it is free in release.
         debug_assert!(
-            off <= idx * core::mem::size_of::<Page>(),
-            "page_of: slice_offset points before the segment"
+            {
+                let base: *mut Page = (&raw mut (*seg).pages).cast();
+                let slot = base.add(idx);
+                let back = (*slot).slice_offset as usize;
+                back <= idx * core::mem::size_of::<Page>()
+                    && slot.cast::<u8>().sub(back).cast::<Page>()
+                        == seg.cast::<u8>().add(off).cast::<Page>()
+            },
+            "page_of: page_off table disagrees with slice_offset"
         );
-        slot.cast::<u8>().sub(off).cast::<Page>()
+        seg.cast::<u8>().add(off).cast::<Page>()
     }
 }
 
@@ -299,14 +348,53 @@ unsafe fn span_mark(seg: *mut Segment, idx: usize, len: usize) {
         // division. The refill path then reads `(*p).area` instead of
         // recovering it with `page_index` (see `Page::area`).
         (*seg).pages[idx].area = seg.cast::<u8>().add(idx * SEGMENT_SLICE_SIZE);
+        // Interior slices, walked with RUNNING values rather than recomputed
+        // indices. `(*seg).pages[idx + j]` costs a multiply by `size_of::<Page>()`
+        // — which is 88, not a power of two — and `j * slot_stride()` costs a
+        // second; both become adds when the loop carries the slot pointer and
+        // the byte offset it is about to store. Every span carved and every
+        // span released walks this loop, and a workload that churns spans
+        // walks it constantly.
+        // Every slice of this span resolves to the span's own slot, so the
+        // table entry is one constant written across the run.
+        let owner = page_off_for(idx);
+        let tab: *mut u32 = (&raw mut (*seg).page_off).cast();
+        *tab.wrapping_add(idx) = owner;
+        let base: *mut Page = (&raw mut (*seg).pages).cast();
+        let mut slot = base.wrapping_add(idx + 1);
+        let mut ent = tab.wrapping_add(idx + 1);
+        let mut off = slot_stride();
         let mut j = 1;
         while j < len {
             // BYTES back to the span start, not slices — see Page::slice_offset.
-            (*seg).pages[idx + j].slice_offset = (j * slot_stride()) as u16;
+            (*slot).slice_offset = off as u16;
+            *ent = owner;
+            slot = slot.wrapping_add(1);
+            ent = ent.wrapping_add(1);
+            off += slot_stride();
             j += 1;
         }
     }
 }
+
+// ASSESSED AND DECLINED 2026-08-21 — `span_mark_free` writing only the span's
+// FIRST and LAST slot instead of every interior one.
+//
+// The reasoning holds: interior `slice_offset`s are read by exactly one
+// function, `page_of`, which is only ever called on a pointer to a LIVE block,
+// and coalescing follows back only from a neighbour's LAST slot. Free spans
+// get long once they coalesce — ~16 interior slices per call on `sh8bench` —
+// so this was the largest line in both `span_alloc` and `span_free`.
+//
+// It was not landed. `debug_validate_segment` asserts the STRONGER invariant —
+// every span, free or live, has every interior slice pointing back — and that
+// walk is the net which caught the M8 parallel-gate race that `adopt_segment`
+// documents. Landing this meant weakening a validated layout invariant of an
+// allocator to buy ~20M Ir on a benchmark whose own noise floor is ~100M: a
+// change we could not measure where it matters, paid for in the one property
+// this code most needs to keep. If it is ever wanted, it needs the invariant
+// re-specified deliberately — free spans validated on bounds, live spans on
+// interiors — not weakened as a side effect of an optimisation.
 
 /// Mark `[idx, idx+len)` as a FREE span and push it on the free list.
 ///
@@ -672,10 +760,19 @@ pub fn huge_alloc(
             Ordering::Relaxed,
         );
         (*page).free_is_zero = b.is_zero;
+        // Every slice of a huge segment resolves to slot 1, so the owner table
+        // is one value repeated across the run. (Writing it as a vectorised
+        // `slice::fill` instead of a store in the loop below measured exactly
+        // flat — the loop is dominated by `slice_offset`, which strides by
+        // `size_of::<Page>()` and cannot vectorise.)
+        let owner = page_off_for(1);
+        let tab: *mut u32 = (&raw mut (*seg).page_off).cast();
+        *tab.wrapping_add(1) = owner;
         let mut j = 2;
         while j < SLICES_PER_SEGMENT {
             // Bytes back to slot 1, which holds this huge block's page data.
             (*seg).pages[j].slice_offset = ((j - 1) * slot_stride()) as u16;
+            *tab.wrapping_add(j) = owner;
             j += 1;
         }
         Ok((seg, block))

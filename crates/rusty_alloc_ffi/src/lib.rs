@@ -591,6 +591,23 @@ pub extern "C" fn mi_malloc_good_size(size: usize) -> usize {
     rusty_alloc::good_size(size)
 }
 
+/// EINVAL, out of line. A `#[cold]` function is how a plain `return 22` is
+/// told it is the unlikely arm: LLVM then lays the constant and the return
+/// away from the straight-line success path instead of between its
+/// instructions.
+#[cold]
+#[inline(never)]
+fn einval() -> c_int {
+    22
+}
+
+/// ENOMEM, out of line, for the same reason as [`einval`].
+#[cold]
+#[inline(never)]
+fn enomem() -> c_int {
+    12
+}
+
 /// `mi_posix_memalign(&p, alignment, size)` → 0 / EINVAL(22) / ENOMEM(12).
 ///
 /// # Safety
@@ -601,15 +618,39 @@ pub unsafe extern "C" fn mi_posix_memalign(
     alignment: usize,
     size: usize,
 ) -> c_int {
-    if out.is_null()
-        || !alignment.is_power_of_two()
-        || alignment < core::mem::size_of::<*mut c_void>()
-    {
-        return 22; // EINVAL
+    // SAFETY: forwarded contract.
+    unsafe { posix_memalign_impl(out, alignment, size) }
+}
+
+/// The body of [`mi_posix_memalign`], callable from Rust so the LD_PRELOAD
+/// override's own `posix_memalign` export IS this code rather than a
+/// cross-crate `extern "C"` call it cannot inline through. Same arrangement as
+/// `alloc::free_inline`, and the body is small enough to be worth it — the
+/// `realloc_inline` experiment showed a large body makes the export pay a
+/// frame instead.
+///
+/// # Safety
+/// As [`mi_posix_memalign`].
+#[inline]
+pub unsafe fn posix_memalign_impl(
+    out: *mut *mut c_void,
+    alignment: usize,
+    size: usize,
+) -> c_int {
+    // Bound FIRST, then the power-of-two test. `is_power_of_two` is
+    // `count_ones() == 1`, which LLVM expands to a non-zero test AND a
+    // `x & (x - 1)` test; establishing `alignment >= size_of::<*mut _>()`
+    // first makes the non-zero half redundant, so the second test reduces to
+    // the single `and`. Same predicate, measured cheaper.
+    if out.is_null() || alignment < core::mem::size_of::<*mut c_void>() {
+        return einval();
+    }
+    if alignment & (alignment - 1) != 0 {
+        return einval(); // not a power of two
     }
     let p = alloc::malloc_aligned(size, alignment);
     if p.is_null() {
-        return 12; // ENOMEM
+        return enomem();
     }
     // SAFETY: out valid per contract.
     unsafe { out.write(p.cast()) };
@@ -1890,17 +1931,39 @@ pub extern "C" fn mi_is_redirected() -> bool {
 /// divergence: no `std::get_new_handler` loop).
 #[unsafe(no_mangle)]
 pub extern "C" fn mi_new(size: usize) -> *mut c_void {
-    let p = alloc::malloc(size);
-    if p.is_null() {
-        alloc::collect(true);
-        let p2 = alloc::malloc(size);
-        if p2.is_null() {
-            rusty_alloc::options::error(12);
-            std::process::abort();
-        }
-        return p2.cast();
+    new_impl(size)
+}
+
+/// The body of [`mi_new`], callable from Rust so the LD_PRELOAD override's
+/// `operator new` / `operator new[]` exports ARE this code rather than a
+/// cross-crate `extern "C"` call they cannot inline through. Same arrangement
+/// as `alloc::free_inline` and `posix_memalign_impl`.
+///
+/// The success path is deliberately three instructions of its own — allocate,
+/// test, return — with the whole retry-collect-abort sequence out of line, so
+/// inlining it into an export costs a frame nothing like the one a large body
+/// would (the `realloc_inline` experiment measured that the other way).
+#[inline]
+pub fn new_impl(size: usize) -> *mut c_void {
+    // `malloc_or`, not `malloc` + a null test: testing the result here
+    // would keep `size` alive across the slow-path call, and that single
+    // live value gives every `operator new` export a frame. See
+    // `alloc::malloc_or`.
+    alloc::malloc_or(size, new_oom).cast()
+}
+
+/// `operator new` ran out of memory: collect once, retry, and abort if that
+/// still fails (the documented divergence — no `std::get_new_handler` loop).
+#[cold]
+#[inline(never)]
+fn new_oom(size: usize) -> *mut u8 {
+    alloc::collect(true);
+    let p2 = alloc::malloc(size);
+    if p2.is_null() {
+        rusty_alloc::options::error(12);
+        std::process::abort();
     }
-    p.cast()
+    p2
 }
 
 /// `mi_new_nothrow`.
@@ -1912,12 +1975,27 @@ pub extern "C" fn mi_new_nothrow(size: usize) -> *mut c_void {
 /// `mi_new_aligned`.
 #[unsafe(no_mangle)]
 pub extern "C" fn mi_new_aligned(size: usize, alignment: usize) -> *mut c_void {
+    new_aligned_impl(size, alignment)
+}
+
+/// The body of [`mi_new_aligned`], callable from Rust so the override's
+/// aligned `operator new` exports are the body rather than a cross-crate call.
+/// Sibling of [`new_impl`].
+#[inline]
+pub fn new_aligned_impl(size: usize, alignment: usize) -> *mut c_void {
     let p = alloc::malloc_aligned(size, alignment);
     if p.is_null() {
-        rusty_alloc::options::error(12);
-        std::process::abort();
+        new_aligned_oom();
     }
     p.cast()
+}
+
+/// Aligned `operator new` ran out of memory: report and abort.
+#[cold]
+#[inline(never)]
+fn new_aligned_oom() -> ! {
+    rusty_alloc::options::error(12);
+    std::process::abort()
 }
 
 /// `mi_new_aligned_nothrow`.

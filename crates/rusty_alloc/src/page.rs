@@ -605,6 +605,36 @@ pub unsafe fn page_pop(page: *mut Page) -> *mut u8 {
     block.cast()
 }
 
+/// Link a dead block onto the page's owner-only free list, WITHOUT touching
+/// `used`.
+///
+/// Split out of [`page_push_local`] so the caller can decrement `used` with a
+/// single memory-destination RMW whose flags drive the retire branch — see
+/// `alloc::free_inline`. The two halves are independent: the link is three
+/// stores, the decrement is the count.
+///
+/// # Safety
+/// As [`page_push_local`].
+#[inline(always)]
+pub unsafe fn page_link_local(page: *mut Page, block: *mut Block) {
+    // SAFETY: forwarded contract — `block` belongs to `page` and is dead.
+    unsafe {
+        // Mark free BEFORE linking it in, so a double free is caught before
+        // the block is published on a list twice.
+        #[cfg(feature = "blockmap")]
+        blockmap_transition(page, block.cast(), false);
+        block_set_next(page, block, (*page).local_free);
+        (*page).local_free = block;
+    }
+}
+
+/// Byte offset of `Page::used`, for the one caller that decrements it in asm.
+///
+/// Asserted against the real layout in `tests` rather than assumed: an asm
+/// operand cannot be type-checked, so the offset is the one thing here that a
+/// field reordering could silently break.
+pub const USED_OFFSET: usize = core::mem::offset_of!(Page, used);
+
 /// Push a block on the owner free list (`mi_free` local path).
 ///
 /// Returns the POST-decrement `used` count, and the caller MUST act on it:
@@ -612,10 +642,10 @@ pub unsafe fn page_pop(page: *mut Page) -> *mut u8 {
 /// wrapped — and the caller aborts via [`double_free_abort`]; 0 means the page
 /// just emptied and is a retire candidate. Returning the value instead of
 /// testing it here lets `alloc::free` fold BOTH cold outcomes into one
-/// rarely-taken branch on the decrement's own flags, where the in-function
-/// test cost a separate load/store plus two hot-path branches. Every
-/// legitimate `used` is far below `i32::MAX` (a span holds at most a few
-/// million blocks), so a negative value can only be the wrap.
+/// rarely-taken branch, and `#[must_use]` makes ignoring the double-free
+/// signal a compile error. Every legitimate `used` is far below `i32::MAX` (a
+/// span holds at most a few million blocks), so a negative value can only be
+/// the wrap.
 ///
 /// # Safety
 /// `page` owned by the calling thread; `block` must be the start of a block
@@ -630,24 +660,36 @@ pub unsafe fn page_push_local(page: *mut Page, block: *mut Block) -> u32 {
     unsafe {
         // Mark free BEFORE linking it in, so a double free is caught before
         // the block is published on a list twice.
-        #[cfg(feature = "blockmap")]
-        blockmap_transition(page, block.cast(), false);
-        block_set_next(page, block, (*page).local_free);
-        (*page).local_free = block;
+        // The blockmap transition lives in `page_link_local`; do NOT repeat
+        // it here. Flipping the liveness bit twice makes the second flip read
+        // as "already free" and abort as a double free — which is exactly what
+        // happened when this function was split, and what `tests/abandon_rss`
+        // caught.
+        page_link_local(page, block);
         let u = (*page).used.wrapping_sub(1);
         (*page).used = u;
-        // NOTE (2026-08-20): this decrement is where the batch-op gap to
-        // mimalloc lives, and it is a safe-Rust CODEGEN FLOOR, not a fixable
-        // structure. mimalloc's free emits `subw $1, used; je` — one
+        // NOTE (2026-08-20, RE-REFUTED 2026-08-21): this decrement is where
+        // the gap to mimalloc lives on every free-heavy workload — sh6bench
+        // +366M Ir, sh8bench +852M, alloc-test +200M — and it is a safe-Rust
+        // CODEGEN FLOOR, not a fixable structure. mimalloc's free emits `subw $1, used; je` — one
         // memory-destination RMW whose flags feed the retire branch (2
         // instructions). We emit load / dec / store / test / branch (5),
         // because the decremented value must be in memory before the branch
         // (the retire tail re-reads `used`) AND drive the branch, and LLVM
         // will not select `dec [mem]; jle` for that shape. Splitting the push
         // from the decrement and inlining the latter next to the branch was
-        // tried and produced BYTE-IDENTICAL asm — see docs/opps.md #6. Closing
-        // it needs inline asm on the hottest path, which is not worth ~0.5% on
-        // one synthetic op.
+        // tried and produced BYTE-IDENTICAL asm — see docs/opps.md #6.
+        //
+        // RE-REFUTED 2026-08-21, harder. opps #6 split the push from the
+        // decrement; it never removed the REGISTER dependency, which is the
+        // stated reason LLVM declines the fold. So that was tried too: the
+        // return value was deleted, the decrement written straight to memory,
+        // and the caller made to re-read the same field — the exact shape
+        // Clang folds for mimalloc. Result on sh6bench, whose allocator count
+        // is exact to the unit: **8,005,465,906 before and after**, not one
+        // instruction different. The fold is not reachable from safe Rust by
+        // any arrangement of this code, and the `#[must_use]` return is worth
+        // keeping for the compile-time double-free guard it provides.
         u
     }
 }
@@ -688,6 +730,12 @@ pub(crate) fn corrupt_free_list_abort() -> ! {
 /// # Safety
 /// `page` must be a live page NOT owned by the calling thread; `block` a dead
 /// block of this page.
+// NOT `#[inline(never)]`. Outlining this is tempting — inlined, its spin loop
+// is what gives `free_general` an eight-instruction frame that every general
+// free pays. Measured, it is a LOSS: `free_general` −1,495,040 but
+// `remote_free` +1,868,800, net +373,760 on the cross-thread op, because a
+// workload where this function matters is one where every free reaches it, so
+// the call is paid every time AND the callee grows a frame of its own.
 pub unsafe fn remote_free(page: *mut Page, block: *mut Block) {
     loop {
         // SAFETY: xthread_free/xheap are the designed cross-thread fields.
@@ -810,6 +858,35 @@ pub unsafe fn page_set_flag(page: *mut Page, flag: usize) {
 /// # Safety
 /// `page` owned by the calling thread.
 pub unsafe fn page_collect(page: *mut Page) {
+    // SAFETY: forwarded contract; PRESERVE the protocol flag.
+    unsafe { page_collect_impl::<false>(page, 0) }
+}
+
+/// Collect AND install a new protocol flag in ONE locked read-modify-write.
+///
+/// The abandon/adopt and teardown walks both used to do
+/// `page_set_flag(p, F); page_collect(p)` — two CAS loops over the SAME atomic
+/// word, on every live page of every segment they touch. The composition of
+/// those two operations is exactly "take the block-list head and set the flag
+/// to F", which is one CAS. `page_set_flag`'s spin-while-`XFLAG_FREEING` is
+/// kept, so a remote free in flight is still waited out before the word is
+/// rewritten — the fused form is atomically at least as strong as the pair it
+/// replaces, because the flag and the steal can no longer be observed apart.
+///
+/// # Safety
+/// As [`page_collect`].
+pub unsafe fn page_collect_and_set_flag(page: *mut Page, flag: usize) {
+    // SAFETY: forwarded contract.
+    unsafe { page_collect_impl::<true>(page, flag) }
+}
+
+/// The body of both. `SET_FLAG` is a const parameter so neither caller pays a
+/// runtime branch for the other's behaviour.
+///
+/// # Safety
+/// As [`page_collect`].
+#[inline]
+unsafe fn page_collect_impl<const SET_FLAG: bool>(page: *mut Page, flag: usize) {
     // SAFETY: owner-only lists plus designed atomic steal.
     unsafe {
         if (*page).free.is_null() {
@@ -820,16 +897,41 @@ pub unsafe fn page_collect(page: *mut Page) {
                 (*page).free_is_zero = false;
             }
         }
-        // Steal the cross-thread chain, preserving the protocol flag.
+        // Peek ONCE before entering the exchange loop. A plain collect (no
+        // flag to write) has nothing to do when the chain is empty, which is
+        // every collect on a thread that never receives a cross-thread free —
+        // and `malloc_generic` collects the queue front on every slow-path
+        // allocation. Entering the loop to discover that costs the loop's
+        // setup as well as the test; this is the test alone, straight-line.
+        // Steal the cross-thread chain, preserving the protocol flag — or,
+        // when SET_FLAG, replacing it in the same CAS.
+        if !SET_FLAG && ((*page).xthread_free.load(Ordering::Acquire) & !XMASK) == 0 {
+            return;
+        }
         loop {
             let x = (*page).xthread_free.load(Ordering::Acquire);
+            if SET_FLAG && x & XMASK == XFLAG_FREEING {
+                // A remote free is mid-flight; the flag must not be rewritten
+                // underneath it (this is `page_set_flag`'s wait, inherited).
+                core::hint::spin_loop();
+                continue;
+            }
             let head = (x & !XMASK) as *mut Block;
             if head.is_null() {
+                if SET_FLAG
+                    && (*page)
+                        .xthread_free
+                        .compare_exchange_weak(x, flag, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_err()
+                {
+                    continue;
+                }
                 break;
             }
+            let want = if SET_FLAG { flag } else { x & XMASK };
             if (*page)
                 .xthread_free
-                .compare_exchange_weak(x, x & XMASK, Ordering::AcqRel, Ordering::Relaxed)
+                .compare_exchange_weak(x, want, Ordering::AcqRel, Ordering::Relaxed)
                 .is_err()
             {
                 continue;
@@ -921,9 +1023,53 @@ pub unsafe fn page_extend(page: *mut Page, area: *mut u8) {
             (*page).payload = area;
             core::ptr::write_bytes(area.add(reserved * bsize), 0, bitmap_bytes(reserved));
         }
+        // Blocks linked per extend. The bound is in BYTES of payload, so a
+        // small class links many blocks and a large one few — mimalloc uses
+        // the same shape with a 4 KiB bound ("one OS page seems to work
+        // well"). Raising it to 8 KiB halves how often a draining class has to
+        // re-enter the whole slow path — the queue walk, the heartbeat, the
+        // direct-table update — without changing how much memory is touched:
+        // the page's area is already committed when it is carved, so this
+        // moves link-list work earlier, not memory.
+        //
+        // REFUTED 2026-08-21 — raising this bound is an INSTRUCTION win and a
+        // CACHE loss, and the cache side is the one that decides.
+        //
+        // Doubling to 8 KiB reads −0.16 to −8.39 Ir/op across ten of twelve
+        // scanned ops (realloc −8.39, aligned −5.75, med −2.85) because a
+        // draining size class re-enters the slow path half as often.
+        // Quadrupling to 16 KiB reads better still on most of them. But each
+        // extend WALKS its whole batch, and cachegrind on a shbench-shaped
+        // workload prices that walk:
+        //
+        //     bound    I refs        D1 misses      LL misses
+        //     4 KiB    11,567,403    144,514        20,750
+        //     8 KiB    11,542,248    146,106 +1.1%  21,207 +2.2%
+        //     16 KiB   11,544,360    149,413 +3.4%  22,079 +6.4%
+        //
+        // 8 KiB buys 25,155 instructions for 457 extra last-level misses. At a
+        // few hundred cycles each that is ~114k cycles spent to save perhaps
+        // 13k. This repository measures instructions BECAUSE its clock cannot
+        // resolve small effects — not because instructions are the goal — and
+        // the README says so directly: "fewer instructions is not
+        // automatically less TIME (cache behaviour and syscalls do not show up
+        // here)". A change with a measured cost in the blind spot and an
+        // unverifiable gain in the domain that matters does not land.
+        //
+        // Upstream's own comment on the same 4 KiB bound: "one OS page seems
+        // to work well". It is one OS page for a reason.
         let take = ((4096 / bsize).max(1)).min(reserved - capacity);
         let start = area.add(capacity * bsize);
         // Link the fresh blocks in address order.
+        //
+        // Two rewrites of this loop have been measured and both lost. Walking
+        // BACKWARDS with a running pointer, to replace `start.add(i * bsize)`'s
+        // multiply, read FLAT — LLVM already strength-reduces the index.
+        // Walking FORWARD, storing `b + bsize` into `b` to drop the carried
+        // `head`, read **+0.33 Ir/op** on a shbench-shaped workload: the
+        // forward form makes each store depend on the previous address
+        // computation, where the backward form's decrementing induction
+        // variable does not. Left as it is.
         let mut i = take;
         let mut head: *mut Block = (*page).free;
         while i > 0 {
@@ -1027,6 +1173,32 @@ mod blockmap_index_tests {
         assert!(saw_containing > 0, "no containing-block cases covered");
         assert!(saw_garbage > 0, "no out-of-range cases covered");
     }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    /// `alloc::free_inline` decrements `Page::used` from INLINE ASSEMBLY, as
+    /// `sub dword ptr [pg + USED_OFFSET], 1`, because safe Rust cannot express
+    /// a memory-destination RMW whose flags drive the retire branch. An asm
+    /// operand is not type-checked: if the field moved, or changed width, the
+    /// allocator would silently decrement the wrong bytes of every page it
+    /// frees into. This is the check that stops that.
+    #[test]
+    fn used_offset_matches_the_field_the_asm_decrements() {
+        assert_eq!(
+            USED_OFFSET,
+            core::mem::offset_of!(Page, used),
+            "USED_OFFSET is out of step with Page::used"
+        );
+    }
+
+    /// The asm writes a DWORD. If `used` ever stops being a `u32` this stops
+    /// compiling, which is the earliest possible place to catch it — a
+    /// narrower field would leave the high bytes of a neighbour decremented,
+    /// a wider one would tear the count.
+    const _WIDTH_CHECK: fn(&Page) -> u32 = |p| p.used;
 }
 
 #[cfg(test)]
