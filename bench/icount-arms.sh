@@ -17,30 +17,79 @@ set -uo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 RA="${RA_OVERRIDE_LIB:-$HOME/ra_target/release/librusty_alloc_override.so}"
 MI="${MI_ORACLE_LIB:-$root/oracle/out/linux/mi/libmimalloc.so}"
+# jemalloc arm. The README quotes a vs-jemalloc column; that number used to come
+# from a one-off invocation, which meant nothing in this repo could re-derive
+# it. Wired in here so `bench/icount-arms.sh` produces every column the README
+# prints. Override with JE_LIB=; skipped cleanly if the library is absent.
+JE="${JE_LIB:-/usr/lib/x86_64-linux-gnu/libjemalloc.so.2}"
 
-icount() { # arm cmd...
+# Whole-program instructions for one arm. Also records, in ALLOC_IR, how many
+# of those instructions were the allocator's OWN — because a whole-program ratio
+# understates the allocator by exactly the fraction of the program that is not
+# the allocator, and on these workloads that fraction is 94-98%. Attribution is
+# by OBJECT from the raw callgrind file: an interpreter reaches the allocator
+# through symbols that carry neither allocator's name, so matching on the symbol
+# name (as bench/opscan2.sh does, correctly, for a C microbenchmark) misses them.
+#
+# Prints TWO numbers, "whole allocator". It has to print rather than set a
+# variable: every caller uses $( ), and an assignment inside a command
+# substitution dies with the subshell.
+icount() { # arm cmd... -> "<whole_program_ir> <allocator_ir>"
+
   local arm="$1"; shift
-  local pre=""; case "$arm" in ra) pre="$RA";; mi) pre="$MI";; esac
-  local err; err=$(mktemp)
+  local pre=""; case "$arm" in ra) pre="$RA";; mi) pre="$MI";; je) pre="$JE";; esac
+  local err cg alloc; err=$(mktemp); cg=$(mktemp); alloc=0
   if [ -n "$pre" ]; then
-    LD_PRELOAD="$pre" valgrind --tool=callgrind --callgrind-out-file=/dev/null \
+    LD_PRELOAD="$pre" valgrind --tool=callgrind --callgrind-out-file="$cg" \
       --cache-sim=no --branch-sim=no "$@" >/dev/null 2>"$err"
   else
-    valgrind --tool=callgrind --callgrind-out-file=/dev/null \
+    valgrind --tool=callgrind --callgrind-out-file="$cg" \
       --cache-sim=no --branch-sim=no "$@" >/dev/null 2>"$err"
   fi
-  grep -oP 'refs:\s+\K[0-9,]+' "$err" | tr -d ','
-  rm -f "$err"
+  if [ -n "$pre" ]; then
+    alloc=$(awk -v want="$(basename "$pre")" '
+      function reg(kind, spec,   id, rest) {
+        if (spec ~ /^\([0-9]+\)/) {
+          id = spec; sub(/^\(/, "", id); sub(/\).*$/, "", id)
+          rest = spec; sub(/^\([0-9]+\)[ ]?/, "", rest)
+          if (rest != "") NAMES[kind "/" id] = rest
+          return NAMES[kind "/" id]
+        }
+        return spec
+      }
+      /^ob=/  { ob = reg("ob", substr($0,4)); next }
+      /^cob=/ {      reg("ob", substr($0,5)); next }
+      /^calls=/ { skip = 1; next }
+      /^[0-9+*-]/ { if (skip) { skip = 0; next }
+                    if (index(ob, want) > 0) a += $2; next }
+      END { print a + 0 }' "$cg")
+  else
+    alloc=0
+  fi
+  printf '%s %s
+' "$(grep -oP 'refs:\s+\K[0-9,]+' "$err" | tr -d ',')" "$alloc"
+  rm -f "$err" "$cg"
 }
+
 
 bench() { # name -- cmd...
   local name="$1"; shift; shift
-  local ra mi sys
-  ra=$(icount ra "$@"); mi=$(icount mi "$@"); sys=$(icount sys "$@")
-  awk -v n="$name" -v a="$ra" -v m="$mi" -v s="$sys" 'BEGIN{
-    printf "%-8s ra %14d | mi %14d | sys %14d | ra/mi %.4f | ra/sys %.4f\n", n, a, m, s, a/m, a/s
+  local ra mi je sys ra_al mi_al
+  read -r ra ra_al   <<<"$(icount ra  "$@")"
+  read -r mi mi_al   <<<"$(icount mi  "$@")"
+  read -r sys _      <<<"$(icount sys "$@")"
+  je=0; [ -f "$JE" ] && read -r je _ <<<"$(icount je "$@")"
+  awk -v n="$name" -v a="$ra" -v m="$mi" -v j="$je" -v s="$sys" \
+      -v aa="$ra_al" -v ma="$mi_al" 'BEGIN{
+    rj = (j > 0) ? sprintf("%.4f", a/j) : " n/a  "
+    printf "%-8s ra %13d | mi %13d | je %13d | sys %13d | ra/mi %.4f | ra/je %s | ra/sys %.4f\n", n, a, m, j, s, a/m, rj, a/s
+    if (aa > 0 && ma > 0)
+      printf "%-8s   allocator only: ra %10d (%5.2f%% of program) | mi %10d | ra/mi %.4f | program floor if ours were free %.4f\n", "", aa, 100*aa/a, ma, aa/ma, (a-aa)/m
   }'
 }
+
+
+
 
 # PIN THE INTERPRETER'S HASH SEED. Perl randomises its hash seed per PROCESS,
 # so without this the same workload allocates a different pattern every run:
