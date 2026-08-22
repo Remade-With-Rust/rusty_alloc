@@ -828,8 +828,10 @@ impl Heap {
                 unsafe {
                     let pg: *mut Page = &raw mut (*seg).pages[1];
                     (*pg).xheap.store(self.delayed as usize, Ordering::Release);
-                    (*pg).flags
-                        .fetch_or(pflags::HUGE_SEGMENT | pflags::SINGLE_BLOCK, Ordering::Relaxed);
+                    (*pg).flags.fetch_or(
+                        pflags::HUGE_SEGMENT | pflags::SINGLE_BLOCK,
+                        Ordering::Relaxed,
+                    );
                     page_set_flag(pg, XFLAG_DELAYED);
                     (*seg).next = self.huge_segments;
                     self.huge_segments = seg;

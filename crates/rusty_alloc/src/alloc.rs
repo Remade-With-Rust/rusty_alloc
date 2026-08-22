@@ -1131,7 +1131,6 @@ unsafe fn free_general(p: *mut u8, seg: *mut Segment, pg: *mut Page, owner_tid: 
     }
 }
 
-
 /// Usable size of a live block (≥ requested); 0 for null. Any thread.
 ///
 /// # Safety

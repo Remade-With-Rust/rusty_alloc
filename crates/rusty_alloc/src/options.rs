@@ -69,23 +69,23 @@ const DEFAULTS: [i64; OPTION_COUNT] = [
     // abandoned_page_purge defaults ON (upstream does the same). An abandoned
     // segment has no owner to reuse its pages, so holding them resident buys
     // nothing and costs 32 MiB a time — the RSS tail measured against mimalloc.
-    0, 0, 0, 1,       // deprecated x3 / abandoned_page_purge(1)
-    1,       // eager_commit_delay
-    -1,      // purge_delay: v1 ships purging OPT-IN (see LEDGER M8 open defect)
-    0,       // use_numa_nodes
-    0,       // disallow_os_alloc
-    100,     // os_tag
-    32,      // max_errors
-    32,      // max_warnings
-    10,      // max_segment_reclaim (%)
-    0,       // destroy_on_exit
+    0, 0, 0, 1,         // deprecated x3 / abandoned_page_purge(1)
+    1,         // eager_commit_delay
+    -1,        // purge_delay: v1 ships purging OPT-IN (see LEDGER M8 open defect)
+    0,         // use_numa_nodes
+    0,         // disallow_os_alloc
+    100,       // os_tag
+    32,        // max_errors
+    32,        // max_warnings
+    10,        // max_segment_reclaim (%)
+    0,         // destroy_on_exit
     1_048_576, // arena_reserve (KiB = 1 GiB)
-    10,      // arena_purge_mult
-    1,       // purge_extend_delay
-    1,       // abandoned_reclaim_on_free
-    0,       // disallow_arena_alloc
-    400,     // retry_on_oom (ms)
-    0,       // visit_abandoned
+    10,        // arena_purge_mult
+    1,         // purge_extend_delay
+    1,         // abandoned_reclaim_on_free
+    0,         // disallow_arena_alloc
+    400,       // retry_on_oom (ms)
+    0,         // visit_abandoned
     0, 0, 0,     // guarded_min/max/precise
     1000,  // guarded_sample_rate
     0,     // guarded_sample_seed

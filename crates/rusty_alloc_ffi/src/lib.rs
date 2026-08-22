@@ -632,11 +632,7 @@ pub unsafe extern "C" fn mi_posix_memalign(
 /// # Safety
 /// As [`mi_posix_memalign`].
 #[inline]
-pub unsafe fn posix_memalign_impl(
-    out: *mut *mut c_void,
-    alignment: usize,
-    size: usize,
-) -> c_int {
+pub unsafe fn posix_memalign_impl(out: *mut *mut c_void, alignment: usize, size: usize) -> c_int {
     // Bound FIRST, then the power-of-two test. `is_power_of_two` is
     // `count_ones() == 1`, which LLVM expands to a non-zero test AND a
     // `x & (x - 1)` test; establishing `alignment >= size_of::<*mut _>()`

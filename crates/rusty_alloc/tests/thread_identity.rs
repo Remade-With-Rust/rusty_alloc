@@ -91,7 +91,10 @@ fn thread_id_is_unique_across_live_threads() {
          the local free path assumes exclusive ownership.",
         unique.len()
     );
-    assert!(!unique.contains(&0), "0 is the abandoned sentinel, never a live id");
+    assert!(
+        !unique.contains(&0),
+        "0 is the abandoned sentinel, never a live id"
+    );
 }
 
 #[test]

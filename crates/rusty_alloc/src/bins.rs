@@ -123,7 +123,10 @@ mod tests {
         // CONFIG_ARM64_16K_PAGES kernel). Assert the property, never a literal:
         // a hardcoded 4 KiB expectation here fails on aarch64-apple-darwin.
         let ps = crate::os::page_size();
-        assert!(ps.is_power_of_two() && ps >= 4096, "implausible page size {ps}");
+        assert!(
+            ps.is_power_of_two() && ps >= 4096,
+            "implausible page size {ps}"
+        );
 
         for size in [
             MEDIUM_OBJ_SIZE_MAX + 1,

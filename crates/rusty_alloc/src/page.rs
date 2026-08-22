@@ -242,10 +242,10 @@ pub unsafe fn block_next(page: *const Page, b: *const Block) -> *mut Block {
                 // for free from its `enc == 0` early return; this arm has no
                 // such return and must say so.
                 // One u16 load and a shift: SEGMENT_SLICE_SIZE is 2^16, so LLVM
-            // turns this constant multiply into `shl 16`. The obvious
-            // `capacity * block_size` is two loads and a real multiply, and
-            // measured +5 Ir/op worse on small/batch.
-            let extent = (*page).slice_count as usize * crate::types::SEGMENT_SLICE_SIZE;
+                // turns this constant multiply into `shl 16`. The obvious
+                // `capacity * block_size` is two loads and a real multiply, and
+                // measured +5 Ir/op worse on small/batch.
+                let extent = (*page).slice_count as usize * crate::types::SEGMENT_SLICE_SIZE;
                 if !n.is_null() && !link_is_plausible(n.addr(), b.addr(), extent) {
                     corrupt_free_list_abort();
                 }

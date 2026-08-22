@@ -818,4 +818,3 @@ pub unsafe fn huge_free(seg: *mut Segment) -> Result<(), PrimError> {
         os::free(block)
     }
 }
-

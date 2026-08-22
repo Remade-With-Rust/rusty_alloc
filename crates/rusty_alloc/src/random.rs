@@ -272,8 +272,14 @@ mod tests {
     fn state_layout_matches_rfc8439() {
         let mut r = Random::new();
         let key = [
-            0x0302_0100, 0x0706_0504, 0x0b0a_0908, 0x0f0e_0d0c, 0x1312_1110, 0x1716_1514,
-            0x1b1a_1918, 0x1f1e_1d1c,
+            0x0302_0100,
+            0x0706_0504,
+            0x0b0a_0908,
+            0x0f0e_0d0c,
+            0x1312_1110,
+            0x1716_1514,
+            0x1b1a_1918,
+            0x1f1e_1d1c,
         ];
         r.seed_from(key, 0xdead_beef_cafe_f00d);
         assert_eq!(
@@ -282,7 +288,11 @@ mod tests {
             "the four ChaCha constants are wrong"
         );
         assert_eq!(&r.state[4..12], &key, "key is not in words 4..12");
-        assert_eq!([r.state[12], r.state[13]], [0, 0], "counter must start at 0");
+        assert_eq!(
+            [r.state[12], r.state[13]],
+            [0, 0],
+            "counter must start at 0"
+        );
         assert_eq!(r.state[14], 0xcafe_f00d, "stream low word");
         assert_eq!(r.state[15], 0xdead_beef, "stream high word");
     }
@@ -298,7 +308,11 @@ mod tests {
         for _ in 0..16 {
             r.next_u32(); // forces exactly one refill
         }
-        assert_eq!([r.state[12], r.state[13]], [1, 0], "counter did not advance");
+        assert_eq!(
+            [r.state[12], r.state[13]],
+            [1, 0],
+            "counter did not advance"
+        );
 
         // Force the low word to wrap and confirm the carry reaches word 13.
         r.state[12] = u32::MAX;
@@ -354,8 +368,15 @@ mod tests {
                 x[b] = (x[b] ^ x[c]).rotate_left(7);
             }
         }
-        let expect: Vec<u32> = x.iter().zip(orig.iter()).map(|(a, b)| a.wrapping_add(*b)).collect();
-        assert_eq!(block, expect, "ChaCha8 block function diverged from the RFC construction");
+        let expect: Vec<u32> = x
+            .iter()
+            .zip(orig.iter())
+            .map(|(a, b)| a.wrapping_add(*b))
+            .collect();
+        assert_eq!(
+            block, expect,
+            "ChaCha8 block function diverged from the RFC construction"
+        );
         s = orig; // silence the unused-assignment lint on `s`
         let _ = s;
     }
