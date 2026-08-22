@@ -33,23 +33,43 @@ theirs; **lower is better**):
 
 | workload | vs mimalloc | vs jemalloc | vs glibc |
 |---|---:|---:|---:|
-| lua | **0.97** | **0.85** | 0.83 |
-| perl | **1.00** | **0.90** | 0.82 |
+| lua | **0.97** | **0.84** | 0.82 |
+| perl | **0.99** | **0.89** | 0.81 |
 | sqlite | **1.00** | **0.98** | 0.99 |
 
 We match mimalloc and come in **2–15% under jemalloc** (jemalloc 5.3.0) across
 all three real programs, and ~17% under glibc.
 
 The per-operation scan (small/med/big/large/huge, calloc, realloc, aligned,
-usable, batch and mixed working-set ops) measures **at-or-below mimalloc on
-11 of 13 operations**, ties one, and is 0.8% behind on batch. Per-op ratios vs
-mimalloc: small/med **0.71**, big/large **0.77**, realloc **0.76**, calloc
-**0.82**, mixed **0.88**, aligned **0.90**, usable 1.00, batch 1.008. Wall-clock
-time is deliberately not claimed: the measurement box cannot resolve it above
-its own noise floor, and instructions are not seconds. The 0.8% batch gap is a
-measured safe-Rust codegen floor on the free path's `used--` (mimalloc emits a
-memory-destination decrement LLVM will not select from Rust) — traced, not
-guessed; see `docs/opps.md`.
+usable, batch and mixed working-set ops) measures **below mimalloc on all 13
+operations**. Per-op ratios vs mimalloc: med **0.47**, small **0.49**, aligned **0.50**,
+realloc **0.51**, small_touch **0.51**, big/large **0.53**, calloc **0.63**,
+mixed **0.67**, usable **0.73**, batch lifo/fifo **0.89**, huge **0.01**.
+
+Five of those hold ONE BLOCK LIVE at a time, so the page empties on every free
+and what they measure is page retire-and-recarve rather than steady-state
+service. On workloads with a real working set — the honest number for a
+program — it is `liveset` **0.92** (65,536 live objects, random victim replaced
+each step), `shbench` **0.91** (bulk batches released in waves) and `xthread`
+**0.83** (every free performed by a non-owning thread). Wall-clock time is deliberately not claimed: the measurement box
+cannot resolve it above its own noise floor, and instructions are not seconds.
+
+Batch is the narrowest margin, and it is the one with a story. It sat at
+**1.008** after a ThreadSanitizer fix made a page-flags byte atomic, which
+costs exactly one instruction because LLVM will not fold an atomic load into a
+test's memory operand. That trade was kept — upstream reads the same byte
+non-atomically and has the race — and the instruction was won back elsewhere on
+the same path rather than by undoing it.
+
+`free`'s fast path is **21 instructions against mimalloc's 25**, down from 27.
+The `used--` codegen floor `docs/opps.md` recorded is closed: it took five
+instructions from safe Rust because LLVM will not emit a memory-destination
+read-modify-write when the value must also drive a branch, and it is two now,
+written directly. Resolving a pointer to its page went from nine instructions
+to five on the back of a per-slice owner table in the segment header. The flags
+test is the single row where upstream is still cheaper, and it stays that way
+deliberately: closing it would keep the read atomic in hardware while hiding it
+from the sanitizer that found the race.
 
 Correctness on real software: jq, sqlite3, python3, git, xz, zstd, lua and
 perl produce **byte-identical output** under rusty_alloc, mimalloc and glibc;

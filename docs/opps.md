@@ -152,7 +152,26 @@ growing the hot path's register pressure is the whole trick.
 
 ## Tier 3 — deterministic-latency, not instruction-hot
 
-### 6. The batch-op gap — TRACED, and it is a safe-Rust codegen floor
+### 6. The batch-op gap — CLOSED 2026-08-22 (it was a safe-Rust floor, not a hardware one)
+
+> **STATUS: CLOSED.** Everything below was correct about the cause and correct
+> that no arrangement of *safe Rust* could reach it — the two refutations it
+> records both stand. It was wrong only in the conclusion drawn from that.
+> `used--` is now **two instructions**, matching mimalloc, written as the
+> `sub dword ptr [pg + USED_OFFSET], 1` and `jle` that the hardware actually
+> needs, with the retire arm as an `asm!` label block (`asm_goto`, stable since
+> Rust 1.87). `free`'s fast path went 27 → 21 instructions against mimalloc's
+> 25, and `batch_lifo`/`batch_fifo` from 1.008× to **0.89×**. The remaining
+> row where upstream is cheaper is the atomic flags test, and that one is
+> declined on purpose — see the README.
+>
+> Kept in full because the analysis is the reason the fix is the shape it is:
+> LLVM will not emit a memory-destination read-modify-write when the
+> decremented value must also drive a branch, and it will even re-test a value
+> `dec` has already set the flags for. Read it as a record of how the floor was
+> established, not as an open item.
+
+
 
 **Where:** `free`'s `used` decrement, via [page.rs:page_push_local](../crates/rusty_alloc/src/page.rs#L625)
 and the retire branch in [alloc.rs:free_inline](../crates/rusty_alloc/src/alloc.rs#L598).

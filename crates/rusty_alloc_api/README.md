@@ -2,8 +2,8 @@
 
 The safe Rust surface over [`rusty_alloc`](https://crates.io/crates/rusty_alloc),
 a pure-Rust remake of mimalloc that measures at-or-below mimalloc on
-instructions retired for real programs (lua 0.97x, perl 1.00x, sqlite 1.00x) and
-below jemalloc across the board (lua 0.85x, perl 0.90x, sqlite 0.98x), while
+instructions retired for real programs (lua 0.97x, perl 0.99x, sqlite 1.00x) and
+below jemalloc across the board (lua 0.84x, perl 0.89x, sqlite 0.98x), while
 detecting double frees that upstream silently accepts and carrying no data race
 on its free path.
 
