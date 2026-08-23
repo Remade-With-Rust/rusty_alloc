@@ -23,7 +23,7 @@ are to try.
 
 | # | Location | Tier | Targets | Status |
 |---|---|---|---|---|
-| 1 | `page_index` division on the refill path | 1 | batch loss | **LANDED — whole-program win, not the batch one** |
+| 1 | `page_index` division on the refill path | 1 | batch loss | **CLOSED 2026-08-22 — the divide itself is gone, at zero header cost** |
 | 2 | `stat_realloc` re-resolves the heap per realloc | 1 | realloc | **LANDED — realloc −14.16 Ir/op** |
 | 3 | Emitted-bounds-check audit of the hot paths | 2 | unknown | **DONE — fast paths already bounds-check-free** |
 | 4 | `update_direct` recomputes `bin_size` twice | 2 | batch loss | **ASSESSED — premise false, the cheap version is already there** |
@@ -67,6 +67,38 @@ verified against the fit assertion in the default build AND under
 
 **Measure:** opscan batch_lifo / batch_fifo (the target), plus small / mixed as
 regression guards, and the three real-program arms.
+
+**CLOSED 2026-08-22.** The `page_off` table removed `page_index` from `page_of`
+(the whole-program win already recorded above), but the division itself
+survived at all five remaining call sites, emitting `movabs
+$0x2e8ba2e8ba2e8ba3; mul; shr` — a 3-instruction magic multiply with a 10-byte
+immediate — because 88 is `8 * 11`.
+
+**It needed no new field.** The fix proposed above was to store the slice index
+in a spare `Page` slot, and the risk recorded above was the 1 KiB of header
+that would cost. Neither was necessary: `Page::area` **already** holds
+`seg + idx * SEGMENT_SLICE_SIZE`, written once at carve, and
+`SEGMENT_SLICE_SIZE` is 2^16. So the index comes back as
+
+```rust
+let idx = ((*page).area.addr() - seg.addr()) / SEGMENT_SLICE_SIZE; // a shift
+```
+
+with the slot-pointer form kept as a `debug_assert`. Zero header cost, and the
+"foreclosed alternative" about padding `Page` to a power of two stays
+foreclosed and stays irrelevant.
+
+Two things had to be true and one of them was not:
+
+- `span_mark` writes `area` for **every** carved span, free or allocated — so
+  the free-span walkers at segment.rs:525 and :657 were already safe.
+- `huge_alloc` builds its single slot by hand and **never wrote `area`**, so
+  huge pages carried a null. That is fixed in the same change, and it was a
+  latent trap for anything else reaching for the field: `unalign` reads it now,
+  and huge pages set `SINGLE_BLOCK`, so they do not take its early return.
+
+Result: five magic multiplies to zero, cfrac **-17,057 Ir**, `huge` +5.00 Ir/op
+against mimalloc's 53,362. Full detail in `docs/plans/fast-trans.md`.
 
 ### 2. `stat_realloc` re-resolves the heap on every realloc
 
