@@ -30,7 +30,39 @@ members = [
 # ratios against mimalloc on real programs moved lua 0.75->0.66, perl
 # 0.95->0.83, sqlite 0.98->0.85; every op of the per-op scan is now BELOW
 # mimalloc, batch included.
-version = "1.0.1"
+#
+# 1.1.0 — MINOR, and minor rather than patch for exactly one reason: it adds a
+# public item, `bins::is_aligned_to`. Nothing is removed or changed, so every
+# 1.0.x user compiles unchanged. The new function is total — a non-power-of-two
+# alignment returns `false`, the conservative answer at every call site — which
+# is what makes it safe to expose. The other helpers this release introduced
+# (`div_by_block_size`, `exact_div_by_block_size`) are deliberately
+# `pub(crate)`: both carry preconditions and return a wrong value rather than
+# diverging outside them, and that does not belong in a frozen public API.
+#
+# The release itself: **the allocator no longer divides.** Zero `div`/`idiv`,
+# zero `divsd`/`divss`, zero 128-bit soft-division libcalls, and zero
+# magic-multiply divisions by `size_of::<Page>()` — verified in the shipped
+# object, not inferred from source. 60 `div` instructions removed in all.
+# `docs/opps.md` #1 (`page_index`'s divide by 88, open since it was filed) is
+# closed at ZERO header cost: `Page::area` already encodes the slice index and
+# `SEGMENT_SLICE_SIZE` is 2^16, so the index is a shift — the spare-field the
+# entry proposed was never needed. `free_general` went 148 instructions to 112
+# and `usable_size_slow` 93 to 55 when the block-size division's four-arm match
+# became a branchless reciprocal table.
+#
+# One latent defect fixed on the way: huge segments build their single page
+# slot by hand and never wrote `Page::area`, so it held null. Nothing read it
+# before; `page_index` and `unalign` both do now.
+#
+# Windows: the QPC tick-to-nanosecond conversion no longer calls `__udivti3`.
+#
+# Real-program numbers are UNCHANGED at the precision the README prints —
+# lua 0.97, perl 0.99, sqlite 1.00 whole-program; 0.66/0.83/0.85 allocator-only
+# — and all 13 per-op scans remain below mimalloc. This release is a
+# code-size and cycle result that the instruction counter mostly cannot see;
+# said plainly rather than dressed up.
+version = "1.1.0"
 edition = "2024"
 # MSRV. Declared for the first time in 1.0.1 because this release genuinely
 # needs it: `asm!` label blocks (`asm_goto`, stable 1.87) carry the free path's
