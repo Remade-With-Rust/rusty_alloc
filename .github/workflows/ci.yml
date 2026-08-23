@@ -2,6 +2,11 @@ name: ci
 on:
   push:
     branches: [main]
+    # A release tag runs the Kani proofs (see the `proofs` job). v1.1.0 shipped
+    # with a proof that had been broken by an unrelated optimisation, because
+    # nothing verified them at release time and the weekly cron below had never
+    # actually fired.
+    tags: ["v*"]
   pull_request:
   # Weekly advisory sweep (H-40): cargo-audit re-checks the RustSec feed even
   # when nothing is being merged. The same trigger runs the Kani proofs, which
@@ -94,7 +99,10 @@ jobs:
   # cover arithmetic that changes rarely, and a regression there would also
   # trip the property tests and Miri long before a release.
   proofs:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

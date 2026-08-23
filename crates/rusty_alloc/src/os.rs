@@ -68,16 +68,25 @@ pub fn page_align_up(size: usize) -> usize {
     let ps = page_size();
     // `div_ceil(ps) * ps` is a division by a RUNTIME value — a real `div`, and
     // this function is called from `purge`, `alloc_aligned` and the reservation
-    // paths, so LLVM emitted one into each. A page size is a power of two on
-    // every platform this builds for (asserted against the live value in
-    // `bins::good_size_above_binned_range_is_page_rounded`, and by the
-    // debug_assert below), and rounding up to a power of two is an add and a
-    // mask.
-    debug_assert!(
-        ps.is_power_of_two(),
-        "page_align_up assumes a power-of-two page size, got {ps}"
-    );
-    (size.max(1) + (ps - 1)) & !(ps - 1)
+    // paths, so LLVM emitted one into each: 26 divide instructions across the
+    // binary from this one line. Rounding up to a power of two is an add and a
+    // mask instead.
+    //
+    // The mask is built from the page size's TRAILING ZEROS rather than from
+    // `ps - 1` directly, which makes the power-of-two property structural
+    // instead of assumed. `ps` is read from an atomic cache of an OS value, so
+    // nothing in the type system says it is a power of two — an earlier
+    // version asserted it and Kani (correctly) refused the proof, because
+    // `ps - 1` underflows at `ps == 0` and the mask is only a round-up for a
+    // power of two. `1 << (tz & 63)` is a power of two for EVERY input,
+    // including 0 (`trailing_zeros` is 64 there, masked to 0, giving mask 0 and
+    // a returned `size.max(1)`), so the function is total and
+    // `good_size_never_shrinks_a_request` verifies again.
+    //
+    // On any real platform `1 << ps.trailing_zeros() == ps`, so this is the
+    // same round-up it always was, for one `tzcnt` and one `shl`.
+    let mask = (1usize << (ps.trailing_zeros() & 63)) - 1;
+    (size.max(1) + mask) & !mask
 }
 
 /// Reserve (and optionally commit) an aligned block of OS memory.

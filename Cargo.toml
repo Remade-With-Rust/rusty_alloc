@@ -62,7 +62,28 @@ members = [
 # — and all 13 per-op scans remain below mimalloc. This release is a
 # code-size and cycle result that the instruction counter mostly cannot see;
 # said plainly rather than dressed up.
-version = "1.1.0"
+#
+# 1.1.1 — patch. No API change, and no behaviour change on any platform whose
+# page size is a power of two, which is all of them. It restores the Kani
+# proof `good_size_never_shrinks_a_request`, which 1.1.0 broke.
+#
+# `page_align_up`'s round-up mask was built from `ps - 1`, guarded by a
+# `debug_assert` that the page size is a power of two. That assertion is true
+# on every real platform but is NOT provable: `ps` is read from an atomic
+# cache of an OS value, so Kani models it as arbitrary, where `ps - 1`
+# underflows at zero and the mask is not a round-up at all. The mask is now
+# built from the page size's trailing zeros — `1 << (tz & 63)` is a power of
+# two for EVERY input, including 0 — which makes the property structural
+# rather than asserted and the function total. On a real platform
+# `1 << ps.trailing_zeros() == ps`, so the arithmetic is unchanged for one
+# `tzcnt` and one `shl`; all 26 divide removals that motivated the mask stay,
+# and every opscan op is byte-identical.
+#
+# How it shipped: the `proofs` job runs only on a weekly cron and manual
+# dispatch, and that cron had NEVER fired — the harnesses had not run in CI
+# once, for any release. `ci.yml` now also runs them on `v*` tags, so a
+# release cannot ship an unverified proof again.
+version = "1.1.1"
 edition = "2024"
 # MSRV. Declared for the first time in 1.0.1 because this release genuinely
 # needs it: `asm!` label blocks (`asm_goto`, stable 1.87) carry the free path's
