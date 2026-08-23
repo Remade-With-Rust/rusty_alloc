@@ -74,11 +74,11 @@ pub fn malloc_small(arm: Arm, ops: u64, seed: u64) {
         Arm::Rusty => "ra",
         Arm::System => "sys",
     };
-    let mops = ops as f64 / dt.as_secs_f64() / 1e6;
-    println!(
-        "malloc-small arm={name} ops={ops} time={:.3}s throughput={mops:.2} Mops/s",
-        dt.as_secs_f64()
-    );
+    // `as_secs_f64` is itself a division, and it was called twice; `/ secs
+    // / 1e6` was a second `divsd` where one suffices.
+    let secs = dt.as_secs_f64();
+    let mops = ops as f64 / (secs * 1e6);
+    println!("malloc-small arm={name} ops={ops} time={secs:.3}s throughput={mops:.2} Mops/s");
     println!(
         "METHOD: in-process wall (inner-loop instrument), single thread, seed={seed}, live-set<=4096, touch-1-word; verdicts require pinvs.ps1 (pinned CPU-time ABBA)"
     );
@@ -170,10 +170,10 @@ pub fn larson(arm: Arm, threads: usize, ops_per_thread: u64, seed: u64) {
         Arm::Rusty => "ra",
         Arm::System => "sys",
     };
+    let secs = dt.as_secs_f64();
     println!(
-        "larson arm={name} threads={threads} ops={total_ops} time={:.3}s throughput={:.2} Mops/s remote_frees={remote_total}",
-        dt.as_secs_f64(),
-        total_ops as f64 / dt.as_secs_f64() / 1e6
+        "larson arm={name} threads={threads} ops={total_ops} time={secs:.3}s throughput={:.2} Mops/s remote_frees={remote_total}",
+        total_ops as f64 / (secs * 1e6)
     );
     println!(
         "METHOD: in-process wall, {threads} threads, 10% bleed via mpsc, live-set<=1024/thread, seed={seed}"
@@ -226,10 +226,10 @@ pub fn xmalloc(arm: Arm, pairs: usize, ops_per_pair: u64, seed: u64) {
         Arm::Rusty => "ra",
         Arm::System => "sys",
     };
+    let secs = dt.as_secs_f64();
     println!(
-        "xmalloc arm={name} pairs={pairs} blocks={freed} time={:.3}s throughput={:.2} Mops/s (every free is remote)",
-        dt.as_secs_f64(),
-        freed as f64 / dt.as_secs_f64() / 1e6
+        "xmalloc arm={name} pairs={pairs} blocks={freed} time={secs:.3}s throughput={:.2} Mops/s (every free is remote)",
+        freed as f64 / (secs * 1e6)
     );
     println!(
         "METHOD: in-process wall, {pairs} producer/consumer pairs, sync_channel(4096), seed={seed}"
@@ -241,13 +241,18 @@ pub fn xmalloc(arm: Arm, pairs: usize, ops_per_pair: u64, seed: u64) {
 /// hypothesis first; every number is ns/op so it can be compared against the
 /// ~15–25 ns a whole malloc+free pair costs.
 pub fn freepath_probe(iters: u64) {
+    // Every arm below divides by the SAME `iters`. One reciprocal, then a
+    // multiply per arm — `divsd` is 13-20 cycles and does not pipeline,
+    // `mulsd` is 4 and does. The last-ulp difference is invisible at the
+    // two decimals these print.
+    let per_iter = 1.0 / iters as f64;
     // (a) the floor: an empty loop the optimizer cannot delete.
     let t0 = Instant::now();
     let mut acc = 0usize;
     for i in 0..iters {
         acc = acc.wrapping_add(black_box(i as usize));
     }
-    let floor = t0.elapsed().as_nanos() as f64 / iters as f64;
+    let floor = t0.elapsed().as_nanos() as f64 * per_iter;
     black_box(acc);
 
     // (b) prim::thread_id() — called on EVERY free to decide local vs remote.
@@ -258,7 +263,7 @@ pub fn freepath_probe(iters: u64) {
     for _ in 0..iters {
         acc = acc.wrapping_add(black_box(rusty_alloc::prim::thread_id()));
     }
-    let tid = t0.elapsed().as_nanos() as f64 / iters as f64;
+    let tid = t0.elapsed().as_nanos() as f64 * per_iter;
     black_box(acc);
 
     // (c) the candidate replacement: a const-init thread_local cache.
@@ -271,7 +276,7 @@ pub fn freepath_probe(iters: u64) {
     for _ in 0..iters {
         acc = acc.wrapping_add(black_box(TID.with(|c| c.get())));
     }
-    let cached = t0.elapsed().as_nanos() as f64 / iters as f64;
+    let cached = t0.elapsed().as_nanos() as f64 * per_iter;
     black_box(acc);
 
     // (d) a real malloc+free pair of a small block, for scale.
@@ -281,7 +286,7 @@ pub fn freepath_probe(iters: u64) {
         // SAFETY: fresh block, freed once.
         unsafe { rusty_alloc::alloc::free(p) };
     }
-    let pair = t0.elapsed().as_nanos() as f64 / iters as f64;
+    let pair = t0.elapsed().as_nanos() as f64 * per_iter;
 
     println!("freepath-probe iters={iters}");
     println!("  (a) loop floor            : {floor:.2} ns/op");
@@ -302,12 +307,17 @@ pub fn freepath_probe(iters: u64) {
 pub fn tls_spike(iters: u64) {
     // (a) static atomic — the no-TLS lower bound.
     static S: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+    // Every arm below divides by the SAME `iters`. One reciprocal, then a
+    // multiply per arm — `divsd` is 13-20 cycles and does not pipeline,
+    // `mulsd` is 4 and does. The last-ulp difference is invisible at the
+    // two decimals these print.
+    let per_iter = 1.0 / iters as f64;
     let t0 = Instant::now();
     let mut acc = 0usize;
     for _ in 0..iters {
         acc = acc.wrapping_add(black_box(S.load(std::sync::atomic::Ordering::Relaxed)));
     }
-    let a = t0.elapsed().as_nanos() as f64 / iters as f64;
+    let a = t0.elapsed().as_nanos() as f64 * per_iter;
     black_box(acc);
 
     // (b) thread_local! Cell — the idiomatic candidate (lazy-init check inside).
@@ -319,7 +329,7 @@ pub fn tls_spike(iters: u64) {
     for _ in 0..iters {
         acc = acc.wrapping_add(black_box(TL.with(|c| c.get())));
     }
-    let b = t0.elapsed().as_nanos() as f64 / iters as f64;
+    let b = t0.elapsed().as_nanos() as f64 * per_iter;
     black_box(acc);
 
     // (c) prim TlsSlot (FlsGetValue / pthread_getspecific) — the C-shaped candidate.
@@ -330,7 +340,7 @@ pub fn tls_spike(iters: u64) {
     for _ in 0..iters {
         acc = acc.wrapping_add(black_box(slot.get()) as usize);
     }
-    let c = t0.elapsed().as_nanos() as f64 / iters as f64;
+    let c = t0.elapsed().as_nanos() as f64 * per_iter;
     black_box(acc);
 
     println!("tls-spike iters={iters}");

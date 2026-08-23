@@ -164,7 +164,7 @@ pub unsafe fn page_of(seg: *mut Segment, p: *mut u8) -> *mut Page {
             {
                 let base: *mut Page = (&raw mut (*seg).pages).cast();
                 let slot = base.add(idx);
-                let back = (*slot).slice_offset as usize;
+                let back = (*slot).slice_offset as usize * slot_stride();
                 back <= idx * core::mem::size_of::<Page>()
                     && slot.cast::<u8>().sub(back).cast::<Page>()
                         == seg.cast::<u8>().add(off).cast::<Page>()
@@ -175,18 +175,21 @@ pub unsafe fn page_of(seg: *mut Segment, p: *mut u8) -> *mut Page {
     }
 }
 
-/// Byte distance between adjacent slice slots — the unit of
-/// [`Page::slice_offset`].
+/// Byte distance between adjacent slice slots. No longer the unit of
+/// [`Page::slice_offset`], which counts slices; this scales it where a byte
+/// distance is actually wanted.
 #[inline]
 pub const fn slot_stride() -> usize {
     core::mem::size_of::<Page>()
 }
 
 // A span can start at most SLICES_PER_SEGMENT-1 slots before an interior slot,
-// so the byte offset must fit the u16 it is stored in.
+// so the slice distance must fit the u16 it is stored in. This had far less
+// headroom when the field held bytes: 511 * 88 = 44,968, inside u16 but only
+// just — a larger `Page` or segment would have overflowed it silently.
 const _: () = assert!(
-    (SLICES_PER_SEGMENT - 1) * core::mem::size_of::<Page>() <= u16::MAX as usize,
-    "slice_offset (bytes) must fit in u16"
+    SLICES_PER_SEGMENT - 1 <= u16::MAX as usize,
+    "slice_offset (slices) must fit in u16"
 );
 
 /// Payload start of the page whose slot index is `idx`.
@@ -205,9 +208,29 @@ pub unsafe fn page_area(seg: *mut Segment, idx: usize) -> *mut u8 {
 /// `page` must be a slot inside `seg`'s table.
 #[inline]
 pub unsafe fn page_index(seg: *mut Segment, page: *mut Page) -> usize {
+    // From the SLOT pointer this is `(page - base) / size_of::<Page>()`, and
+    // `size_of::<Page>()` is 88 — `8 * 11`, not a power of two — so LLVM emits
+    // `movabs $0x2e8ba2e8ba2e8ba3; mul; shr`, a 3-instruction magic multiply
+    // with a 10-byte immediate. That is `docs/opps.md` #1, and it appeared at
+    // all five call sites.
+    //
+    // `Page::area` is `seg + idx * SEGMENT_SLICE_SIZE` (written by `span_mark`
+    // for every carved span, free or allocated, and by `huge_alloc` for its
+    // one slot), and SEGMENT_SLICE_SIZE **is** a power of two. Recovering the
+    // index through the payload pointer is therefore a shift.
+    //
     // SAFETY: both point into the same header per the contract.
-    let base: *mut Page = unsafe { (&raw mut (*seg).pages).cast() };
-    (page.addr() - base.addr()) / core::mem::size_of::<Page>()
+    unsafe {
+        let idx = ((*page).area.addr() - seg.addr()) / SEGMENT_SLICE_SIZE;
+        debug_assert!(
+            {
+                let base: *mut Page = (&raw mut (*seg).pages).cast();
+                idx == (page.addr() - base.addr()) / core::mem::size_of::<Page>()
+            },
+            "page_index: Page::area disagrees with the slot-pointer form"
+        );
+        idx
+    }
 }
 
 /// Spin until no page of `seg` has a remote free IN FLIGHT.
@@ -363,15 +386,13 @@ unsafe fn span_mark(seg: *mut Segment, idx: usize, len: usize) {
         let base: *mut Page = (&raw mut (*seg).pages).cast();
         let mut slot = base.wrapping_add(idx + 1);
         let mut ent = tab.wrapping_add(idx + 1);
-        let mut off = slot_stride();
         let mut j = 1;
         while j < len {
-            // BYTES back to the span start, not slices — see Page::slice_offset.
-            (*slot).slice_offset = off as u16;
+            // SLICES back to the span start, not bytes — see Page::slice_offset.
+            (*slot).slice_offset = j as u16;
             *ent = owner;
             slot = slot.wrapping_add(1);
             ent = ent.wrapping_add(1);
-            off += slot_stride();
             j += 1;
         }
     }
@@ -465,7 +486,7 @@ pub unsafe fn debug_validate_segment(seg: *mut Segment, where_: &str) {
                 for j in 1..len {
                     assert_eq!(
                         (*seg).pages[idx + j].slice_offset as usize,
-                        j * slot_stride(),
+                        j,
                         "{where_}: slice {} lost its back-pointer",
                         idx + j
                     );
@@ -591,10 +612,10 @@ pub unsafe fn span_free(seg: *mut Segment, page: *mut Page) -> bool {
         // Merge left: follow the left slot back to its span start.
         if idx > HEADER_SLICES {
             let lslot_idx = idx - 1;
-            // slice_offset is in bytes; convert back to a slot index here (cold
-            // path — coalescing, not the free fast path).
-            let lstart_idx =
-                lslot_idx - (*seg).pages[lslot_idx].slice_offset as usize / slot_stride();
+            // slice_offset counts SLICES, so the span start is a subtract.
+            // This was `bytes / slot_stride()` — a `movabs; mul; shr` magic
+            // multiply by 88, `docs/opps.md` #1, now gone.
+            let lstart_idx = lslot_idx - (*seg).pages[lslot_idx].slice_offset as usize;
             let lstart: *mut Page = &raw mut (*seg).pages[lstart_idx];
             if (*lstart).block_size == 0 {
                 span_list_remove(seg, lstart);
@@ -698,7 +719,11 @@ pub fn huge_alloc(
     // Worst-case room for placing the block within the reservation. The area
     // is 64 KiB-aligned, so only larger alignments — or offsets that shift
     // the placement off the natural boundary — need slack.
-    let extra = if align > SEGMENT_SLICE_SIZE || !offset.is_multiple_of(align) {
+    // `is_multiple_of` on a RUNTIME `align` is a modulo, i.e. a `div`.
+    // `bins::is_aligned_to` is the mask, and its conservative direction is the
+    // safe one here: a `false` makes this reserve the extra slack it would have
+    // reserved for a misaligned offset anyway.
+    let extra = if align > SEGMENT_SLICE_SIZE || !crate::bins::is_aligned_to(offset, align) {
         align
     } else {
         0
@@ -755,6 +780,19 @@ pub fn huge_alloc(
         (*page).reserved = 1;
         (*page).slice_count = (SLICES_PER_SEGMENT - 1) as u16;
         (*page).slice_offset = 0;
+        // `header == SEGMENT_SLICE_SIZE`, so this is exactly `page_area(seg, 1)`.
+        // Huge segments build their one slot by hand instead of through
+        // `span_mark`, which is the only other writer of this field — so this
+        // was the single page in the allocator whose `area` stayed null.
+        // `page_index` and `unalign` both read it now, and both are reachable
+        // for a huge block (`SINGLE_BLOCK` is set, so `unalign` does not take
+        // its early return).
+        (*page).area = area;
+        debug_assert_eq!(
+            (*page).area,
+            page_area(seg, 1),
+            "huge: area != page_area(1)"
+        );
         (*page).flags.store(
             crate::page::pflags::HUGE_SEGMENT | crate::page::pflags::SINGLE_BLOCK,
             Ordering::Relaxed,
@@ -770,8 +808,8 @@ pub fn huge_alloc(
         *tab.wrapping_add(1) = owner;
         let mut j = 2;
         while j < SLICES_PER_SEGMENT {
-            // Bytes back to slot 1, which holds this huge block's page data.
-            (*seg).pages[j].slice_offset = ((j - 1) * slot_stride()) as u16;
+            // Slices back to slot 1, which holds this huge block's page data.
+            (*seg).pages[j].slice_offset = (j - 1) as u16;
             *tab.wrapping_add(j) = owner;
             j += 1;
         }

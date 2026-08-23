@@ -191,21 +191,107 @@ pub(super) fn thread_id() -> usize {
     (unsafe { GetCurrentThreadId() }) as usize
 }
 
+/// Ticks to nanoseconds. `scale` is `1e9 / freq` when that quotient is exact,
+/// and 0 when it is not.
+///
+/// The `u128` arm is not one instruction, or even a slow one: a 128-bit
+/// division on x86-64 is a `__udivti3` **libcall**. When `scale` is exact the
+/// whole conversion collapses to a single 64-bit multiply.
+#[inline]
+fn ticks_to_ns(count: u64, freq: u64, scale: u64) -> u64 {
+    if scale != 0 {
+        // count * (1e9 / freq). Exact by construction, and a u64 product does
+        // not wrap before ~292 years of nanoseconds.
+        count.wrapping_mul(scale)
+    } else {
+        ((u128::from(count) * 1_000_000_000u128) / u128::from(freq.max(1))) as u64
+    }
+}
+
 pub(super) fn clock_now() -> u64 {
     static FREQ: AtomicU64 = AtomicU64::new(0);
-    let mut freq = FREQ.load(Ordering::Relaxed);
+    // `1e9 / freq` when exact, else 0. QueryPerformanceFrequency is documented
+    // as fixed for the life of the process, so this is computed once. Every
+    // TSC-backed Windows since 8 reports 10 MHz, for which the quotient is
+    // exactly 100 — so the common case never divides at all.
+    static SCALE: AtomicU64 = AtomicU64::new(0);
+
+    // Acquire pairs with the Release store of FREQ below, so a thread that
+    // observes an initialised FREQ also observes the SCALE computed with it.
+    let mut freq = FREQ.load(Ordering::Acquire);
     if freq == 0 {
         let mut f = 0i64;
         // SAFETY: out-param is a valid local; QPF cannot fail on XP+.
         unsafe { QueryPerformanceFrequency(&mut f) };
         freq = f.max(1) as u64;
-        FREQ.store(freq, Ordering::Relaxed);
+        let scale = if 1_000_000_000u64.is_multiple_of(freq) {
+            1_000_000_000u64 / freq
+        } else {
+            0
+        };
+        SCALE.store(scale, Ordering::Relaxed);
+        FREQ.store(freq, Ordering::Release);
     }
     let mut count = 0i64;
     // SAFETY: out-param is a valid local.
     unsafe { QueryPerformanceCounter(&mut count) };
-    // counts * ns_per_s / freq, in u128 to avoid overflow (~292 years of ns).
-    ((count as u128 * 1_000_000_000u128) / freq as u128) as u64
+    ticks_to_ns(count.max(0) as u64, freq, SCALE.load(Ordering::Relaxed))
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::ticks_to_ns;
+
+    /// The reference the fast path has to reproduce, bit for bit.
+    fn reference(count: u64, freq: u64) -> u64 {
+        ((count as u128 * 1_000_000_000u128) / freq as u128) as u64
+    }
+
+    fn scale_for(freq: u64) -> u64 {
+        if 1_000_000_000u64.is_multiple_of(freq) {
+            1_000_000_000u64 / freq
+        } else {
+            0
+        }
+    }
+
+    #[test]
+    fn exact_scale_matches_the_u128_reference() {
+        // 10 MHz is what every TSC-backed Windows since 8 reports; the others
+        // are exact divisors of 1e9 that a hypervisor could plausibly pick.
+        for freq in [10_000_000u64, 1_000_000, 100_000, 1_000, 1] {
+            assert_eq!(scale_for(freq), 1_000_000_000 / freq, "freq {freq}");
+            for count in [0u64, 1, 7, 12_345, 1 << 20, 1 << 32, 86_400 * freq] {
+                assert_eq!(
+                    ticks_to_ns(count, freq, scale_for(freq)),
+                    reference(count, freq),
+                    "freq {freq} count {count}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inexact_frequency_falls_back_and_stays_correct() {
+        // The classic pre-Win8 PIT-derived frequency: 1e9 / 3_579_545 is not
+        // an integer, so the fast path must NOT be taken.
+        let freq = 3_579_545u64;
+        assert_eq!(scale_for(freq), 0, "3.579545 MHz must not get a scale");
+        for count in [0u64, 1, 3_579_545, 1 << 32] {
+            assert_eq!(ticks_to_ns(count, freq, 0), reference(count, freq));
+        }
+    }
+
+    #[test]
+    fn a_day_of_ticks_does_not_wrap() {
+        let freq = 10_000_000u64;
+        let day = 86_400 * freq;
+        assert_eq!(
+            ticks_to_ns(day, freq, scale_for(freq)),
+            86_400 * 1_000_000_000,
+            "one day must convert exactly"
+        );
+    }
 }
 
 pub(super) struct TlsSlotImpl(u32);

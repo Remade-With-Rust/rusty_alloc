@@ -26,12 +26,45 @@ unsafe fn unalign(pg: *mut Page, p: *mut u8) -> *mut u8 {
         if (*pg).flags.load(Ordering::Relaxed) & (pflags::HAS_ALIGNED | pflags::SINGLE_BLOCK) == 0 {
             return p;
         }
-        let seg = segment_of(p);
-        let idx = segment::page_index(seg, pg);
-        let area = segment::page_area(seg, idx);
+        // `page_area(seg, page_index(seg, pg))` recovers a value the page is
+        // already carrying. `Page::area` IS `seg + idx * SEGMENT_SLICE_SIZE`,
+        // written once at carve, so the round-trip through a slot index buys
+        // nothing and costs `segment_of`'s mask, a `movabs; mul; shr` magic
+        // divide by `size_of::<Page>()` (88 = 8 * 11 — `docs/opps.md` #1) and
+        // the scale back up. One load replaces all of it.
+        let area = (*pg).area;
+        debug_assert!(
+            {
+                let seg = segment_of(p);
+                area == segment::page_area(seg, segment::page_index(seg, pg))
+            },
+            "unalign: Page::area disagrees with page_area(page_index(..))"
+        );
+        // One block, and it begins at `area` — the old code reached the same
+        // answer through `(off / bsize) * bsize` with `off < bsize`, paying a
+        // division to compute zero.
+        if (*pg).flags.load(Ordering::Relaxed) & pflags::SINGLE_BLOCK != 0 {
+            return area;
+        }
         let off = p.addr() - area.addr();
         let bsize = (*pg).block_size;
-        area.add((off / bsize) * bsize)
+        // `off / bsize` by a RUNTIME divisor is a real `div`, and because this
+        // function inlines into `free_general`, `usable_size_slow`,
+        // `malloc_aligned_at_slow` and the aligned realloc family, that ONE
+        // source division was emitted right across the binary.
+        //
+        // Two facts remove it. A SINGLE_BLOCK page holds exactly one block and
+        // it starts at `area`, so the round-down is the identity there and
+        // needs no arithmetic — which also excludes the only pages whose
+        // `block_size` is not a bin size (`slices * SEGMENT_SLICE_SIZE`, any
+        // odd part). What remains is a BINNED page, and every bin size is
+        // `odd << k` with odd in {1,3,5,7}, so the division is by one of four
+        // compile-time constants. See `bins::div_by_block_size`.
+        // With SINGLE_BLOCK handled above, `bsize` is necessarily
+        // `bins::bin_size(bin)`, so `div_by_block_size` applies and its
+        // diverging arm is unreachable. This removes the `div` from all five
+        // functions this one inlines into.
+        area.add(crate::bins::div_by_block_size(off, bsize) * bsize)
     }
 }
 
@@ -609,7 +642,7 @@ pub unsafe fn realloc_aligned_at(
     let usable = unsafe { usable_size(p) };
     if newsize <= usable
         && newsize >= usable / 2
-        && (p.addr() + offset).is_multiple_of(align.max(1))
+        && crate::bins::is_aligned_to(p.addr() + offset, align)
     {
         stat_realloc(true);
         return p;
@@ -682,7 +715,7 @@ pub unsafe fn rezalloc_aligned_at(
     let usable = unsafe { usable_size(p) };
     if newsize <= usable
         && newsize >= usable / 2
-        && (p.addr() + offset).is_multiple_of(align.max(1))
+        && crate::bins::is_aligned_to(p.addr() + offset, align)
     {
         stat_realloc(true);
         return p;

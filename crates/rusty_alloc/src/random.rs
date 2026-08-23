@@ -134,9 +134,25 @@ impl Random {
     }
 
     /// Uniform-ish in `[0, n)` (n > 0).
+    ///
+    /// Lemire's multiply-shift rather than `% n`. A modulo by a RUNTIME value
+    /// is a `div` — 20-40 cycles, not pipelined — and it was the only division
+    /// left in `Heap::try_guarded` and `guarded_set_sample_rate`. Taking the
+    /// high half of a widening multiply is ONE instruction (`mul`), so unlike
+    /// the reciprocal substitutions this file's sibling plan records as
+    /// refuted, this is strictly fewer instructions as well as fewer cycles.
+    ///
+    /// The distribution is the same "uniform-ish" this already promised: both
+    /// forms are biased for an `n` that does not divide the generator's range,
+    /// and Lemire's bias is the smaller of the two. Both callers pick a
+    /// sampling interval for the `guarded` feature, where the bias is
+    /// immaterial.
     #[inline]
     pub fn below(&mut self, n: usize) -> usize {
-        if n <= 1 { 0 } else { self.next_usize() % n }
+        if n <= 1 {
+            return 0;
+        }
+        ((self.next_usize() as u128 * n as u128) >> usize::BITS) as usize
     }
 }
 

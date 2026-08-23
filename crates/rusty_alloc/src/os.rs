@@ -66,7 +66,18 @@ pub fn large_page_size() -> usize {
 /// Round `size` up to a whole number of OS pages (never 0).
 pub fn page_align_up(size: usize) -> usize {
     let ps = page_size();
-    size.max(1).div_ceil(ps) * ps
+    // `div_ceil(ps) * ps` is a division by a RUNTIME value — a real `div`, and
+    // this function is called from `purge`, `alloc_aligned` and the reservation
+    // paths, so LLVM emitted one into each. A page size is a power of two on
+    // every platform this builds for (asserted against the live value in
+    // `bins::good_size_above_binned_range_is_page_rounded`, and by the
+    // debug_assert below), and rounding up to a power of two is an add and a
+    // mask.
+    debug_assert!(
+        ps.is_power_of_two(),
+        "page_align_up assumes a power-of-two page size, got {ps}"
+    );
+    (size.max(1) + (ps - 1)) & !(ps - 1)
 }
 
 /// Reserve (and optionally commit) an aligned block of OS memory.
@@ -88,9 +99,11 @@ pub fn alloc_aligned(
     // SAFETY: size is page-multiple and > 0, alignment a power of two; the
     // returned mapping is owned by the OsBlock we hand out.
     let a = unsafe { prim::alloc(size, alignment, commit, allow_large)? };
-    debug_assert_eq!(
-        (a.ptr as usize) % alignment,
-        0,
+    // `% alignment` by a RUNTIME divisor is a real `div`. Debug-only, but
+    // `debug_checks` runs the whole datasweep corpus, so it is worth the mask
+    // — same substitution as the five release sites (D7).
+    debug_assert!(
+        crate::bins::is_aligned_to(a.ptr as usize, alignment),
         "prim returned misaligned block"
     );
     Ok(OsBlock {

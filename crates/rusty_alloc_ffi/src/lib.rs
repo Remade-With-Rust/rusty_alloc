@@ -1171,7 +1171,7 @@ pub unsafe extern "C" fn mi_heap_realloc_aligned_at(
         let usable = alloc::usable_size(p.cast());
         if newsize <= usable
             && newsize >= usable / 2
-            && (p as usize + offset).is_multiple_of(alignment.max(1))
+            && rusty_alloc::bins::is_aligned_to(p as usize + offset, alignment)
         {
             return p;
         }
@@ -1256,7 +1256,7 @@ pub unsafe extern "C" fn mi_heap_rezalloc_aligned_at(
         let usable = alloc::usable_size(p.cast());
         if newsize <= usable
             && newsize >= usable / 2
-            && (p as usize + offset).is_multiple_of(alignment.max(1))
+            && rusty_alloc::bins::is_aligned_to(p as usize + offset, alignment)
         {
             return p;
         }

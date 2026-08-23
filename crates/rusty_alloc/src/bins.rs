@@ -52,7 +52,7 @@ pub const fn bin_size(bin: usize) -> usize {
     }
 }
 
-/// `mi_good_size`: the size actually allocated for a request — the bin's block
+/// `mi_good_size`: the size actually allocated for a request â€” the bin's block
 /// size for binned sizes, page-rounded for huge ones.
 #[inline]
 pub fn good_size(size: usize) -> usize {
@@ -63,6 +63,126 @@ pub fn good_size(size: usize) -> usize {
     }
 }
 
+/// Is `x` a multiple of `align`, without a `div`?
+///
+/// `usize::is_multiple_of` on a RUNTIME divisor is a modulo, and a modulo is a
+/// `div` — 20-40 cycles, not pipelined. Alignment is a power of two by the C
+/// contract, and the aligned-allocation path already relies on that a few lines
+/// away (`& !(align - 1)` appears twice in `malloc_aligned_at_slow`), so the
+/// test is a mask.
+///
+/// The power-of-two check is kept rather than assumed, and it makes the
+/// function total: a caller that passes a non-power-of-two gets `false`, which
+/// is the CONSERVATIVE answer at every call site — each one falls back to the
+/// general path rather than taking an in-place or same-bin shortcut. A mask
+/// alone would be unsound there (`4 & (3-1) == 0` says "aligned to 3").
+#[inline(always)]
+pub fn is_aligned_to(x: usize, align: usize) -> bool {
+    let a = align.max(1);
+    a.is_power_of_two() && (x & (a - 1)) == 0
+}
+
+/// `ceil(2^32 / odd)` for the four odd parts a bin size can have, indexed by
+/// `odd >> 1`: 1 -> 0, 3 -> 1, 5 -> 2, 7 -> 3.
+///
+/// Derived, never transcribed. The `odd == 1` entry is exactly `2^32`, so the
+/// same multiply-high returns `m` unchanged and needs no special case — which
+/// is what makes the lookup branchless.
+const RECIP32: [u64; 4] = [recip32(1), recip32(3), recip32(5), recip32(7)];
+
+const fn recip32(d: u64) -> u64 {
+    (1u64 << 32).div_ceil(d)
+}
+
+/// `n / bsize` for any `bsize` that is a bin's block size, WITHOUT a `div`.
+///
+/// A division by a runtime value is a real `div` — 20-40 cycles and not
+/// pipelined. This removes it using a fact about this allocator's bin
+/// geometry: **every bin size is `odd << k` with `odd` in {1, 3, 5, 7}**.
+/// Bins 1..=8 are `bin * 8`, and above that `bin_size` is
+/// `((5 + m) << (b - 2)) * 8` with `m` in 0..=3, so the odd factor is only
+/// ever 5, 3 (from 6), 7, or 1 (from 8). Shift the power of two out and the
+/// divisor is one of four constants.
+///
+/// **Branchless, by table rather than by `match`.** A four-arm match was the
+/// first form, and it cost a three-way compare tree plus THREE `movabs; mul;
+/// shr` magic multiplies — one per arm, so nine of those instructions were
+/// dead on any given call, in both `free_general` and `usable_size_slow`.
+/// Indexing `RECIP32` by the odd part costs one load and keeps one multiply.
+///
+/// Unlike the modular-inverse trick ([`exact_div_by_block_size`],
+/// `odd_mod_inverse`), this is correct for an arbitrary dividend — it does not
+/// require `n` to be a multiple of `bsize` — which is what makes it usable on
+/// the interior pointers `unalign` and `usable_size` are handed.
+///
+/// # Bounds
+/// The reciprocals are 32-bit, so the identity holds for `n >> k` below 2^30
+/// (the tightest arm, `odd == 5`, is exact to 2^30; the others reach further).
+/// Every caller is bounded by page geometry — the largest dividend any of them
+/// can present is one page payload, `MEDIUM_PAGE_SLICES * SEGMENT_SLICE_SIZE`
+/// = 2^19, and `k >= 3` shrinks it further. Debug builds assert it.
+#[inline(always)]
+pub(crate) fn div_by_block_size(n: usize, bsize: usize) -> usize {
+    let k = bsize.trailing_zeros();
+    let odd = bsize >> k;
+    let m = (n >> k) as u64;
+    debug_assert!(
+        matches!(odd, 1 | 3 | 5 | 7),
+        "bin_size {bsize} has odd part {odd}, outside the {{1,3,5,7}} this relies on"
+    );
+    debug_assert!(
+        m < (1 << 30),
+        "div_by_block_size: {n} >> {k} exceeds the bound the 32-bit reciprocals are exact over"
+    );
+    ((m * RECIP32[(odd >> 1) & 3]) >> 32) as usize
+}
+
+/// `n / bsize` when `n` is a KNOWN MULTIPLE of `bsize`.
+///
+/// Cheaper than [`div_by_block_size`] and strictly less general. Dividing by a
+/// constant is a multiply-high plus a shift (`movabs; mul; shr`, and `mul`
+/// clobbers `rdx`); dividing an exact multiple is the modular inverse, a
+/// single `imul` with no high half and no shift.
+///
+/// The four inverses are derived at compile time from `odd_mod_inverse`, not
+/// transcribed — a mistyped digit here would produce plausible garbage rather
+/// than a compile error.
+///
+/// # Correctness
+/// `n` **must** be a multiple of `bsize`. For anything else this returns a
+/// meaningless value rather than a rounded-down quotient: the inverse maps
+/// non-multiples across the whole 64-bit range. Use [`div_by_block_size`] on
+/// interior pointers. Debug builds assert the precondition.
+#[inline(always)]
+pub(crate) fn exact_div_by_block_size(n: usize, bsize: usize) -> usize {
+    const INV3: usize = crate::page::odd_mod_inverse(3);
+    const INV5: usize = crate::page::odd_mod_inverse(5);
+    const INV7: usize = crate::page::odd_mod_inverse(7);
+
+    let k = bsize.trailing_zeros();
+    let odd = bsize >> k;
+    debug_assert!(
+        bsize != 0 && n.is_multiple_of(bsize),
+        "exact_div_by_block_size: {n} is not a multiple of {bsize}"
+    );
+    let n = n >> k;
+    match odd {
+        1 => n,
+        3 => n.wrapping_mul(INV3),
+        5 => n.wrapping_mul(INV5),
+        7 => n.wrapping_mul(INV7),
+        // Diverges for the same reason `div_by_block_size`'s arm does: a
+        // computing fallback lets LLVM merge the arms back into one runtime
+        // division.
+        _ => unreachable!("block_size {bsize} has odd part {odd}, not in {{1,3,5,7}}"),
+    }
+}
+
+/// `max(1, 4096 / bin_size(bin))` for every bin — `page_extend`'s batch size,
+/// resolved at compile time. **Measured and NOT adopted** — see the refutation
+/// at the `let take` line in `page::page_extend`. Kept because the measurement
+/// is worth more than the deletion: it is the table anyone will reach for.
+///
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,6 +270,100 @@ mod tests {
         for size in 65..=MEDIUM_OBJ_SIZE_MAX {
             let g = good_size(size);
             assert!(g - size <= size / 4 + 16, "waste {g}-{size} too large");
+        }
+    }
+}
+
+#[cfg(test)]
+mod div_helper_tests {
+    use super::*;
+
+    /// `div_by_block_size` IS wired into `unalign` (D11). The identity it rests on
+    /// is worth pinning independently of that: if a future bin geometry produced
+    /// an odd factor outside {1,3,5,7}, the branchless `RECIP32` lookup would
+    /// silently index the wrong reciprocal and return a wrong quotient rather
+    /// than diverge — which is exactly what this test exists to prevent.
+    /// (Debug builds also assert it at the call.)
+    #[test]
+    fn every_bin_size_has_odd_part_in_1_3_5_7() {
+        for bin in 1..BIN_COUNT {
+            let bs = bin_size(bin);
+            if bs == 0 {
+                continue;
+            }
+            let odd = bs >> bs.trailing_zeros();
+            assert!(
+                matches!(odd, 1 | 3 | 5 | 7),
+                "bin {bin} size {bs} has odd part {odd}"
+            );
+        }
+    }
+
+    /// And that the helper equals real division for every bin size over a
+    /// dividend range that spans whole blocks and interior offsets alike.
+    #[test]
+    fn div_by_block_size_equals_real_division() {
+        for bin in 1..BIN_COUNT {
+            let bs = bin_size(bin);
+            if bs == 0 {
+                continue;
+            }
+            for n in [0usize, 1, bs - 1, bs, bs + 1, 3 * bs, 3 * bs + 7, 1 << 20] {
+                assert_eq!(
+                    div_by_block_size(n, bs),
+                    n / bs,
+                    "div_by_block_size({n}, {bs})"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod exact_div_tests {
+    use super::{bin_size, div_by_block_size, exact_div_by_block_size};
+
+    /// The inverses are derived, so prove the derivation: for every bin size
+    /// and every exact multiple, the cheap form must equal real division.
+    #[test]
+    fn exact_form_matches_real_division_for_every_bin() {
+        for bin in 1..=40usize {
+            let bs = bin_size(bin);
+            if bs == 0 {
+                continue;
+            }
+            for k in [0usize, 1, 2, 3, 17, 255, 4095] {
+                let n = k * bs;
+                assert_eq!(
+                    exact_div_by_block_size(n, bs),
+                    n / bs,
+                    "bin {bin} bsize {bs} multiple {k}"
+                );
+            }
+        }
+    }
+
+    /// The two forms agree wherever the exact one is legal, and the general
+    /// one keeps working where it is not — the distinction the doc claims.
+    #[test]
+    fn general_form_agrees_on_multiples_and_survives_non_multiples() {
+        for bin in 1..=40usize {
+            let bs = bin_size(bin);
+            if bs == 0 {
+                continue;
+            }
+            for k in [1usize, 9, 100] {
+                let n = k * bs;
+                assert_eq!(div_by_block_size(n, bs), exact_div_by_block_size(n, bs));
+            }
+            // Interior offsets: only the general form is meaningful here.
+            for d in [1usize, bs / 2, bs - 1] {
+                if d == 0 || d >= bs {
+                    continue;
+                }
+                let n = 3 * bs + d;
+                assert_eq!(div_by_block_size(n, bs), 3, "bin {bin} offset {d}");
+            }
         }
     }
 }

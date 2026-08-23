@@ -646,7 +646,12 @@ impl Heap {
                 return ptr::null_mut();
             };
             (*p).block_size = bsize;
-            (*p).reserved = ((slices * SEGMENT_SLICE_SIZE) / bsize) as u32;
+            // `bsize` here is `bins::bin_size(bin)`, so the odd part is in
+            // {1,3,5,7} and this is four constant divisions (multiplies),
+            // not a runtime `div`. Refuted once before, but only as a pair
+            // with the `page_extend` substitution that was itself the loss.
+            (*p).reserved =
+                crate::bins::div_by_block_size(slices * SEGMENT_SLICE_SIZE, bsize) as u32;
             // `blockmap`: the liveness map is carved from the front of this
             // page's payload (see `page_extend`), so the block count has to
             // come down by the bytes it occupies or the last block would run
@@ -662,7 +667,8 @@ impl Heap {
             {
                 let raw = (slices * SEGMENT_SLICE_SIZE) / bsize;
                 let bm = crate::page::bitmap_bytes(raw);
-                (*p).reserved = ((slices * SEGMENT_SLICE_SIZE - bm) / bsize) as u32;
+                (*p).reserved =
+                    crate::bins::div_by_block_size(slices * SEGMENT_SLICE_SIZE - bm, bsize) as u32;
                 (*p).payload = ptr::null_mut();
                 (*p).bs_inv = crate::page::odd_mod_inverse(bsize >> bsize.trailing_zeros());
             }
@@ -990,7 +996,7 @@ impl Heap {
         // nothing in between. Repeating it could only fail again, so the copy
         // that used to sit here was pure cold-path tax.
         // Natural fit: only sound when the offset keeps block starts aligned.
-        if offset.is_multiple_of(align)
+        if bins::is_aligned_to(offset, align)
             && size <= MEDIUM_OBJ_SIZE_MAX
             && align <= SEGMENT_SLICE_SIZE
         {
@@ -1001,12 +1007,12 @@ impl Heap {
             // per aligned allocation that lands here (29% of them on
             // `rptest`).
             let b = bins::bin(size);
-            if bins::bin_size(b).is_multiple_of(align) {
+            if bins::is_aligned_to(bins::bin_size(b), align) {
                 return self.malloc_in_bin(size, b);
             }
             let asize = (size.max(1) + align - 1) & !(align - 1);
             let ab = bins::bin(asize);
-            if bins::bin_size(ab).is_multiple_of(align) {
+            if bins::is_aligned_to(bins::bin_size(ab), align) {
                 return self.malloc_in_bin(asize, ab);
             }
         }
@@ -1801,6 +1807,13 @@ pub unsafe fn visit_segment_blocks(
                 // Free-mark bitmap over capacity blocks (≤ 8192 → 1 KiB stack).
                 let cap = (*slot).capacity as usize;
                 let mut freemap = [0u64; 128];
+                // A SINGLE_BLOCK page's `block_size` is `slices *
+                // SEGMENT_SLICE_SIZE`, which carries no bin geometry, so
+                // `div_by_block_size` does not apply — but such a page holds
+                // exactly one block, at offset 0, so it needs no division at
+                // all. Hoisted out of the closure: one flags load for the whole
+                // walk in place of a `div` per block.
+                let single = (*slot).flags.load(Ordering::Relaxed) & pflags::SINGLE_BLOCK != 0;
                 // Bounds-checked marking: a link that does not resolve to a
                 // block of THIS page means the list is corrupt — skip it
                 // rather than index the bitmap out of range.
@@ -1809,7 +1822,15 @@ pub unsafe fn visit_segment_blocks(
                     if addr < area_ptr.addr() {
                         return;
                     }
-                    let off = (addr - area_ptr.addr()) / bsize;
+                    let off = if single {
+                        0
+                    } else {
+                        // `b` comes off a free list, so it is a block START:
+                        // the offset is an exact multiple of `bsize` and the
+                        // cheaper inverse applies. The `off < cap` bound below
+                        // still catches a corrupt link either way.
+                        crate::bins::exact_div_by_block_size(addr - area_ptr.addr(), bsize)
+                    };
                     if off < cap {
                         freemap[off / 64] |= 1 << (off % 64);
                     }

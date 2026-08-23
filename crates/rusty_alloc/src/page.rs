@@ -96,7 +96,8 @@ pub struct Block {
 /// - any larger non-multiple: a garbage index, which overwhelmingly fails the
 ///   `idx < capacity` bound that follows. The chance of a random 64-bit value
 ///   landing under a few thousand is about 2^-52.
-#[cfg(feature = "blockmap")]
+// Not `blockmap`-gated: `bins::exact_div_by_block_size` derives its four
+// constants from this at compile time in every build.
 #[inline]
 pub(crate) const fn odd_mod_inverse(n: usize) -> usize {
     debug_assert!(n % 2 == 1);
@@ -385,15 +386,21 @@ pub struct Page {
     pub area: *mut u8,
     /// Slices this page spans.
     pub slice_count: u16,
-    /// For interior slices: distance BACK to the span-start slot, **in bytes**
-    /// (not in slices).
+    /// For interior slices: distance BACK to the span-start slot, **in
+    /// slices** (not in bytes).
     ///
-    /// Bytes, because this field is read on the hottest path in the allocator:
-    /// `page_of` follows it back on every free. Stored as a slice count it has
-    /// to be scaled by `size_of::<Page>()` — 80, not a power of two — which
-    /// LLVM emits as `neg; lea; shl` before the subtract. Pre-scaled, the
-    /// follow-back is one byte subtraction. This is exactly what upstream
-    /// does: *"the `slice_offset` is the byte offset back to the first slice"*.
+    /// This held BYTES until 2026-08-22, pre-scaled by `size_of::<Page>()`,
+    /// because `page_of` followed it back on every free and a slice count
+    /// would have to be scaled there. **That justification expired** when the
+    /// `Segment::page_off` table took over `page_of`: in a release build the
+    /// only remaining reader is `span_free`'s coalesce-left, and the only
+    /// byte-scaled reader is a `debug_assert`.
+    ///
+    /// Bytes therefore bought nothing and cost a division. `size_of::<Page>()`
+    /// is 88 — `8 * 11`, not a power of two — so recovering the slice count
+    /// from bytes is a real `movabs; mul; shr` magic-multiply sequence, which
+    /// is what `docs/opps.md` #1 named. In slices the same read is a bare
+    /// subtract, and the two loops that WRITE the field drop a multiply each.
     pub slice_offset: u16,
     /// Bin index this page is queued under (BIN_HUGE marks unqueued larges).
     pub bin: u8,
@@ -1058,7 +1065,35 @@ pub unsafe fn page_extend(page: *mut Page, area: *mut u8) {
         //
         // Upstream's own comment on the same 4 KiB bound: "one OS page seems
         // to work well". It is one OS page for a reason.
-        let take = ((4096 / bsize).max(1)).min(reserved - capacity);
+        // RESOLVED (2026-08-22), after two refutations worth keeping.
+        //
+        // `4096 / bsize` was a real `div` by a runtime value, emitted twice
+        // into `malloc_generic_walk` because this function inlines at both of
+        // its call sites. Two removals were built and both LOST: a
+        // compile-time per-bin batch table at **+29,457 Ir on cfrac**, and
+        // `bins::div_by_block_size` at **+48,605** measured together with the
+        // `fresh_page` substitution. The reason is where this function
+        // inlines — heap.rs:497 is `malloc_generic`'s FAST path, taken on
+        // every slow-path allocation, while the `div` sits on the grow arm
+        // that fires on 0.1% of them. Both kept the *computation* and only
+        // changed its form, so both moved a live value onto the common path.
+        //
+        // This removes the computation instead. `reserved` is
+        // `(slice_count * SEGMENT_SLICE_SIZE) / bsize`, so `4096 / bsize` is
+        // exactly `reserved / (slice_count * 16)`. Every span that can reach
+        // here is 1 or `MEDIUM_PAGE_SLICES` (= 8) slices — the huge path sets
+        // `reserved = 1` and never extends — so the divisor is a power of two
+        // and the bound is a shift of `reserved`, a value the `min` on that
+        // same line already holds live. Nothing arrives to replace what
+        // leaves, which is why this is the only one of the three that made
+        // cfrac faster (-1,500 Ir).
+        debug_assert!(
+            (*page).slice_count.is_power_of_two(),
+            "extend bound assumes a power-of-two span, got {}",
+            (*page).slice_count
+        );
+        let span_shift = 4 + (*page).slice_count.trailing_zeros();
+        let take = ((reserved >> span_shift).max(1)).min(reserved - capacity);
         let start = area.add(capacity * bsize);
         // Link the fresh blocks in address order.
         //
