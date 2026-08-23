@@ -162,10 +162,10 @@ pub(super) unsafe fn reset(ptr_: *mut u8, size: usize) -> Result<(), PrimError> 
     // SAFETY: caller guarantees a live committed range; MEM_RESET marks the
     // contents dead without decommitting.
     let p = unsafe { VirtualAlloc(ptr_.cast(), size, MEM_RESET, PAGE_READWRITE) };
-    if !p.is_null() {
-        Ok(())
-    } else {
+    if p.is_null() {
         Err(last_error())
+    } else {
+        Ok(())
     }
 }
 
@@ -238,13 +238,47 @@ pub(super) fn clock_now() -> u64 {
     ticks_to_ns(count.max(0) as u64, freq, SCALE.load(Ordering::Relaxed))
 }
 
+pub(super) struct TlsSlotImpl(u32);
+
+pub(super) fn tls_new(dtor: Option<TlsDtor>) -> Option<TlsSlotImpl> {
+    // SAFETY: FlsAlloc accepts an optional callback pointer of exactly this
+    // type; the callback fires at thread exit with the slot value when non-null.
+    let idx = unsafe { FlsAlloc(dtor) };
+    if idx == u32::MAX {
+        None
+    } else {
+        Some(TlsSlotImpl(idx))
+    }
+}
+
+#[inline]
+pub(super) fn tls_get(slot: &TlsSlotImpl) -> *mut c_void {
+    // SAFETY: index came from a successful FlsAlloc and is never freed (slots
+    // live for the process — mirrors upstream).
+    unsafe { FlsGetValue(slot.0) }
+}
+
+#[inline]
+pub(super) fn tls_set(slot: &TlsSlotImpl, value: *mut c_void) {
+    // SAFETY: as tls_get.
+    unsafe { FlsSetValue(slot.0, value) };
+}
+
+pub(super) fn tls_raw(slot: &TlsSlotImpl) -> usize {
+    slot.0 as usize
+}
+
+pub(super) fn tls_from_raw(raw: usize) -> TlsSlotImpl {
+    TlsSlotImpl(raw as u32)
+}
+
 #[cfg(test)]
 mod clock_tests {
     use super::ticks_to_ns;
 
     /// The reference the fast path has to reproduce, bit for bit.
     fn reference(count: u64, freq: u64) -> u64 {
-        ((count as u128 * 1_000_000_000u128) / freq as u128) as u64
+        ((u128::from(count) * 1_000_000_000u128) / u128::from(freq)) as u64
     }
 
     fn scale_for(freq: u64) -> u64 {
@@ -292,38 +326,4 @@ mod clock_tests {
             "one day must convert exactly"
         );
     }
-}
-
-pub(super) struct TlsSlotImpl(u32);
-
-pub(super) fn tls_new(dtor: Option<TlsDtor>) -> Option<TlsSlotImpl> {
-    // SAFETY: FlsAlloc accepts an optional callback pointer of exactly this
-    // type; the callback fires at thread exit with the slot value when non-null.
-    let idx = unsafe { FlsAlloc(dtor) };
-    if idx == u32::MAX {
-        None
-    } else {
-        Some(TlsSlotImpl(idx))
-    }
-}
-
-#[inline]
-pub(super) fn tls_get(slot: &TlsSlotImpl) -> *mut c_void {
-    // SAFETY: index came from a successful FlsAlloc and is never freed (slots
-    // live for the process — mirrors upstream).
-    unsafe { FlsGetValue(slot.0) }
-}
-
-#[inline]
-pub(super) fn tls_set(slot: &TlsSlotImpl, value: *mut c_void) {
-    // SAFETY: as tls_get.
-    unsafe { FlsSetValue(slot.0, value) };
-}
-
-pub(super) fn tls_raw(slot: &TlsSlotImpl) -> usize {
-    slot.0 as usize
-}
-
-pub(super) fn tls_from_raw(raw: usize) -> TlsSlotImpl {
-    TlsSlotImpl(raw as u32)
 }

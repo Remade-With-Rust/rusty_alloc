@@ -118,7 +118,7 @@ fn win_process_info() -> (usize, usize, usize, usize, usize, usize, usize, usize
             k.as_mut_ptr().cast(),
             u.as_mut_ptr().cast(),
         );
-        let ft = |t: [u32; 2]| ((t[1] as u64) << 32 | t[0] as u64) / 10_000; // 100ns → ms
+        let ft = |t: [u32; 2]| (u64::from(t[1]) << 32 | u64::from(t[0])) / 10_000; // 100ns → ms
         let mut pmc: PROCESS_MEMORY_COUNTERS = core::mem::zeroed();
         pmc.cb = core::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
         K32GetProcessMemoryInfo(proc, &mut pmc, pmc.cb);

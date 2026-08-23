@@ -1725,7 +1725,7 @@ pub extern "C" fn mi_option_set_enabled_default(option: c_int, enable: bool) {
 /// target and a real narrowing on the other. Clippy only sees the platform it
 /// runs on, which is why this fires on Linux CI and never locally on Windows.
 #[unsafe(no_mangle)]
-#[allow(clippy::unnecessary_cast)]
+#[allow(clippy::unnecessary_cast, clippy::cast_lossless)]
 pub extern "C" fn mi_option_get(option: c_int) -> core::ffi::c_long {
     rusty_alloc::options::get(option.max(0) as usize) as core::ffi::c_long
 }
@@ -1735,7 +1735,7 @@ pub extern "C" fn mi_option_get(option: c_int) -> core::ffi::c_long {
 /// See [`mi_option_get`] for why the `c_long` casts are platform-dependent
 /// rather than redundant.
 #[unsafe(no_mangle)]
-#[allow(clippy::unnecessary_cast)]
+#[allow(clippy::unnecessary_cast, clippy::cast_lossless)]
 pub extern "C" fn mi_option_get_clamp(
     option: c_int,
     min: core::ffi::c_long,
@@ -1756,7 +1756,7 @@ pub extern "C" fn mi_option_get_size(option: c_int) -> usize {
 /// `value as i64` widens on Windows (`c_long` = i32) and is a no-op on LP64
 /// unix — see [`mi_option_get`].
 #[unsafe(no_mangle)]
-#[allow(clippy::unnecessary_cast)]
+#[allow(clippy::unnecessary_cast, clippy::cast_lossless)]
 pub extern "C" fn mi_option_set(option: c_int, value: core::ffi::c_long) {
     rusty_alloc::options::set(option.max(0) as usize, value as i64);
 }
@@ -1765,7 +1765,7 @@ pub extern "C" fn mi_option_set(option: c_int, value: core::ffi::c_long) {
 ///
 /// See [`mi_option_set`].
 #[unsafe(no_mangle)]
-#[allow(clippy::unnecessary_cast)]
+#[allow(clippy::unnecessary_cast, clippy::cast_lossless)]
 pub extern "C" fn mi_option_set_default(option: c_int, value: core::ffi::c_long) {
     rusty_alloc::options::set_default(option.max(0) as usize, value as i64);
 }
