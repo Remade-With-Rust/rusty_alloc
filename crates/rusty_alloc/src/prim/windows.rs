@@ -67,7 +67,13 @@ pub(super) unsafe fn alloc(
             let p = unsafe {
                 VirtualAlloc(ptr::null(), lsize, flags | MEM_LARGE_PAGES, PAGE_READWRITE)
             };
-            if !p.is_null() && (p as usize).is_multiple_of(try_alignment) {
+            // `is_multiple_of` on a RUNTIME divisor is a modulo, i.e. a real
+            // `div`. Same substitution as D7/D12/D19; this site was missed
+            // because it is Windows-only and every scan in that campaign read
+            // the Linux `.so`. `is_aligned_to`'s conservative direction is the
+            // safe one here: a `false` falls through to the aligned-reservation
+            // retry below rather than accepting a block.
+            if !p.is_null() && crate::bins::is_aligned_to(p as usize, try_alignment) {
                 return Ok(Alloc {
                     ptr: p.cast(),
                     is_large: true,
@@ -85,7 +91,7 @@ pub(super) unsafe fn alloc(
     // Fast path: reservations are 64 KiB aligned already.
     // SAFETY: NULL base + valid flags; failure returns null, handled.
     let p = unsafe { VirtualAlloc(ptr::null(), size, flags, PAGE_READWRITE) };
-    if !p.is_null() && (p as usize).is_multiple_of(try_alignment) {
+    if !p.is_null() && crate::bins::is_aligned_to(p as usize, try_alignment) {
         return Ok(Alloc {
             ptr: p.cast(),
             is_large: false,
@@ -224,11 +230,13 @@ pub(super) fn clock_now() -> u64 {
         // SAFETY: out-param is a valid local; QPF cannot fail on XP+.
         unsafe { QueryPerformanceFrequency(&mut f) };
         freq = f.max(1) as u64;
-        let scale = if 1_000_000_000u64.is_multiple_of(freq) {
-            1_000_000_000u64 / freq
-        } else {
-            0
-        };
+        // ONE division, not two: `is_multiple_of` is itself a modulo, so
+        // the obvious spelling divides twice to answer a single question.
+        // `q * freq` cannot overflow — `q` is `1e9 / freq`, so the product is
+        // at most 1e9 — and a `freq` above 1e9 gives `q == 0`, which fails the
+        // test and correctly selects the u128 fallback.
+        let q = 1_000_000_000u64 / freq;
+        let scale = if q * freq == 1_000_000_000 { q } else { 0 };
         SCALE.store(scale, Ordering::Relaxed);
         FREQ.store(freq, Ordering::Release);
     }

@@ -624,10 +624,10 @@ divisors and were never candidates. These are the other 35.
 | `stats.rs:125,201` | `/ 1_000_000` | **At the floor.** Same; two magic multiplies, once per stats print. |
 | `stats.rs:145` timeval→ms | `/ 1000` | **At the floor.** Same. |
 | `stats.rs:36` | — | **Not a division.** A `/` inside a format string; the scanner counted it twice. |
-| `bins.rs:124` `EXTEND_BATCH` | `4096 / bs` | **Not shipped.** Table builder, and the table it builds was measured and not adopted. |
+| `bins.rs:124` `EXTEND_BATCH` | `4096 / bs` | **DELETED in v1.1.0** — see Round six. Superseded by D13; restricting it to `pub(crate)` exposed it as dead. |
 | `bins.rs:284,299`, `page.rs:1160`, `random.rs:412` | assorted | **Must stay.** `#[cfg(test)]` oracles — they are the independent reference the fast forms are checked against. Optimising an oracle to match its subject destroys the test. |
 | `ra_bench/kernels.rs` × 12 (f64) | `ops / secs / 1e6` | **Declined, with reason.** One execution per printed benchmark line — unmeasurable — and re-associating to `a/(b*c)` to halve the `divsd`s perturbs reported figures in the last ulp. Changing benchmark arithmetic for no gain is a bad trade on a harness used for cross-run comparison. |
-| `ra_wasm` × 1 (f64) | reporting | **Declined, same reason.** |
+| `ra_wasm` × 1 | *(mischaracterised — see Round six)* | That crate has no float arithmetic. `BIG / 2` is a shift; `% 3000` is a constant modulo in a self-test, `publish = false`. |
 
 Three honest categories, and they are not the same thing: **19 wins**, five
 sites where *no instruction exists to remove* (verified in the disassembly, not
@@ -858,3 +858,123 @@ Gate: clippy **0** workspace-wide with `--all-features`; 32 suites / **88**
 tests / 0 panics by exit code; `blockmap` 18 suites; datasweep 573,640 checks x
 6 allocator arms; `sweep-all` passed; all 13 opscan ops at or ahead of mimalloc;
 cfrac allocator **3,445,578,293**; `free` **21.000** Ir/call.
+
+## Round six — the audit, and the platform this document never looked at
+
+Re-reading this plan against the code as it actually stands after v1.1.1 turned
+up one substantial gap, one false claim, and several stale rows. The gap is the
+interesting one, and it is structural rather than a missed line:
+
+> **Every "zero divisions" claim above was measured on the Linux `.so`.**
+> `crates/rusty_alloc/src/prim/windows.rs` is not compiled into that object, so
+> no scan in five rounds ever read it.
+
+### D23 — the Windows OS-allocation path
+
+Emitting assembly for the `x86_64-pc-windows-msvc` target
+(`cargo rustc -p rusty_alloc --target ... -- --emit=asm`, which needs no
+disassembler and works on any host) found **10 integer division instructions**
+where the Linux object has zero. Attributed:
+
+| symbol | div instructions | source |
+| ------ | ---------------: | ------ |
+| `prim::alloc` | 4 | **two `is_multiple_of(try_alignment)`** on a runtime divisor |
+| `prim::clock_now` | 2 | `is_multiple_of(freq)` **and** `1e9 / freq` — divides twice to answer once |
+| `random::Random::reseed` | 2 | `clock_now` inlined into it |
+| `stats::process_info` | 2 | the ms conversions, already known to be at the floor |
+
+`prim::alloc`'s two are the find. They are the **same** `is_multiple_of`-on-a-
+runtime-alignment shape that D7, D12 and D19 removed from eight sites — and
+they sit on the OS reservation path, which every segment goes through. They
+survived five rounds purely because they are behind `#[cfg(windows)]`.
+
+`bins::is_aligned_to` applies unchanged, and its conservative direction is the
+safe one here: a `false` falls through to the aligned-reservation retry rather
+than accepting a block.
+
+`clock_now`'s pair is D17's own doing. `is_multiple_of` **is** a modulo, so
+`if 1e9.is_multiple_of(freq) { 1e9 / freq }` divides twice to learn one thing.
+One division and a multiply-back answers it: `q * freq` cannot overflow, since
+`q` is `1e9 / freq` and the product is at most 1e9, and a `freq` above 1e9
+gives `q == 0`, which fails the test and correctly selects the u128 fallback.
+
+**Result: 10 -> 3 integer divisions in the Windows build.** `prim::alloc` goes
+**4 -> 0**. The three that remain are `clock_now`'s single once-per-process
+`1e9 / freq` (the frequency is only known at runtime), the same one inlined
+into `reseed`, and `process_info`'s display conversion. `rusty_alloc-ffi`'s
+Windows build was scanned too: **0**.
+
+Linux is untouched — `windows.rs` does not compile there — and measured so:
+cfrac allocator **3,445,578,308**, `free` 21.000 Ir/call, zero divisions of
+every class, all seven CI-equivalent gates green on both hosts.
+
+### Corrections
+
+**Round four's "zero `divsd`/`divss` in the entire `rabench` binary" is false.
+There are 9.** The measurement that produced it ran
+
+```
+B=$HOME/ra_target/release/rabench
+objdump ... $B | grep -cE '...div[sp][sd]...'
+```
+
+through `wsl.exe bash -lc` with the variable stripped — a recurring failure in
+this session — so `objdump` read nothing and `grep -c` counted an empty stream
+as zero. The D20 work was real and did reduce them, but the endpoint was never
+measured. What is actually there, re-counted per symbol: 2 each in
+`malloc_small`, `larson`, `xmalloc` and `freepath_probe`, 1 in `tls_spike` —
+which is **one division per quantity computed**, plus the `/ 1e9` inside
+`Duration::as_secs_f64`, which is std's. That is the floor for computing a
+rate, so nothing is owed here except the corrected number.
+
+The lesson generalises past this line: **a count of zero from a pipeline is
+only meaningful if the pipeline is known to have read something.** Every scan
+in this document should have printed its input size.
+
+Three ledger rows were stale rather than wrong:
+
+- `bins.rs:124` `EXTEND_BATCH` — the table and its two tests were **deleted**
+  in v1.1.0, once restricting it to `pub(crate)` exposed it as dead. D13's
+  shift form had superseded it entirely. The row, and the `bins.rs:284,299`
+  test-oracle row that referenced it, no longer describe anything.
+- The `ra_bench/kernels.rs` row says "Declined, with reason" — round three's
+  verdict, which **round four reversed** by implementing it (D20). The ledger
+  was never updated, so the document contradicted itself.
+- The `ra_wasm × 1 (f64) | reporting` row is a mischaracterisation. That crate
+  has no float arithmetic at all. Its two division sites are `BIG / 2` (a
+  power of two, a shift) and `(i * 37 + round) % 3000` in a self-test loop — a
+  constant modulo, so a magic multiply, in a crate marked `publish = false`.
+- The test count moved 88 -> 86 with the two `EXTEND_BATCH` tests.
+
+### D22 — and the entry D6 needed
+
+`page_align_up` is no longer the mask this document describes. **D6 broke a
+Kani proof**, `good_size_never_shrinks_a_request`, and shipped that way in
+v1.1.0; v1.1.1 fixed it. The full account is in the release history, but the
+short version belongs here because D6's entry above is otherwise misleading:
+
+the mask was `ps - 1`, guarded by `debug_assert!(ps.is_power_of_two())`. That
+assertion is true on every real platform and **not provable** — `ps` is read
+from an atomic cache of an OS value, so Kani models it as arbitrary, where
+`ps - 1` underflows at zero and the mask is not a round-up at all. Building it
+from `1 << (ps.trailing_zeros() & 63)` makes the property structural instead of
+asserted and the function total. All five harnesses verify, and the solver time
+collapsed — a symbolic division is a hard SAT instance, a shift is not.
+
+That defect reached a published artifact, and the reason it did is worth
+recording next to the technical fix: the `proofs` job ran only on a weekly cron
+that **had never fired**, so the harnesses had never gated any release. `ci.yml`
+now runs them on `v*` tags.
+
+### Where the inventory actually stands
+
+| artifact | integer div | float div | soft-div libcalls |
+| -------- | ----------: | --------: | ----------------: |
+| `librusty_alloc_override.so` (Linux) | **0** | **0** | **0** |
+| `rusty_alloc` (Windows target) | **3** | 0 | 0 |
+| `rusty_alloc-ffi` (Windows target) | **0** | 0 | 0 |
+| `rabench` (Linux) | 0 in bench symbols | 9 | 0 |
+
+Every remaining entry is one division per quantity that must be computed, on a
+path that runs once per process or once per printed line. The magic multiplies
+left in allocator symbols are `process_info`'s two display conversions.
