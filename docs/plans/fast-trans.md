@@ -978,3 +978,90 @@ now runs them on `v*` tags.
 Every remaining entry is one division per quantity that must be computed, on a
 path that runs once per process or once per printed line. The magic multiplies
 left in allocator symbols are `process_info`'s two display conversions.
+
+## Round seven — macOS and wasm, and an instrument that proves itself first
+
+Round six's finding was that "zero divisions" had only ever been measured on
+the Linux `.so`. Windows turned out to have ten. That immediately raises the
+question for the other three shipped targets, and the honest answer was that
+nobody had looked.
+
+### The instrument, before the result
+
+Round six also produced the rule that a zero from a pipeline means nothing
+unless the pipeline is known to have read something. Two things had to be
+established before any count here could be trusted, because **the division
+mnemonic is different on every ISA** — a Linux-x86 `grep` for `div` is
+structurally incapable of finding a division on aarch64 or wasm:
+
+| ISA | integer | float |
+| --- | ------- | ----- |
+| x86-64 | `div` `idiv` | `divsd` `divss` |
+| aarch64 | `udiv` `sdiv` | `fdiv` |
+| wasm32 | `i32.div_u` `i64.rem_s` … | `f64.div` |
+
+**Self-test.** A throwaway crate containing three runtime divisions
+(`u64 / u64`, `i32 % i32`, `f64 / f64`, each `#[inline(never)]` so nothing
+folds) was compiled for each target and run through the same patterns:
+
+| target | hits in a known-dividing crate |
+| ------ | ----------------------------- |
+| x86_64-apple-darwin | 3 — `divq`, `idivl`, `divsd` |
+| aarch64-apple-darwin | 3 — `udiv`, `sdiv`, `fdiv` |
+| wasm32-unknown-unknown | 3 — `i64.div_u`, `i32.rem_s`, `f64.div` |
+
+**Coverage check.** A zero is also meaningless if the target's `cfg` branches
+were not in the artifact scanned, and these targets have real ones —
+`prim/unix.rs` has macOS arms, `stats.rs` has an `#[cfg(target_vendor =
+"apple")]` `process_info`, `init.rs` has aarch64 paths, and wasm has its own
+`prim` and `random` backends. Symbols known to exist only per-target were
+confirmed present in each `.s`: `prim::alloc`, `clock_now` and `reseed` on all
+three, `process_info` on both Apple targets. It is **absent on wasm**, which is
+correct rather than a gap — `stats.rs:98` substitutes a stub there, so wasm
+genuinely has no `process_info` to divide in.
+
+### The result
+
+| target | division instructions |
+| ------ | --------------------: |
+| x86_64-apple-darwin | **0** |
+| aarch64-apple-darwin | **0** |
+| wasm32-unknown-unknown | **0** |
+| `rusty_alloc-wasm` crate on wasm32 | **0** |
+
+Nothing to fix. Unlike Windows, the Unix `prim` backend never had the
+`is_multiple_of`-on-a-runtime-alignment shape that D23 removed — that was
+specific to `prim/windows.rs`.
+
+Constant divisions, which emit a reciprocal multiply rather than a `div`, are
+where they were on every other target: `stats::process_info`'s millisecond
+conversions (2 on x86_64-darwin, 3 on aarch64-darwin, plus the same again
+inlined into `print_process`). That is the floor established twice already — a
+constant divisor with an arbitrary dividend cannot do better than a
+multiply-high and a shift.
+
+One caution recorded so the number is not over-read: on aarch64 `umulh` is
+**not** a reliable marker of division. It is also how a 64-bit overflow-checked
+multiply is done, which is why it appears once each in `calloc`, `mallocn`,
+`recalloc`, `reallocn` and `recalloc_aligned_at` — those are `size * count`
+overflow checks, not divisions. The same over-reading would have counted
+`reseed`'s sixteen splitmix64 `wrapping_mul`s on wasm as divisions. Only the
+division mnemonics above are diagnostic on their own.
+
+### Every shipped target, finally on one page
+
+| artifact | integer div | float div | soft-div libcall |
+| -------- | ----------: | --------: | ---------------: |
+| `librusty_alloc_override.so` (Linux x86-64) | **0** | **0** | **0** |
+| `rusty_alloc` (Windows x86-64) | 3 | 0 | 0 |
+| `rusty_alloc-ffi` (Windows x86-64) | **0** | 0 | 0 |
+| `rusty_alloc` (macOS x86-64) | **0** | **0** | **0** |
+| `rusty_alloc` (macOS aarch64) | **0** | **0** | **0** |
+| `rusty_alloc` (wasm32) | **0** | **0** | **0** |
+| `rusty_alloc-wasm` (wasm32) | **0** | **0** | **0** |
+| `rabench` (Linux) | 0 in bench symbols | 9 | 0 |
+
+Windows' three are one once-per-process `1e9 / freq`, that same one inlined
+into `reseed`, and `process_info`'s display conversion. Everything else in the
+table is zero, and every zero above was produced by a pattern proven to fire on
+a crate that does divide.
