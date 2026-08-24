@@ -83,7 +83,38 @@ members = [
 # dispatch, and that cron had NEVER fired — the harnesses had not run in CI
 # once, for any release. `ci.yml` now also runs them on `v*` tags, so a
 # release cannot ship an unverified proof again.
-version = "1.1.1"
+#
+# 1.1.2 — patch. No API change. **Windows gets faster; nothing else moves.**
+#
+# The division campaign that produced 1.1.0 measured every one of its "zero
+# divisions" claims on the Linux `.so`, and `prim/windows.rs` is not compiled
+# into that object — so five rounds of scanning had never read it. Emitting
+# assembly for the msvc target found TEN integer divisions there:
+#
+#   * `prim::alloc` x4 — two `is_multiple_of(try_alignment)` on a RUNTIME
+#     divisor, the same shape D7/D12/D19 removed from eight other sites, on
+#     the OS reservation path every segment goes through. Now the same mask,
+#     whose conservative direction is the safe one here: a `false` falls
+#     through to the aligned-reservation retry rather than accepting a block.
+#   * `prim::clock_now` x2 — `is_multiple_of` IS a modulo, so 1.1.0's
+#     `if 1e9.is_multiple_of(freq) { 1e9 / freq }` divided twice to answer
+#     once. `q * freq == 1e9` answers it after one division and cannot
+#     overflow.
+#   * `random::reseed` x2 — `clock_now` inlined into it.
+#   * `stats::process_info` x2 — display conversions, already minimal.
+#
+# **10 -> 3, and `prim::alloc` 4 -> 0.** What remains is one once-per-process
+# `1e9 / freq`, the same one inlined into `reseed`, and the ms conversion.
+#
+# macOS (x86-64 and aarch64) and wasm32 were audited the same way and are
+# already at **zero** — the Unix backend never had that shape. Those scans are
+# kept as `tools/div-scan-targets.sh` with a self-test that proves each ISA's
+# pattern actually fires (`udiv`/`i64.div_u` are invisible to an x86 `div`
+# grep, so a zero from the wrong pattern looks exactly like a clean result).
+#
+# Linux is byte-identical: cfrac allocator 3,445,578,308, `free` 21.000
+# Ir/call, all 13 opscan ops unchanged, zero divisions of every class.
+version = "1.1.2"
 edition = "2024"
 # MSRV. Declared for the first time in 1.0.1 because this release genuinely
 # needs it: `asm!` label blocks (`asm_goto`, stable 1.87) carry the free path's

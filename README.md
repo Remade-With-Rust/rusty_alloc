@@ -25,7 +25,7 @@ does not offer.
   implementation as a differential oracle on every change.
 - **Runs on WebAssembly** with no C toolchain and no emscripten.
 
-> **Status: `1.1.1` — the API is frozen; changes follow semver from here.**
+> **Status: `1.1.2` — the API is frozen; changes follow semver from here.**
 > `1.1.0` is additive only (one new public item); every `1.0.x` user compiles
 > unchanged.
 > Upgrading from 0.3.x or earlier is mandatory, not optional: 0.4.0 fixed
