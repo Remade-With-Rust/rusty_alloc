@@ -18,4 +18,4 @@
     14  crates/rusty_alloc_bench/src/replay.rs
    350  crates/rusty_alloc_ffi/src/lib.rs
     51  crates/rusty_alloc_override/src/lib.rs
-    22  crates/rusty_alloc_wasm/src/lib.rs
+    26  crates/rusty_alloc_wasm/src/lib.rs

@@ -115,6 +115,13 @@ pub const HEADER_SLICES: usize = 1;
 /// Usable slices in a Normal segment.
 pub const USABLE_SLICES: usize = SLICES_PER_SEGMENT - HEADER_SLICES;
 
+// `LARGE_OBJ_SIZE_MAX` is the byte capacity of exactly this carved region —
+// the routing constant and the geometry must never drift apart, or malloc
+// would either send span-sized requests to dedicated huge segments (the
+// segment tax, docs/plans/segment-tax.md) or ask `span_from_segments` for a
+// span no segment can hold.
+const _: () = assert!(crate::types::LARGE_OBJ_SIZE_MAX == USABLE_SLICES * SEGMENT_SLICE_SIZE);
+
 /// Recover the owning segment from any pointer into it. `with_addr` keeps
 /// provenance so the mask trick is miri-clean.
 #[inline]

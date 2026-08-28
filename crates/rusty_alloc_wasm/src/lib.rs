@@ -221,6 +221,65 @@ pub extern "C" fn ra_selftest() -> i32 {
     selftest()
 }
 
+/// Linear-memory growth (bytes) from holding `count` live blocks of `bytes`
+/// each — the segment-tax report's waste probe (docs/plans/segment-tax.md),
+/// adopted from the reporter's own reproduction. The host differences two
+/// counts to get the MARGINAL cost of one block, free of the heap's one-time
+/// setup, and asserts it against the geometry's bound. Measurement is
+/// wasm-only (`memory_size` counts reservations, which on wasm are real,
+/// permanent memory); the native build runs the allocation pattern and
+/// returns 0 so a non-wasm-specific breakage still surfaces in ordinary
+/// `cargo test`.
+///
+/// # Safety
+/// Safe to call; exported as `extern "C"` for the WebAssembly host.
+#[unsafe(no_mangle)]
+pub extern "C" fn ra_hold(bytes: u32, count: u32) -> u32 {
+    hold_impl(&[bytes as usize], count)
+}
+
+/// As [`ra_hold`], holding `pairs` interleaved (a, b) block pairs — the
+/// mixed-size probe. This is the row that discriminates the span-routing fix
+/// (F1): a 20 MiB span and an 11.9 MiB span pack into ONE segment (320 + 190
+/// slices <= 511), where dedicated huge reservations cost one 32 MiB segment
+/// EACH. Single-size probes cannot see this — no span above 255 slices can
+/// pair with itself.
+///
+/// # Safety
+/// Safe to call; exported as `extern "C"` for the WebAssembly host.
+#[unsafe(no_mangle)]
+pub extern "C" fn ra_hold_mix(a: u32, b: u32, pairs: u32) -> u32 {
+    hold_impl(&[a as usize, b as usize], pairs)
+}
+
+fn hold_impl(sizes: &[usize], rounds: u32) -> u32 {
+    #[cfg(target_arch = "wasm32")]
+    let before = core::arch::wasm32::memory_size::<0>();
+    let mut held: Vec<*mut u8> = Vec::with_capacity(sizes.len() * rounds as usize);
+    for _ in 0..rounds {
+        for &n in sizes {
+            let p = malloc(n);
+            assert!(!p.is_null(), "waste probe: malloc({n}) failed");
+            // SAFETY: n bytes we own; touch both ends so the block is real.
+            unsafe {
+                *p = 0x77;
+                *p.add(n - 1) = 0x77;
+            }
+            held.push(p);
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    let after = core::arch::wasm32::memory_size::<0>();
+    for &p in &held {
+        // SAFETY: allocated above, freed exactly once.
+        unsafe { free(p) };
+    }
+    #[cfg(target_arch = "wasm32")]
+    return ((after - before) * 65536) as u32;
+    #[cfg(not(target_arch = "wasm32"))]
+    0
+}
+
 /// Current size of the wasm linear memory in bytes, so the host can report how
 /// much the allocator actually asked the VM for.
 #[cfg(target_arch = "wasm32")]

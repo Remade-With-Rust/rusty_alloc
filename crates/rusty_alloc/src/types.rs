@@ -57,10 +57,24 @@ pub const SMALL_OBJ_SIZE_MAX: usize = SMALL_PAGE_SIZE / 8;
 /// the oracle's `mi_good_size` switches to page-rounding above this.
 pub const MEDIUM_OBJ_SIZE_MAX: usize = MEDIUM_PAGE_SIZE / 8;
 
-/// Largest object served from an in-segment large page
-/// (`MI_LARGE_OBJ_SIZE_MAX` = SEGMENT_SIZE/2 = 16 MiB). Above this a dedicated
-/// huge segment is used.
-pub const LARGE_OBJ_SIZE_MAX: usize = SEGMENT_SIZE / 2;
+/// Largest object served from an in-segment large span. Above this a
+/// dedicated huge segment is used.
+///
+/// **Deliberate divergence from upstream** (2026-08-28, the segment-tax
+/// report — docs/plans/segment-tax.md). Upstream's `MI_LARGE_OBJ_SIZE_MAX`
+/// is `SEGMENT_SIZE/2` = 16 MiB, but our `large_alloc` allocates an
+/// EXACT-SLICE span, so the true capacity of the in-segment path is
+/// everything the carved region can hold: `USABLE_SLICES` = 511 slices =
+/// 32 MiB − 64 KiB. Routing (16 MiB, 31.94 MiB] to dedicated huge segments
+/// instead charged each such allocation a whole 32 MiB reservation — 60 %
+/// waste at 20 MiB, and on wasm (where a reservation is permanent linear
+/// memory) that waste was the process's floor. As a span, the same 20 MiB
+/// costs 320 slices and leaves 191 slices of the segment usable by other
+/// allocations.
+///
+/// Expressed via `SLICES_PER_SEGMENT - 1` because `segment::HEADER_SLICES`
+/// is 1; a const assert in `segment.rs` keeps the two locked together.
+pub const LARGE_OBJ_SIZE_MAX: usize = (SLICES_PER_SEGMENT - 1) * SEGMENT_SLICE_SIZE;
 
 /// Size in machine words, rounded up (`_mi_wsize_from_size`).
 #[inline]
