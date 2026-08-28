@@ -11,7 +11,7 @@
      6  crates/rusty_alloc/src/prim/wasm.rs
     30  crates/rusty_alloc/src/prim/windows.rs
      2  crates/rusty_alloc/src/random.rs
-    35  crates/rusty_alloc/src/segment.rs
+    36  crates/rusty_alloc/src/segment.rs
      3  crates/rusty_alloc/src/stats.rs
     14  crates/rusty_alloc_api/src/lib.rs
     15  crates/rusty_alloc_bench/src/kernels.rs

@@ -88,10 +88,11 @@ all 13 opscan ops unchanged (`huge` 647.00 predates this work).
 
 ## Residual, known and accepted
 
-- Sub-chunk OS blocks (heap-descriptor pages freed by `init.rs`) still reach
-  the no-op `free` on wasm and are lost — bounded by heap create/destroy
-  cycles, which a single-threaded wasm module rarely performs. Recorded, not
-  fixed.
+- ~~Sub-chunk OS blocks (heap-descriptor pages freed by `init.rs`) still
+  reach the no-op `free` on wasm and are lost.~~ **Closed by F2**
+  (docs/plans/segment-tax.md): `os::free` now recycles slice-granular blocks
+  through the slice pool, and descriptors are page-granular where a wasm
+  page is a slice.
 - Adoption assumes the no-free platform is single-threaded (true for
   `wasm32-unknown-unknown` without the threads proposal, and already a
   standing assumption of `prim/wasm.rs`). The atomics are ordered correctly

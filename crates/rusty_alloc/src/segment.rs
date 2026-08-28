@@ -124,6 +124,7 @@ const _: () = assert!(crate::types::LARGE_OBJ_SIZE_MAX == USABLE_SLICES * SEGMEN
 
 /// Recover the owning segment from any pointer into it. `with_addr` keeps
 /// provenance so the mask trick is miri-clean.
+#[cfg(not(all(target_arch = "wasm32", not(miri))))]
 #[inline]
 pub fn segment_of(p: *mut u8) -> *mut Segment {
     // NOTE (2026-08-21): the GEP form `p.wrapping_sub(p.addr() & (SEGMENT_SIZE
@@ -132,6 +133,52 @@ pub fn segment_of(p: *mut u8) -> *mut Segment {
     // 59.32 -> 60.32, batch_lifo 59.53 -> 60.53). The round-trip is free here
     // and the subtraction is not. Do not retry.
     p.with_addr(p.addr() & !(SEGMENT_SIZE - 1)).cast()
+}
+
+/// wasm: segments are SLICE-aligned, not SEGMENT_SIZE-aligned (F2,
+/// docs/plans/segment-tax.md), so the mask cannot recover the base — the
+/// slice-granular table in `segment_map` does. One load; this platform's
+/// free path is plain Rust (the x86 asm fast path is cfg'd out) and
+/// single-threaded, so the table lookup is the whole cost of dissolving the
+/// alignment constraint that made every ragged reservation strand its tail.
+#[cfg(all(target_arch = "wasm32", not(miri)))]
+#[inline]
+pub fn segment_of(p: *mut u8) -> *mut Segment {
+    let base = crate::segment_map::base_of(p.addr());
+    debug_assert!(
+        base != 0,
+        "segment_of: unmapped wasm address {:#x}",
+        p.addr()
+    );
+    p.with_addr(base).cast()
+}
+
+/// Reserve backing memory for a segment of `want` bytes.
+///
+/// Native: an eagerly committed, SEGMENT_SIZE-aligned OS block, exactly as
+/// always. wasm: the slice pool first — recycled memory at 64 KiB
+/// granularity — then a fresh slice-aligned reservation sized to the SLICE
+/// round of `want`, not the chunk round. This is where the segment tax
+/// dies: a 33 MiB huge block reserves 33.06 MiB instead of 64 MiB, and on
+/// free every slice of it becomes serviceable again.
+fn reserve_backing(want: usize) -> Result<(*mut u8, usize, bool), PrimError> {
+    #[cfg(all(target_arch = "wasm32", not(miri)))]
+    {
+        let size = os::page_align_up(want); // wasm page == slice == 64 KiB
+        debug_assert!(size.is_multiple_of(SEGMENT_SLICE_SIZE));
+        if let Some(addr) = crate::slice_pool::alloc_run(size / SEGMENT_SLICE_SIZE) {
+            // Provenance: pool addresses were exposed when their blocks were
+            // freed (`expose_provenance` at the free sites).
+            return Ok((core::ptr::with_exposed_provenance_mut(addr), size, false));
+        }
+        let b = os::alloc_aligned(size, SEGMENT_SLICE_SIZE, true, false)?;
+        Ok((b.ptr, b.size, b.is_zero))
+    }
+    #[cfg(not(all(target_arch = "wasm32", not(miri))))]
+    {
+        let b = os::alloc_aligned(want, SEGMENT_SIZE, true, false)?;
+        Ok((b.ptr, b.size, b.is_zero))
+    }
 }
 
 /// Resolve a block pointer to its page slot (follows `slice_offset` back to
@@ -298,8 +345,8 @@ pub fn segment_alloc(arena_id: i32) -> Result<*mut Segment, PrimError> {
             if arena_id >= 0 {
                 return Err(0); // exclusive-arena heap and its arena is full
             }
-            let b = os::alloc_aligned(SEGMENT_SIZE, SEGMENT_SIZE, true, false)?;
-            (b.ptr, b.size, b.is_zero)
+            let (p, sz, zero) = reserve_backing(SEGMENT_SIZE)?;
+            (p, sz, zero)
         }
     };
     let seg: *mut Segment = ptr_.cast();
@@ -351,6 +398,15 @@ pub unsafe fn segment_free(seg: *mut Segment) -> Result<(), PrimError> {
     }
     if crate::arena::chunk_free(seg.cast()) {
         return Ok(());
+    }
+    // wasm: the slice pool is the free list (F2) — `expose_provenance` so a
+    // later `reserve_backing` may reconstruct a pointer to this range.
+    #[cfg(all(target_arch = "wasm32", not(miri)))]
+    // SAFETY: seg is live per the contract; reading total_size.
+    unsafe {
+        if crate::slice_pool::free_range(seg.cast::<u8>().expose_provenance(), (*seg).total_size) {
+            return Ok(());
+        }
     }
     // SAFETY: per contract; reconstruct the OsBlock we allocated with.
     unsafe {
@@ -743,8 +799,8 @@ pub fn huge_alloc(
     let (bptr, total, mem_zero) = match crate::arena::chunk_alloc_n(-1, chunks) {
         Some((p, zero)) => (p, chunks * SEGMENT_SIZE, zero),
         None => {
-            let b = os::alloc_aligned(want, SEGMENT_SIZE, true, false)?;
-            (b.ptr, b.size, b.is_zero)
+            let (p, sz, zero) = reserve_backing(want)?;
+            (p, sz, zero)
         }
     };
     let seg: *mut Segment = bptr.cast();
@@ -853,6 +909,13 @@ pub unsafe fn huge_free(seg: *mut Segment) -> Result<(), PrimError> {
             if crate::arena::chunk_free_n(seg.cast(), (*seg).total_size / SEGMENT_SIZE) {
                 return Ok(());
             }
+        }
+        // wasm: ragged (slice-granular) huge reservations recycle through
+        // the slice pool — the F2 fix itself. Chunk-multiple ones only
+        // reach here when no arena owns them, and the pool takes those too.
+        #[cfg(all(target_arch = "wasm32", not(miri)))]
+        if crate::slice_pool::free_range(seg.cast::<u8>().expose_provenance(), (*seg).total_size) {
+            return Ok(());
         }
         let block = os::OsBlock {
             ptr: seg.cast(),

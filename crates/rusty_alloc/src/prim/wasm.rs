@@ -99,6 +99,11 @@ pub(super) unsafe fn alloc(
 /// ever reached (`prim::FREE_RETURNS_MEMORY == false` is the switch). A block
 /// that does arrive here is genuinely lost, which is why `os::alloc_aligned`
 /// makes every segment-aligned reservation chunk-granular on this platform.
+#[allow(
+    clippy::unnecessary_wraps,
+    clippy::unused_self,
+    reason = "the prim backends share one signature; a no-op backend still returns the contract's Result"
+)]
 pub(super) unsafe fn free(_ptr: *mut u8, _size: usize) -> Result<(), PrimError> {
     Ok(())
 }
@@ -106,16 +111,31 @@ pub(super) unsafe fn free(_ptr: *mut u8, _size: usize) -> Result<(), PrimError> 
 /// Already backed. Reports NOT-known-zero conservatively: `decommit` preserves
 /// contents here, so a re-committed range may hold stale bytes and the caller
 /// must zero it itself when it needs zeros.
+#[allow(
+    clippy::unnecessary_wraps,
+    clippy::unused_self,
+    reason = "the prim backends share one signature; a no-op backend still returns the contract's Result"
+)]
 pub(super) unsafe fn commit(_ptr: *mut u8, _size: usize) -> Result<bool, PrimError> {
     Ok(false)
 }
 
 /// No-op. Returns `false` = no re-commit needed before touching the range
 /// again, and contents are preserved (as on unix `MADV_DONTNEED`, not Windows).
+#[allow(
+    clippy::unnecessary_wraps,
+    clippy::unused_self,
+    reason = "the prim backends share one signature; a no-op backend still returns the contract's Result"
+)]
 pub(super) unsafe fn decommit(_ptr: *mut u8, _size: usize) -> Result<bool, PrimError> {
     Ok(false)
 }
 
+#[allow(
+    clippy::unnecessary_wraps,
+    clippy::unused_self,
+    reason = "the prim backends share one signature; a no-op backend still returns the contract's Result"
+)]
 pub(super) unsafe fn reset(_ptr: *mut u8, _size: usize) -> Result<(), PrimError> {
     Ok(())
 }

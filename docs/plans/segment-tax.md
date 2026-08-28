@@ -2,8 +2,8 @@
 
 **Source:** FFAI/Carmenta field report on 1.1.5
 (claude.ai/code/artifact/e9d564af-598d-4983-8f69-1c6de65081e3), 2026-08-28.
-Status: **F1 + F5 LANDED, 2026-08-28** (results at the bottom). F2 next;
-F3 rejected; F4 superseded.
+Status: **F1 + F5 + F2 LANDED, 2026-08-28** (results at the bottom).
+F3 rejected (and now moot); F4 superseded; F6 open.
 
 ## What the report establishes (verified against the source)
 
@@ -171,3 +171,45 @@ datasweep 573,640 × 6 arms, corpus sweep passed, clippy 0 on both platforms.
 What FFAI should see: their 25.1 MiB detector tensors and every other
 (16, 31.94] MiB buffer now pack with their neighbours instead of costing a
 32 MiB floor each. The ≥ 32 MiB rows (their 48 MiB frames) wait on F2.
+
+## Results — F2 landed, 2026-08-28
+
+F2 shipped as something better than the plan's sketch. The plan proposed
+slice-granular ARENAS; what landed dissolves the constraint that made
+granularity a problem in the first place. The chunk rounding existed because
+every segment base had to be SEGMENT_SIZE-aligned for `segment_of`'s pointer
+mask. On wasm that mask is now a slice-granular base table
+(`segment_map::base_of`, 256 KiB of wasm-only BSS, one load per resolution —
+and wasm's free path is plain Rust with no asm fast path, so the swap is
+cfg'd cleanly while native keeps its measured-optimal mask untouched).
+
+With the mask gone, three small pieces finish it:
+
+* `slice_pool` — an 8 KiB free-slice bitmap over the 4 GiB wasm address
+  space: first-fit `alloc_run`, bit-set `free_range`, coalescing by
+  construction. Bookkeeping only; unit-tested natively.
+* `reserve_backing` — segments and huge blocks reserve the SLICE round of
+  what they need (pool first, fresh `memory.grow` second), not the chunk
+  round. The wasm prim's one-time 32 MiB alignment pad disappears too, since
+  nothing asks for more than 64 KiB alignment any more.
+* Frees go to the pool: `segment_free`, `huge_free`, and `os::free` itself —
+  which also closes wasm-recycling.md's residual heap-descriptor leak, since
+  descriptors are page-granular and a wasm page IS a slice.
+
+| waste-gate row | pre-F2 | with F2 | bound |
+|---|---:|---:|---:|
+| 33 MiB single | 64.00 — FAIL | **33.06** | 34 |
+| 32 MiB exact — the report's headline | 64.00 — FAIL | **32.06** | 33 |
+| 48 MiB frame (12 MP RGBA) | 64.00 — FAIL | **48.06** | 49 |
+| every F1 row | unchanged | unchanged | — |
+
+The 64 KiB that cost 32 MiB now costs 64 KiB. The selftest's own steady
+state fell 128.06 → **66.50 MiB** (192.06 at 1.1.5) and its start-up floor
+2.06 → 1.31 MiB (the alignment pad). Native: cfrac allocator 3,445,578,349 —
+byte-identical, all 13 opscan ops unchanged, 33 suites / 98 tests / 0
+panics, Kani 5/5, datasweep × 6 arms, corpus passed, clippy 0 on native,
+wasm, and Windows, census re-baselined 864.
+
+Still open: F6 (occupancy census for the report's unattributed remainder of
+the 2.2×). With F1+F2, their steady-state plateau should re-measure well
+below 1280 MiB — worth asking for a re-run before investing in F6.

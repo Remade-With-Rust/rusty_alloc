@@ -29,6 +29,11 @@ mod proofs;
 pub mod random;
 pub mod segment;
 pub mod segment_map;
+// Wired into the segment paths only on wasm (F2, docs/plans/segment-tax.md);
+// native builds compile it for its unit tests, so its items are "unused"
+// there by design.
+#[cfg_attr(not(all(target_arch = "wasm32", not(miri))), allow(dead_code))]
+pub(crate) mod slice_pool;
 pub mod stats;
 pub mod types;
 

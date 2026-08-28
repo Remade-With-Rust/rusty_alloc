@@ -152,6 +152,14 @@ pub unsafe fn free(block: OsBlock) -> Result<(), PrimError> {
     if !prim::FREE_RETURNS_MEMORY && crate::arena::adopt_os_block(block.ptr, block.size).is_some() {
         return Ok(());
     }
+    // Slice-granular fallback (F2): blocks adoption cannot take — heap
+    // descriptors are page-granular, and on wasm a page IS a slice — recycle
+    // through the slice pool instead of hitting the no-op prim free. This
+    // closes the residual descriptor leak recorded in wasm-recycling.md.
+    #[cfg(all(target_arch = "wasm32", not(miri)))]
+    if crate::slice_pool::free_range(block.ptr.expose_provenance(), block.size) {
+        return Ok(());
+    }
     // SAFETY: forwarded contract (whole mapping base + size).
     unsafe { prim::free(block.ptr, block.size) }
 }

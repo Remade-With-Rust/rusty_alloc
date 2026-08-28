@@ -115,7 +115,15 @@ if (rc === 0) {
     ["20 MiB single (regression pin)",        () => single(20 * MIB, 1, 9),                    34 * MIB],
     ["20 MiB + 11.875 MiB pair (F1 gate)",    () => mix(20 * MIB, 190 * 65536, 1, 5),          34 * MIB],
     ["25.1 MiB + 6 MiB pair",                 () => mix(402 * 65536, 6 * MIB, 1, 5),           34 * MIB],
-    ["33 MiB single (huge; F2 will lower)",   () => single(33 * MIB, 1, 3),                    66 * MIB],
+    // F2 rows (slice-granular reservations): a huge block now reserves the
+    // SLICE round of header+size, not the chunk round, and every freed slice
+    // is serviceable again. Pre-F2 these read a whole extra 32 MiB chunk:
+    // 33 MiB -> 64, 32 MiB-exact -> 64 (the report's headline row), a 48 MiB
+    // 12 MP RGBA frame -> 64. The bounds allow one slice of header plus one
+    // slice of rounding.
+    ["33 MiB single (F2 gate)",               () => single(33 * MIB, 1, 3),                    34 * MIB],
+    ["32 MiB exact (the report's headline)",  () => single(32 * MIB, 1, 3),                    33 * MIB],
+    ["48 MiB frame (12 MP RGBA)",             () => single(48 * MIB, 1, 3),                    49 * MIB],
   ];
 
   let wasteFailed = false;
