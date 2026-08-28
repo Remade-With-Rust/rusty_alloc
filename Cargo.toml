@@ -132,7 +132,7 @@ members = [
 # different files that never got the section. Fixed here, in both, and
 # verified by extracting the packaged `.crate` before publishing rather than
 # checking the live page afterwards.
-version = "1.1.4"
+version = "1.1.5"
 edition = "2024"
 # MSRV. Declared for the first time in 1.0.1 because this release genuinely
 # needs it: `asm!` label blocks (`asm_goto`, stable 1.87) carry the free path's
