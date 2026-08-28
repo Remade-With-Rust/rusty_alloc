@@ -23,6 +23,8 @@ pub const E_LARGE_NULL: i32 = 7;
 pub const E_LARGE_PATTERN: i32 = 8;
 pub const E_RECYCLE_NULL: i32 = 9;
 pub const E_ALIGN: i32 = 10;
+pub const E_STEADY_NULL: i32 = 11;
+pub const E_STEADY_LEAK: i32 = 12;
 
 /// Sizes chosen to cross bin boundaries and the small/medium/large thresholds
 /// without demanding enough linear memory to make a wasm host unhappy.
@@ -151,7 +153,48 @@ pub fn selftest() -> i32 {
         }
     }
 
-    // 6. Every block must be at least word-aligned.
+    // 6. STEADY STATE: N identical alloc/free cycles must stop growing
+    //    linear memory after the first. This is the arm whose absence let
+    //    v1.1.4 ship a leak of one whole 32 MiB segment per large cycle: the
+    //    churn loop above never empties a segment, and the measurement that
+    //    justified disabling arenas on wasm ran a short workload that never
+    //    reached the steady-state regime. Three shapes, chosen to pin the
+    //    routes: 4 MiB (a medium page inside a shared segment), 20 MiB
+    //    (> LARGE_OBJ_SIZE_MAX = 16 MiB, the dedicated huge route — the shape
+    //    that leaked +640 MiB over 20 cycles), and 33 MiB (a huge block whose
+    //    ragged size exercises the chunk-granular rounding; without it the
+    //    sub-chunk tail leaks per cycle even with adoption working).
+    for &(size, cycles) in &[(4usize << 20, 20usize), (20 << 20, 20), (33 << 20, 12)] {
+        #[cfg(target_arch = "wasm32")]
+        let mut after_first = 0usize;
+        // `cycle` is read only by the wasm-gated measurement below.
+        #[cfg_attr(not(target_arch = "wasm32"), allow(unused_variables))]
+        for cycle in 0..cycles {
+            let p = malloc(size);
+            if p.is_null() {
+                return E_STEADY_NULL;
+            }
+            // Touch first/middle/last so every cycle commits real memory.
+            // SAFETY: size bytes we own.
+            unsafe {
+                *p = 0x7E;
+                *p.add(size / 2) = 0x7E;
+                *p.add(size - 1) = 0x7E;
+                free(p);
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                let now = core::arch::wasm32::memory_size::<0>() * 65536;
+                if cycle == 0 {
+                    after_first = now;
+                } else if now > after_first {
+                    return E_STEADY_LEAK;
+                }
+            }
+        }
+    }
+
+    // 7. Every block must be at least word-aligned.
     for &n in &SIZES {
         let p = malloc(n);
         if p.is_null() {

@@ -105,6 +105,21 @@ pub fn alloc_aligned(
     );
     let alignment = alignment.max(page_size());
     let size = page_align_up(size);
+    // On a platform whose `free` cannot return memory (wasm), a freed block's
+    // only afterlife is adoption as SEGMENT_SIZE arena chunks (see [`free`]).
+    // A segment-aligned block with a ragged size would leave a sub-chunk tail
+    // with no such afterlife — up to SEGMENT_SIZE-page_size lost per HUGE
+    // alloc/free cycle, which is an unbounded leak, not an overhead. Rounding
+    // the size up makes every adoptable block exactly chunk-granular: the
+    // overshoot is committed linear memory (wasm has no lazy commit), but it
+    // is bounded by one chunk per LIVE huge block and fully recycled on free.
+    // `alignment >= SEGMENT_SIZE` is precisely the segment/huge reservation
+    // paths; descriptor-sized allocations keep their page granularity.
+    let size = if !prim::FREE_RETURNS_MEMORY && alignment >= crate::types::SEGMENT_SIZE {
+        size.next_multiple_of(crate::types::SEGMENT_SIZE)
+    } else {
+        size
+    };
     // SAFETY: size is page-multiple and > 0, alignment a power of two; the
     // returned mapping is owned by the OsBlock we hand out.
     let a = unsafe { prim::alloc(size, alignment, commit, allow_large)? };
@@ -129,6 +144,14 @@ pub fn alloc_aligned(
 /// `block` must come from [`alloc_aligned`], be unfreed, and have no live
 /// references into it.
 pub unsafe fn free(block: OsBlock) -> Result<(), PrimError> {
+    // Where the prim cannot return memory to the host (wasm: linear memory
+    // never shrinks), dropping the block would leave it mapped but
+    // unreachable — the allocator would simply forget it. Adopt it as arena
+    // chunks instead, which makes the arena the free list the no-op prim
+    // `free` relies on. Compiled out entirely where `free` works.
+    if !prim::FREE_RETURNS_MEMORY && crate::arena::adopt_os_block(block.ptr, block.size).is_some() {
+        return Ok(());
+    }
     // SAFETY: forwarded contract (whole mapping base + size).
     unsafe { prim::free(block.ptr, block.size) }
 }

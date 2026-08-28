@@ -48,6 +48,22 @@ pub struct MemConfig {
     pub has_partial_free: bool,
 }
 
+/// Whether [`free`] actually returns memory to the host.
+///
+/// True everywhere except wasm: `munmap` and `VirtualFree(MEM_RELEASE)` both
+/// release the whole mapping (only PARTIAL free differs between them — that is
+/// [`MemConfig::has_partial_free`], a different property). On wasm linear
+/// memory can only grow, so [`free`] is a no-op and a mapping handed to it
+/// would otherwise be unreachable forever. [`crate::os::free`] keys on this to
+/// hand such blocks to [`crate::arena::adopt_os_block`] instead, which is the
+/// allocator's ONLY recycling layer on such a platform — the segment cache
+/// this role is sometimes attributed to does not exist (upstream mimalloc v2
+/// deleted it when arenas replaced it, and this remake followed).
+///
+/// A `const`, not a `MemConfig` field, so the adoption path folds away
+/// entirely on every platform whose free works.
+pub const FREE_RETURNS_MEMORY: bool = !cfg!(all(target_arch = "wasm32", not(miri)));
+
 /// Result of a successful [`alloc`].
 #[derive(Debug, Clone, Copy)]
 pub struct Alloc {

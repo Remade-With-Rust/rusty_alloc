@@ -18,6 +18,8 @@ const ERRORS = {
   8: "large-block pattern mismatch",
   9: "churn allocation returned null (page recycling failed)",
   10: "block was not word-aligned",
+  11: "steady-state allocation returned null",
+  12: "steady-state cycles GREW linear memory - segment/huge recycling failed (the v1.1.4 wasm leak)",
 };
 
 const path = process.argv[2];

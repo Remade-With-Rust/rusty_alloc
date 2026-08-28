@@ -23,10 +23,15 @@ pub struct Arena {
     /// chunk derivation keeps provenance and the region stays reachable
     /// (the M4 reachability-follows-pointers lesson, recaught here by miri).
     pub base: *mut u8,
-    /// Usable size (whole chunks).
-    pub size: usize,
-    /// Chunk count.
-    pub chunks: usize,
+    /// Usable size in bytes (whole chunks). Atomic because
+    /// [`adopt_os_block`] EXTENDS an adopted arena in place when a freed
+    /// block lands exactly at its end; published with `Release` after the new
+    /// chunks' `dirty` bits, so a reader that observes the new count observes
+    /// their state too. A reader holding the old value merely misses the new
+    /// chunks for one scan.
+    size: AtomicUsize,
+    /// Chunk count. Same discipline as `size`.
+    chunks: AtomicUsize,
     /// Only heaps created with this arena id may allocate from it.
     pub exclusive: bool,
     /// We own the mapping (false for `mi_manage_os_memory` memory).
@@ -62,8 +67,8 @@ fn arena_register(
     // only the scalar fields need writing.
     unsafe {
         (*a).base = base;
-        (*a).size = size;
-        (*a).chunks = chunks;
+        (*a).size.store(size, Ordering::Release);
+        (*a).chunks.store(chunks, Ordering::Release);
         (*a).exclusive = exclusive;
         (*a).owned = owned;
         (*a).numa_node = numa_node;
@@ -123,7 +128,7 @@ pub fn manage_os_memory_ex(
     let a = ARENAS[id as usize].load(Ordering::Acquire);
     // SAFETY: freshly registered arena descriptor.
     unsafe {
-        let chunks = (*a).chunks;
+        let chunks = (*a).chunks.load(Ordering::Acquire);
         for w in 0..chunks.div_ceil(64) {
             let bits = if (w + 1) * 64 <= chunks {
                 u64::MAX
@@ -138,38 +143,69 @@ pub fn manage_os_memory_ex(
 
 /// Whether reserving a large default arena up front pays for itself.
 ///
-/// **False on wasm, where it is actively harmful.** The arena exists to keep
-/// segment churn off the OS by reserving address space cheaply and committing
-/// it lazily — but wasm has no virtual reservation at all: `memory.grow` backs
-/// every byte immediately, so a 1 GiB "reservation" costs 1 GiB of real linear
-/// memory before the first `malloc` even returns. And it buys nothing there,
-/// because wasm memory is never returned to the host — every segment we have
-/// ever touched is already permanently cached, which is exactly what the arena
-/// was for. Upstream reaches for the same lever more mildly (`arena.c` divides
-/// the reserve by 4 "if virtual reserve is not supported (for WASM for
-/// example)"); with grow-only memory, skipping it entirely is strictly better.
+/// **False on wasm — but not for the reason a first reading suggests.** The
+/// arena plays two roles: it is a cheap ADDRESS-SPACE RESERVATION that keeps
+/// segment churn off the OS, and it is the FREE LIST that `segment_free` /
+/// `huge_free` return chunks to. On wasm the first role is actively harmful —
+/// `memory.grow` backs every byte immediately, so a 1 GiB "reservation" costs
+/// 1 GiB of real linear memory before the first `malloc` returns (measured by
+/// `bench/wasm-selftest.mjs`: 1056.06 MiB -> 64.00 MiB, 6.79 ms -> 1.75 ms).
+/// The second role is INDISPENSABLE there: `prim::free` is a no-op, so the
+/// arena is the only recycling layer that exists, and v1.1.4 shipped with
+/// both roles disabled — every freed segment reached the no-op `free` and
+/// 32 MiB of linear memory became permanently unreachable, one whole segment
+/// per >16 MiB alloc/free cycle (measured: 20 cycles of one 20 MiB `Vec`
+/// leaked exactly +640 MiB).
 ///
-/// Measured by `bench/wasm-selftest.mjs`, same workload either way:
-/// **1056.06 MiB -> 64.00 MiB of linear memory, and 6.79 ms -> 1.75 ms.**
+/// So on wasm the default arena stays OFF and the free-list role is served
+/// incrementally instead: [`adopt_os_block`] registers each OS-allocated
+/// block as arena chunks at the moment it is FREED, growing the recyclable
+/// pool to the workload's peak footprint and never beyond it — no up-front
+/// commit, no leak. Upstream reaches for a milder lever (`arena.c` divides
+/// the reserve by 4 where virtual reserve is unsupported); adopt-on-free
+/// dominates both.
 const DEFAULT_ARENA_PAYS: bool = !cfg!(all(target_arch = "wasm32", not(miri)));
 
-/// Lazily reserve the DEFAULT arena (`mi_option_arena_reserve`, 1 GiB by
-/// default) the first time a segment misses the arena pools — this is what
-/// keeps segment churn off the OS (upstream does the same; without it,
-/// malloc-large pays a VirtualAlloc/munmap round-trip per cycle, measured
-/// 3–4× slower on the Tier-A gate).
-fn ensure_default_arena() {
-    use core::sync::atomic::AtomicBool;
-    static TRIED: AtomicBool = AtomicBool::new(false);
-    if TRIED.swap(true, Ordering::AcqRel) {
-        return;
-    }
+/// Reserve ANOTHER default-sized arena (`mi_option_arena_reserve`, 1 GiB by
+/// default), called when every existing arena is full — this is what keeps
+/// segment churn off the OS (without it, malloc-large pays a
+/// VirtualAlloc/munmap round-trip per cycle, measured 3–4× slower on the
+/// Tier-A gate).
+///
+/// Returns true when the caller should rescan the arena table. Until v1.1.4
+/// this was one-shot behind a `TRIED` flag: the FIRST miss reserved the
+/// default arena and every later exhaustion fell through to raw OS segments
+/// forever — correct but 3–4× slower on exactly the workloads arenas exist
+/// for, and the flag was a swap on EVERY chunk_alloc. Now reserving is
+/// miss-driven: the fast path pays nothing, and a workload that outgrows one
+/// reserve gets another (upstream does the same; `MAX_ARENAS` bounds the
+/// total). A failed reserve latches off so an OOM-adjacent process does not
+/// hammer the OS on every allocation.
+fn reserve_default_arena_on_miss() -> bool {
+    // 0 = idle, 1 = a thread is reserving, 2 = failed permanently.
+    static RESERVE: AtomicUsize = AtomicUsize::new(0);
     if !DEFAULT_ARENA_PAYS {
-        return;
+        return false;
     }
     let reserve = crate::options::get_size(23); // arena_reserve (KiB-scaled)
-    if reserve >= SEGMENT_SIZE {
-        let _ = reserve_os_memory_ex(reserve, true, false, false);
+    if reserve < SEGMENT_SIZE {
+        return false;
+    }
+    match RESERVE.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => {
+            let ok = reserve_os_memory_ex(reserve, true, false, false).is_ok();
+            RESERVE.store(if ok { 0 } else { 2 }, Ordering::Release);
+            ok
+        }
+        Err(1) => {
+            // Another thread is reserving right now: wait it out, then rescan
+            // — its fresh arena serves this miss too. Do NOT reserve again.
+            while RESERVE.load(Ordering::Acquire) == 1 {
+                core::hint::spin_loop();
+            }
+            RESERVE.load(Ordering::Acquire) == 0
+        }
+        Err(_) => false,
     }
 }
 
@@ -177,11 +213,16 @@ fn ensure_default_arena() {
 /// NON-exclusive arena (reserving the default arena on first miss). Returns
 /// (chunk ptr, chunk-is-zero).
 pub fn chunk_alloc(restrict_id: i32) -> Option<(*mut u8, bool)> {
-    if restrict_id < 0 {
-        if crate::options::is_enabled(27) {
-            return None; // disallow_arena_alloc
-        }
-        ensure_default_arena();
+    if restrict_id < 0 && crate::options::is_enabled(27) {
+        return None; // disallow_arena_alloc
+    }
+    if let Some(r) = chunk_alloc_inner(restrict_id) {
+        return Some(r);
+    }
+    // Exhausted (or empty) table. An exclusive-arena heap gets no default
+    // arena; otherwise reserve one more and rescan once.
+    if restrict_id >= 0 || !reserve_default_arena_on_miss() {
+        return None;
     }
     chunk_alloc_inner(restrict_id)
 }
@@ -202,14 +243,15 @@ fn chunk_alloc_inner(restrict_id: i32) -> Option<(*mut u8, bool)> {
             if restrict_id < 0 && (*a).exclusive {
                 continue;
             }
-            let words = (*a).chunks.div_ceil(64);
+            let chunks = (*a).chunks.load(Ordering::Acquire);
+            let words = chunks.div_ceil(64);
             for w in 0..words {
                 loop {
                     let cur = (*a).used[w].load(Ordering::Acquire);
-                    let limit = if (w + 1) * 64 <= (*a).chunks {
+                    let limit = if (w + 1) * 64 <= chunks {
                         64
                     } else {
-                        (*a).chunks % 64
+                        chunks % 64
                     };
                     let free_bits = !cur
                         & if limit == 64 {
@@ -253,12 +295,20 @@ pub fn chunk_alloc_n(restrict_id: i32, n: usize) -> Option<(*mut u8, bool)> {
     if n == 1 {
         return chunk_alloc(restrict_id);
     }
-    if restrict_id < 0 {
-        if crate::options::is_enabled(27) {
-            return None;
-        }
-        ensure_default_arena();
+    if restrict_id < 0 && crate::options::is_enabled(27) {
+        return None;
     }
+    if let Some(r) = chunk_alloc_n_inner(restrict_id, n) {
+        return Some(r);
+    }
+    if restrict_id >= 0 || !reserve_default_arena_on_miss() {
+        return None;
+    }
+    chunk_alloc_n_inner(restrict_id, n)
+}
+
+#[allow(clippy::needless_range_loop)] // indexed scan over a fixed atomic table
+fn chunk_alloc_n_inner(restrict_id: i32, n: usize) -> Option<(*mut u8, bool)> {
     while MULTI_LOCK
         .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
@@ -280,7 +330,7 @@ pub fn chunk_alloc_n(restrict_id: i32, n: usize) -> Option<(*mut u8, bool)> {
                 if restrict_id < 0 && (*a).exclusive {
                     continue;
                 }
-                let chunks = (*a).chunks;
+                let chunks = (*a).chunks.load(Ordering::Acquire);
                 if n > chunks {
                     continue;
                 }
@@ -347,7 +397,9 @@ pub fn chunk_free_n(p: *mut u8, n: usize) -> bool {
         }
         // SAFETY: live descriptor; bounded indices per the range check.
         unsafe {
-            if addr >= (*a).base.addr() && addr < (*a).base.addr() + (*a).size {
+            if addr >= (*a).base.addr()
+                && addr < (*a).base.addr() + (*a).size.load(Ordering::Acquire)
+            {
                 let start = (addr - (*a).base.addr()) / SEGMENT_SIZE;
                 for j in start..start + n {
                     (*a).used[j / 64].fetch_and(!(1 << (j % 64)), Ordering::AcqRel);
@@ -371,7 +423,9 @@ pub fn chunk_free(p: *mut u8) -> bool {
         }
         // SAFETY: live descriptor; bit index bounded by the range check.
         unsafe {
-            if addr >= (*a).base.addr() && addr < (*a).base.addr() + (*a).size {
+            if addr >= (*a).base.addr()
+                && addr < (*a).base.addr() + (*a).size.load(Ordering::Acquire)
+            {
                 let idx = (addr - (*a).base.addr()) / SEGMENT_SIZE;
                 (*a).used[idx / 64].fetch_and(!(1 << (idx % 64)), Ordering::AcqRel);
                 return true;
@@ -379,6 +433,103 @@ pub fn chunk_free(p: *mut u8) -> bool {
         }
     }
     false
+}
+
+/// Adopt an OS block that cannot be returned to the host, making its memory
+/// recyclable through this module. This is the free list `prim/wasm.rs`'s
+/// no-op `free` depends on: [`crate::os::free`] calls it (only) on platforms
+/// where `prim::FREE_RETURNS_MEMORY` is false, at the moment a segment or
+/// huge block is released. Without it every such release strands its whole
+/// mapping — v1.1.4 leaked one 32 MiB segment per >16 MiB alloc/free cycle on
+/// wasm this way.
+///
+/// The block becomes `size / SEGMENT_SIZE` chunks, all free, all pre-marked
+/// dirty (they held live data; a future tenant must not treat them as zero —
+/// the same rule [`manage_os_memory_ex`] applies to adopted host memory).
+///
+/// **Coalescing:** consecutive `memory.grow` reservations are address-
+/// contiguous, so a freed block usually lands exactly at the end of a
+/// previously adopted arena. When it does — and the arena is ours,
+/// non-exclusive, and has bitmap headroom — the arena is EXTENDED in place
+/// rather than a new one registered: the new chunks' dirty bits are published
+/// before the enlarged `chunks`/`size` counts (`Release`/`Acquire`), so a
+/// scanner never sees a chunk whose state it cannot trust. Extension is what
+/// keeps the fixed `MAX_ARENAS` table from filling: the common
+/// grow-free-grow-free pattern collapses into ONE arena that tracks the peak
+/// footprint, instead of one slot per 32 MiB forever.
+///
+/// Returns the arena id (existing on extension, fresh on registration), or
+/// `None` for a block this module cannot recycle — not chunk-aligned, not a
+/// whole number of chunks, or the table is full — in which case the caller
+/// falls through to `prim::free` and, on a no-return platform, the block is
+/// lost (which is why [`crate::os::alloc_aligned`] rounds segment-aligned
+/// requests up to whole chunks there).
+///
+/// Registration allocates the descriptor through [`os::alloc_aligned`]; that
+/// is an ALLOCATION, never a free, so it cannot re-enter this function.
+#[allow(clippy::needless_range_loop)] // indexed scan over a fixed atomic table
+pub(crate) fn adopt_os_block(ptr: *mut u8, size: usize) -> Option<i32> {
+    let addr = ptr.addr();
+    if size == 0 || !addr.is_multiple_of(SEGMENT_SIZE) || !size.is_multiple_of(SEGMENT_SIZE) {
+        return None;
+    }
+    let n = size / SEGMENT_SIZE;
+    // Serialise against other adopters and the multi-chunk allocator; the
+    // lock-free single-chunk paths are ordered by the Release publication
+    // below. (On wasm, the only platform whose os::free reaches here, there
+    // is exactly one thread anyway.)
+    while MULTI_LOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    let id = (|| {
+        let count = ARENA_COUNT.load(Ordering::Acquire).min(MAX_ARENAS);
+        for id in 0..count {
+            let a = ARENAS[id].load(Ordering::Acquire);
+            if a.is_null() {
+                continue;
+            }
+            // SAFETY: live descriptor; extension writes stay inside the
+            // fixed-size bitmap arrays per the MAX_CHUNKS bound.
+            unsafe {
+                if (*a).exclusive || !(*a).owned {
+                    continue;
+                }
+                let chunks = (*a).chunks.load(Ordering::Acquire);
+                if (*a).base.addr() + chunks * SEGMENT_SIZE != addr || chunks + n > MAX_CHUNKS {
+                    continue;
+                }
+                // Dirty bits FIRST, counts after: a reader that observes the
+                // new count must observe the new chunks as dirty.
+                for j in chunks..chunks + n {
+                    (*a).dirty[j / 64].fetch_or(1 << (j % 64), Ordering::AcqRel);
+                    (*a).used[j / 64].fetch_and(!(1 << (j % 64)), Ordering::AcqRel);
+                }
+                (*a).chunks.store(chunks + n, Ordering::Release);
+                (*a).size
+                    .store((chunks + n) * SEGMENT_SIZE, Ordering::Release);
+                return Some(id as i32);
+            }
+        }
+        None
+    })();
+    MULTI_LOCK.store(false, Ordering::Release);
+    if id.is_some() {
+        return id;
+    }
+    // No adjacent arena: register the block as its own. Chunks start free;
+    // pre-mark them dirty exactly as manage_os_memory_ex does.
+    let id = arena_register(ptr, size, false, true, -1).ok()?;
+    let a = ARENAS[id as usize].load(Ordering::Acquire);
+    // SAFETY: freshly registered live descriptor.
+    unsafe {
+        for j in 0..n {
+            (*a).dirty[j / 64].fetch_or(1 << (j % 64), Ordering::AcqRel);
+        }
+    }
+    Some(id)
 }
 
 /// `mi_arena_area`: the arena's base and size, or null.
@@ -391,7 +542,7 @@ pub fn arena_area(id: i32) -> (*mut u8, usize) {
         return (ptr::null_mut(), 0);
     }
     // SAFETY: live descriptor.
-    unsafe { ((*a).base, (*a).size) }
+    unsafe { ((*a).base, (*a).size.load(Ordering::Acquire)) }
 }
 
 /// Debug print of arena occupancy (mi_debug_show_arenas / mi_arenas_print).
@@ -409,16 +560,17 @@ pub fn arenas_print(out: &mut dyn FnMut(&str)) {
         }
         // SAFETY: live descriptor.
         unsafe {
+            let chunks = (*a).chunks.load(Ordering::Acquire);
             let mut used = 0usize;
-            for w in 0..(*a).chunks.div_ceil(64) {
+            for w in 0..chunks.div_ceil(64) {
                 used += (*a).used[w].load(Ordering::Relaxed).count_ones() as usize;
             }
             let mut line = heapless_fmt(
                 id,
                 (*a).base.addr(),
-                (*a).size,
+                (*a).size.load(Ordering::Acquire),
                 used,
-                (*a).chunks,
+                chunks,
                 (*a).exclusive,
             );
             out(line.as_str());
@@ -442,4 +594,111 @@ fn heapless_fmt(
         size / (1024 * 1024),
         if excl { " (exclusive)" } else { "" }
     )
+}
+
+#[cfg(test)]
+mod adopt_tests {
+    use super::*;
+
+    /// The wasm leak, replayed natively: a chunk-granular OS block is adopted,
+    /// and the SAME memory comes back from chunk_alloc — restricted to the
+    /// adopted arena's id so a parallel test's arenas cannot satisfy the
+    /// assertion by accident.
+    #[test]
+    fn adopted_block_recycles_through_chunk_alloc() {
+        let b = os::alloc_aligned(2 * SEGMENT_SIZE, SEGMENT_SIZE, true, false)
+            .expect("64 MiB test reservation");
+        let id = adopt_os_block(b.ptr, 2 * SEGMENT_SIZE).expect("adoptable block");
+
+        let (p1, zero1) = chunk_alloc(id).expect("first adopted chunk");
+        let (p2, _) = chunk_alloc(id).expect("second adopted chunk");
+        assert!(chunk_alloc(id).is_none(), "arena has exactly two chunks");
+        // Adoption must pre-mark chunks dirty: the block held live data, so a
+        // tenant that trusted a zero claim would read stale bytes.
+        assert!(!zero1, "adopted chunk claimed to be zero");
+        let got: [usize; 2] = [p1.addr().min(p2.addr()), p1.addr().max(p2.addr())];
+        assert_eq!(
+            got,
+            [b.ptr.addr(), b.ptr.addr() + SEGMENT_SIZE],
+            "chunk_alloc returned memory other than the adopted block"
+        );
+        assert!(
+            chunk_free(p1) && chunk_free(p2),
+            "adopted chunks must free back"
+        );
+        // And the cycle repeats: the leak is fixed only if this never runs dry.
+        for _ in 0..8 {
+            let (q, _) = chunk_alloc(id).expect("recycled chunk");
+            assert!(chunk_free(q));
+        }
+        // Deliberately NOT os::free'd: arenas hold their memory for the
+        // process lifetime, which is the adoption contract.
+    }
+
+    /// A block that lands exactly at an adopted arena's end EXTENDS it —
+    /// same id, more chunks — because on wasm consecutive `memory.grow`
+    /// blocks are contiguous and one growing arena is what keeps the fixed
+    /// MAX_ARENAS table from filling.
+    #[test]
+    fn adjacent_adoption_extends_in_place() {
+        let b = os::alloc_aligned(3 * SEGMENT_SIZE, SEGMENT_SIZE, true, false)
+            .expect("96 MiB test reservation");
+        let first = adopt_os_block(b.ptr, SEGMENT_SIZE).expect("first block");
+        // SAFETY: one chunk into the same live reservation.
+        let mid = unsafe { b.ptr.add(SEGMENT_SIZE) };
+        let second = adopt_os_block(mid, 2 * SEGMENT_SIZE).expect("adjacent block");
+        assert_eq!(
+            first, second,
+            "adjacent block registered a new arena instead of extending"
+        );
+        let (_, sz) = arena_area(first);
+        assert_eq!(
+            sz,
+            3 * SEGMENT_SIZE,
+            "extension did not publish the new size"
+        );
+        // All three chunks allocate and free through the one arena.
+        let mut got = [0usize; 3];
+        for slot in got.iter_mut() {
+            let (p, zero) = chunk_alloc(first).expect("extended arena chunk");
+            assert!(!zero, "extended chunk claimed to be zero");
+            *slot = p.addr();
+        }
+        assert!(chunk_alloc(first).is_none());
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            [
+                b.ptr.addr(),
+                b.ptr.addr() + SEGMENT_SIZE,
+                b.ptr.addr() + 2 * SEGMENT_SIZE
+            ]
+        );
+        for a in got {
+            assert!(chunk_free(b.ptr.with_addr(a)));
+        }
+    }
+
+    /// Blocks the arena cannot recycle are refused, so os::free falls through
+    /// to the prim rather than corrupting the chunk map.
+    #[test]
+    fn ragged_blocks_are_refused() {
+        let b = os::alloc_aligned(SEGMENT_SIZE, SEGMENT_SIZE, true, false)
+            .expect("32 MiB test reservation");
+        // SAFETY: interior pointer / in-range sizes of a live reservation.
+        unsafe {
+            let misaligned = b.ptr.add(os::page_size());
+            assert!(adopt_os_block(misaligned, SEGMENT_SIZE - os::page_size()).is_none());
+            assert!(adopt_os_block(b.ptr, SEGMENT_SIZE / 2).is_none());
+            assert!(adopt_os_block(b.ptr, 0).is_none());
+        }
+        let freed = os::OsBlock {
+            ptr: b.ptr,
+            size: b.size,
+            is_large: false,
+            is_zero: false,
+        };
+        // SAFETY: our unfreed reservation with no live references.
+        unsafe { os::free(freed).expect("native free") };
+    }
 }

@@ -6,10 +6,15 @@
 //! semantic difference the layers above must be able to live with:
 //!
 //! - **`free` is a no-op.** Linear memory cannot shrink, so a released
-//!   reservation is returned to *our* segment/arena caches, never to the host.
-//!   This is the same trade upstream documents for wasi ("wasi heap cannot be
-//!   shrunk"). It makes the allocator's own segment cache load-bearing on wasm
-//!   rather than merely an optimisation.
+//!   reservation can never reach the host. This is the same trade upstream
+//!   documents for wasi ("wasi heap cannot be shrunk"). What makes it safe is
+//!   `os::free` handing every such block to `arena::adopt_os_block` BEFORE the
+//!   no-op is reached, which turns the arena into the free list this platform
+//!   otherwise lacks. (An earlier version of this comment attributed that role
+//!   to a "segment cache" — no such cache exists in this remake, upstream v2
+//!   deleted it when arenas replaced it, and with arenas also disabled on wasm
+//!   the no-op stranded one whole 32 MiB segment per large alloc/free cycle.
+//!   The doc asserted a recycling layer the code did not have.)
 //! - **Alignment costs a one-time pad.** `memory.grow` returns 64 KiB-aligned
 //!   memory, but a segment needs `SEGMENT_SIZE` (32 MiB) alignment. We read the
 //!   current end of memory, grow by `pad + size`, and hand back the aligned
@@ -88,8 +93,12 @@ pub(super) unsafe fn alloc(
     })
 }
 
-/// No-op: wasm linear memory cannot shrink. The range stays mapped and is
-/// recycled by our own segment/arena caches instead.
+/// No-op: wasm linear memory cannot shrink. The range stays mapped — and is
+/// NOT recycled here: recycling happens one layer up, where `os::free` adopts
+/// the block into the arena (`arena::adopt_os_block`) before this no-op is
+/// ever reached (`prim::FREE_RETURNS_MEMORY == false` is the switch). A block
+/// that does arrive here is genuinely lost, which is why `os::alloc_aligned`
+/// makes every segment-aligned reservation chunk-granular on this platform.
 pub(super) unsafe fn free(_ptr: *mut u8, _size: usize) -> Result<(), PrimError> {
     Ok(())
 }
