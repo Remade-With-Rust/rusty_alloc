@@ -14,7 +14,7 @@ readme = "README.md"
 [dependencies]
 # A published crate needs a VERSION alongside the path: the path is what the
 # workspace builds against, the version is what crates.io resolves.
-rusty_alloc = { path = "../rusty_alloc", version = "1.1.5" }
+rusty_alloc = { path = "../rusty_alloc", version = "1.1.6" }
 
 [features]
 debug_checks = ["rusty_alloc/debug_checks"]
