@@ -1,3 +1,8 @@
+> **In the wild** — [RAG Converter](https://ragconverter.com) uses `rusty_alloc` as the allocator, in wasm too.
+> It makes personal and work files AI-readable without them leaving the machine:
+> the whole conversion runs as WebAssembly in the browser tab, with nothing
+> uploaded and nothing to install.
+
 # rusty_alloc
 
 A pure-Rust remake of [mimalloc](https://github.com/microsoft/mimalloc) — the
