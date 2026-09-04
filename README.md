@@ -4,7 +4,8 @@
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![remade with rust](https://img.shields.io/badge/remade--with--rust-portfolio-orange.svg)](https://github.com/remade-with-rust)
 
-> **In the wild** — rusty_alloc has 5,945 active installs. [RAG Converter](https://ragconverter.com) uses `rusty_alloc` as the allocator, in wasm too.
+# In The Wild with 5,945 Active Installs
+> [RAG Converter](https://ragconverter.com) uses `rusty_alloc` as the allocator, in wasm too.
 > It makes personal and work files AI-readable without them leaving the machine:
 > the whole conversion runs as WebAssembly in the browser tab, with nothing
 > uploaded and nothing to install.
@@ -16,7 +17,7 @@ architecture rebuilt from the design rather than transliterated from the C. No
 C in the dependency tree, permissive licence, and a safety property upstream
 does not offer.
 
-## ⚡ The headline
+## The headline
 
 - **At-or-below mimalloc on instructions retired** on real programs under
   `LD_PRELOAD` (lua 0.97×, perl 0.99×, sqlite 1.00×), **2–16% under jemalloc**
