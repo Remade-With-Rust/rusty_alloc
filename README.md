@@ -4,7 +4,7 @@
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![remade with rust](https://img.shields.io/badge/remade--with--rust-portfolio-orange.svg)](https://github.com/remade-with-rust)
 
-> **In the wild** — [RAG Converter](https://ragconverter.com) uses `rusty_alloc` as the allocator, in wasm too.
+> **In the wild** — rusty_alloc has 5,945 active installs. [RAG Converter](https://ragconverter.com) uses `rusty_alloc` as the allocator, in wasm too.
 > It makes personal and work files AI-readable without them leaving the machine:
 > the whole conversion runs as WebAssembly in the browser tab, with nothing
 > uploaded and nothing to install.
