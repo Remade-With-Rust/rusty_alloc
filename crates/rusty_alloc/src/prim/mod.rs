@@ -28,6 +28,22 @@ pub mod mock;
 #[cfg(miri)]
 use mock as sys;
 
+// A target with no OS at all — a microcontroller, where memory is a region the
+// linker reserved (P1 of `docs/plans/small-metal.md`). This is the fifth arm
+// P0 found missing: `riscv32imac-unknown-none-elf` is none of the four above,
+// so before this existed no `sys` was named at all and every call through the
+// seam failed together.
+//
+// ALWAYS COMPILED, so it is type-checked and unit-tested on the host;
+// SELECTED only where no arm above matches, so no host build changes.
+#[cfg_attr(
+    any(windows, unix, all(target_arch = "wasm32", not(miri)), miri),
+    allow(dead_code)
+)]
+pub mod fixed;
+#[cfg(all(not(miri), not(windows), not(unix), not(target_arch = "wasm32")))]
+use fixed as sys;
+
 use core::ffi::c_void;
 
 /// OS error code (`GetLastError` on Windows, `errno` on unix, synthetic in mock).

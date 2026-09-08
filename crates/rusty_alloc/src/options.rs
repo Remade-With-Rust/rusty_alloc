@@ -8,10 +8,198 @@
 //! yes/no/on/off; sizes are plain integers (`_size` options are KiB).
 
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+
+// The only two 64-bit atomics left in the crate, and the only two whose width
+// is a CONTRACT rather than a choice (P3 of `docs/plans/small-metal.md`):
+// `VALUES` backs `options::{get,set}`, which are `i64` in an API frozen at
+// v2.0.0, and `HEARTBEAT` is handed to a registered `DeferredFreeFun` whose C
+// ABI declares it `u64`. Every other 64-bit atomic in the crate was a bitmap
+// and was narrowed to `u32` instead. On a target with the real thing this is
+// `core`; only 32-bit RISC-V / Xtensa pull the shim, and only there.
+#[cfg(target_has_atomic = "64")]
+use core::sync::atomic::{AtomicI64, AtomicU64};
+// With `std` on a 32-bit target, threads are real and the shim's lock table is
+// the honest answer. Without it, the crate already serves `no_std` only on
+// single-threaded targets — that is what `lib.rs`'s `SingleThreadCell` rests on
+// — so paying `portable_atomic`'s lock table (measured at **4,288 bytes of
+// BSS** in a shipped XIAO ESP32-S3 firmware, larger than the heap descriptor
+// the allocator starts with) buys atomicity nothing can observe. Two `u32`
+// halves cost 8 bytes and no lock. See `split64` below.
+#[cfg(all(not(target_has_atomic = "64"), feature = "std"))]
+use portable_atomic::{AtomicI64, AtomicU64};
+#[cfg(all(not(target_has_atomic = "64"), not(feature = "std")))]
+use split64::{AtomicI64, AtomicU64};
+
+/// A 64-bit atomic as two `AtomicU32` halves, for single-threaded `no_std`.
+///
+/// **Sound only because the crate is single-threaded wherever it is used** —
+/// the same standing assumption as `lib.rs`'s `SingleThreadCell`, `prim::fixed`'s
+/// constant thread id, and its never-contended spin lock. A `no_std` build on a
+/// target that grows threads must revisit all four together. Nothing here is
+/// `unsafe`: a struct of `AtomicU32` is `Sync` already, so this adds no unsafe
+/// to the crate.
+///
+/// Only the four operations `options.rs` actually performs are provided; a
+/// fifth would need its own thought about which half moves first.
+///
+/// **Orderings are normalised, not forwarded.** A caller's `Ordering` describes
+/// one 64-bit access; this performs two 32-bit ones, so there is nothing
+/// faithful to forward it to. Forwarding is also a panic: `AtomicU32::load`
+/// rejects `Release`/`AcqRel` and `store` rejects `Acquire`/`AcqRel`, so the
+/// `compare_exchange(.., AcqRel, ..)` that `set_default` performs would abort
+/// the firmware. Loads use `Acquire` and stores `Release` — valid for every
+/// caller, and stronger than a single-threaded target can observe.
+// `test` in the cfg so the module COMPILES AND ITS TEST RUNS on the host. Gated
+// only on the target that uses it, the test below would never execute anywhere
+// CI or a developer runs — and a test that cannot run is worse than no test,
+// because it looks like coverage.
+#[cfg(any(all(not(target_has_atomic = "64"), not(feature = "std")), test))]
+mod split64 {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    /// Split a `u64` into `(lo, hi)` and back. Free-standing so both wrappers
+    /// share one definition of which half is which.
+    const fn split(v: u64) -> (u32, u32) {
+        (v as u32, (v >> 32) as u32)
+    }
+    const fn join(lo: u32, hi: u32) -> u64 {
+        ((hi as u64) << 32) | lo as u64
+    }
+
+    #[derive(Debug)]
+    pub struct AtomicU64 {
+        lo: AtomicU32,
+        hi: AtomicU32,
+    }
+
+    impl AtomicU64 {
+        pub const fn new(v: u64) -> Self {
+            let (lo, hi) = split(v);
+            Self {
+                lo: AtomicU32::new(lo),
+                hi: AtomicU32::new(hi),
+            }
+        }
+        pub fn load(&self, _ord: Ordering) -> u64 {
+            join(
+                self.lo.load(Ordering::Acquire),
+                self.hi.load(Ordering::Acquire),
+            )
+        }
+        pub fn store(&self, v: u64, _ord: Ordering) {
+            let (lo, hi) = split(v);
+            self.lo.store(lo, Ordering::Release);
+            self.hi.store(hi, Ordering::Release);
+        }
+        pub fn fetch_add(&self, v: u64, ord: Ordering) -> u64 {
+            let prev = self.load(ord);
+            self.store(prev.wrapping_add(v), ord);
+            prev
+        }
+    }
+
+    /// The signed half of the same thing: options are `i64` in an API frozen at
+    /// v2.0.0, and the bit pattern round-trips exactly.
+    #[derive(Debug)]
+    pub struct AtomicI64(AtomicU64);
+
+    impl AtomicI64 {
+        pub const fn new(v: i64) -> Self {
+            Self(AtomicU64::new(v as u64))
+        }
+        pub fn load(&self, ord: Ordering) -> i64 {
+            self.0.load(ord) as i64
+        }
+        pub fn store(&self, v: i64, ord: Ordering) {
+            self.0.store(v as u64, ord);
+        }
+        /// `Ordering` pair mirrors `core`'s signature; single-threaded, so the
+        /// read-compare-write cannot be interleaved.
+        pub fn compare_exchange(
+            &self,
+            current: i64,
+            new: i64,
+            success: Ordering,
+            _failure: Ordering,
+        ) -> Result<i64, i64> {
+            let seen = self.load(success);
+            if seen == current {
+                self.store(new, success);
+                Ok(seen)
+            } else {
+                Err(seen)
+            }
+        }
+    }
+
+    /// The orderings `options.rs` actually passes, exercised so a future caller
+    /// forwarding `AcqRel` cannot reintroduce the panic the module doc names.
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn every_ordering_options_uses_is_accepted() {
+            let v = AtomicI64::new(i64::MIN);
+            v.store(-1, Ordering::Release);
+            assert_eq!(v.load(Ordering::Acquire), -1);
+            // `set_default`'s ordering pair — the one that would abort.
+            assert_eq!(
+                v.compare_exchange(-1, 7, Ordering::AcqRel, Ordering::Acquire),
+                Ok(-1)
+            );
+            assert_eq!(v.load(Ordering::Acquire), 7);
+            assert_eq!(
+                v.compare_exchange(-1, 9, Ordering::AcqRel, Ordering::Acquire),
+                Err(7)
+            );
+
+            // Halves join in the right order across the 32-bit boundary.
+            let u = AtomicU64::new(u64::from(u32::MAX));
+            assert_eq!(u.fetch_add(1, Ordering::Relaxed), u64::from(u32::MAX));
+            assert_eq!(u.load(Ordering::Relaxed), 1u64 << 32);
+        }
+    }
+}
 
 /// Number of options (== `_mi_option_last` in v2.4.5).
 pub const OPTION_COUNT: usize = 38;
+
+/// Index of `generic_collect` in [`OPTION_NAMES`] — how many trips of the
+/// allocator's generic (slow) path go by between automatic collects.
+///
+/// Named because it is the one option the allocator reads on its own hot-ish
+/// path. It was declared with a default of 10,000 and **read by nothing** until
+/// P4d of `docs/plans/small-metal.md`, which is why a small-profile heap could
+/// starve on its own per-class page cache and never recover.
+pub const GENERIC_COLLECT: usize = 36;
+const _: () = assert!(GENERIC_COLLECT < OPTION_COUNT);
+
+/// Default trips of the generic path between automatic collects.
+///
+/// Upstream's 10,000 is tuned for a segment of 512 slices, where one cached
+/// page per size class is 14 % of the segment and waiting is free. At the small
+/// profile a segment holds 16, so ~24 classes is every slice there is — and the
+/// P4d stress battery makes only ~649 generic trips in TOTAL, so a 10,000-trip
+/// timer never fires at all before the heap has starved.
+///
+/// **This is the cheap half of upstream's `retire_expire`.** That mechanism
+/// gives each retired page its own countdown, decremented on every generic
+/// trip, so a sole empty page ages out after ~16 rather than waiting for a
+/// sweep. Implementing it means tracking a retired-bin range on the heap, and
+/// `alloc::retire_or_abort` is deliberately written to decide keep-one-warm
+/// from the PAGE's own links precisely so it never has to resolve the heap —
+/// a measured optimisation. Since `collect` now reclaims a bin's last page,
+/// a short sweep period buys the same ageing without touching that path.
+/// Upstream's per-page countdown stays unimplemented and is recorded in
+/// `docs/plans/small-metal.md` §6.
+/// Shipped geometry: upstream's 10,000.
+#[cfg(not(ra_small_profile))]
+pub const GENERIC_COLLECT_DEFAULT: i64 = 10_000;
+/// Small profile: 512, for the reasons above.
+#[cfg(ra_small_profile)]
+pub const GENERIC_COLLECT_DEFAULT: i64 = 512;
 
 /// Option names in ABI index order (also the env-var suffixes, uppercased).
 pub const OPTION_NAMES: [&str; OPTION_COUNT] = [
@@ -69,7 +257,10 @@ const DEFAULTS: [i64; OPTION_COUNT] = [
     // abandoned_page_purge defaults ON (upstream does the same). An abandoned
     // segment has no owner to reuse its pages, so holding them resident buys
     // nothing and costs 32 MiB a time — the RSS tail measured against mimalloc.
-    0, 0, 0, 1,         // deprecated x3 / abandoned_page_purge(1)
+    0,
+    0,
+    0,
+    1,         // deprecated x3 / abandoned_page_purge(1)
     1,         // eager_commit_delay
     -1,        // purge_delay: v1 ships purging OPT-IN (see LEDGER M8 open defect)
     0,         // use_numa_nodes
@@ -86,12 +277,14 @@ const DEFAULTS: [i64; OPTION_COUNT] = [
     0,         // disallow_arena_alloc
     400,       // retry_on_oom (ms)
     0,         // visit_abandoned
-    0, 0, 0,     // guarded_min/max/precise
-    1000,  // guarded_sample_rate
-    0,     // guarded_sample_seed
-    0,     // target_segments_per_thread
-    10000, // generic_collect
-    1,     // allow_thp
+    0,
+    0,
+    0,                       // guarded_min/max/precise
+    1000,                    // guarded_sample_rate
+    0,                       // guarded_sample_seed
+    0,                       // target_segments_per_thread
+    GENERIC_COLLECT_DEFAULT, // generic_collect
+    1,                       // allow_thp
 ];
 
 static VALUES: [AtomicI64; OPTION_COUNT] = [const { AtomicI64::new(i64::MIN) }; OPTION_COUNT];
@@ -101,17 +294,42 @@ fn ensure_init() {
     if ENV_PARSED.swap(true, Ordering::AcqRel) {
         return;
     }
+    // A firmware has no environment, no owned strings and no formatter, so
+    // without `std` every option keeps its compiled-in default — the whole of
+    // the no_std option story (P3 of `docs/plans/small-metal.md`, §2.5). This
+    // is deletion, not a port: there is nothing to read, so the environment
+    // pass does not exist rather than existing and returning nothing.
+    for i in 0..OPTION_COUNT {
+        VALUES[i].store(DEFAULTS[i], Ordering::Release);
+    }
+    // ...and neither has `wasm32-unknown-unknown`. `std::env::var` there is a
+    // stub that always fails, so this loop formatted 76 strings, allocated 76
+    // `String`s and read an environment that cannot exist — on every startup,
+    // to find nothing. It also dragged `core::fmt`, `alloc::fmt::format` and
+    // `str::to_uppercase` into a module that otherwise needs none of them:
+    // `options::get` was the LARGEST function in a wasm build at 3,708 bytes,
+    // ahead of anything in the allocator proper. Same deletion as the `no_std`
+    // arm above, for the same reason — there is nothing to read.
+    //
+    // `target_os = "unknown"` and not `target_arch` alone: wasm32-wasip1 does
+    // have an environment and keeps the pass.
+    #[cfg(all(
+        feature = "std",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     for i in 0..OPTION_COUNT {
         let name = OPTION_NAMES[i].to_uppercase();
-        let val = std::env::var(format!("RUSTY_ALLOC_{name}"))
-            .or_else(|_| std::env::var(format!("MIMALLOC_{name}")))
+        let val = std::env::var(std::format!("RUSTY_ALLOC_{name}"))
+            .or_else(|_| std::env::var(std::format!("MIMALLOC_{name}")))
             .ok()
             .and_then(|s| parse_value(&s));
-        let v = val.unwrap_or(DEFAULTS[i]);
-        VALUES[i].store(v, Ordering::Release);
+        if let Some(v) = val {
+            VALUES[i].store(v, Ordering::Release);
+        }
     }
 }
 
+#[cfg(feature = "std")]
 fn parse_value(s: &str) -> Option<i64> {
     match s.trim().to_ascii_lowercase().as_str() {
         "" | "1" | "true" | "yes" | "on" => Some(1),
@@ -171,6 +389,11 @@ pub fn get_size(option: usize) -> usize {
 }
 
 /// `mi_options_print` via the output hook.
+///
+/// std-only: building the line needs an owned string. A `no_std` consumer that
+/// wants this can format into a stack buffer and call [`out_fmt`], which is
+/// the seam that survives.
+#[cfg(feature = "std")]
 pub fn print() {
     ensure_init();
     for (i, name) in OPTION_NAMES.iter().enumerate() {
@@ -244,10 +467,23 @@ pub fn register_deferred_free(f: Option<DeferredFreeFun>, arg: *mut c_void) {
 }
 
 /// Route a message to the registered output hook, else stderr.
+///
+/// Takes `&str` and needs no allocation, so this SEAM survives `no_std` — a
+/// firmware that registers an output hook still gets the allocator's messages
+/// over its serial log. Only the *stderr fallback* and the `format!`-based
+/// CALLERS are std-only (P3 of `docs/plans/small-metal.md`, §2.5).
 pub fn out_fmt(msg: &str) {
     let (f, a) = OUTPUT_FUN.load();
     if f.is_null() {
-        eprint!("{msg}");
+        // `write_all`, not `eprint!`. The macro formats, and formatting is not
+        // free: `core::fmt`, `Display for str` and `Display for u64` are ~2.5 KiB
+        // of wasm that this one interpolation of an ALREADY-`&str` argument
+        // pulled into every build. Bytes to a writer need none of it.
+        #[cfg(feature = "std")]
+        {
+            use std::io::Write;
+            let _ = std::io::stderr().write_all(msg.as_bytes());
+        }
         return;
     }
     // NUL-terminate on the stack for the C hook (bounded copy).
@@ -263,18 +499,47 @@ pub fn out_fmt(msg: &str) {
     }
 }
 
-/// Report an error code through the hook (else stderr when show_errors).
-pub fn error(err: i32) {
-    let (f, a) = ERROR_FUN.load();
-    if !f.is_null() {
-        // SAFETY: registered with the documented signature.
-        unsafe {
-            let fun: ErrorFun = core::mem::transmute::<*mut c_void, ErrorFun>(f);
-            fun(err, a);
-        }
-    } else if is_enabled(0) {
-        out_fmt(&format!("rusty_alloc: error {err}\n"));
+/// `"rusty_alloc: error <n>\n"` into `buf`, without a formatter.
+///
+/// Hand-rendered because `format!` on a single integer is what dragged
+/// `core::fmt` into every build; see [`error`]. The buffer is sized for the
+/// prefix plus the longest `i32` (`-2147483648`) plus the newline.
+fn render_error(buf: &mut [u8; 32], err: i32) -> &str {
+    const PREFIX: &[u8] = b"rusty_alloc: error ";
+    buf[..PREFIX.len()].copy_from_slice(PREFIX);
+    let mut n = PREFIX.len();
+    if err < 0 {
+        buf[n] = b'-';
+        n += 1;
     }
+    // `unsigned_abs`: negating `i32::MIN` overflows, and this path must not
+    // panic -- it is what runs when something has already gone wrong.
+    let mut v = err.unsigned_abs();
+    let mut digits = [0u8; 10];
+    let mut d = 0;
+    loop {
+        digits[d] = b'0' + (v % 10) as u8;
+        d += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    while d > 0 {
+        d -= 1;
+        buf[n] = digits[d];
+        n += 1;
+    }
+    buf[n] = b'\n';
+    n += 1;
+    // `from_utf8`, not `from_utf8_unchecked`: every byte above is ASCII by
+    // construction, so this cannot fail -- but validating 30 bytes on a path
+    // that only runs when something has already gone wrong is cheaper than
+    // adding an `unsafe` to the census for it.
+    core::str::from_utf8(&buf[..n]).unwrap_or(
+        "rusty_alloc: error
+",
+    )
 }
 
 /// Fire the deferred-free hook (called from the allocation heartbeat).
@@ -307,5 +572,48 @@ fn fire_deferred(force: bool) {
             let fun: DeferredFreeFun = core::mem::transmute::<*mut c_void, DeferredFreeFun>(f);
             fun(force, hb, a);
         }
+    }
+}
+
+/// Report an error code through the hook (else stderr when show_errors).
+pub fn error(err: i32) {
+    let (f, a) = ERROR_FUN.load();
+    if !f.is_null() {
+        // SAFETY: registered with the documented signature.
+        unsafe {
+            let fun: ErrorFun = core::mem::transmute::<*mut c_void, ErrorFun>(f);
+            fun(err, a);
+        }
+    } else if is_enabled(0) {
+        // Rendered into a stack buffer rather than `format!`. The error code is
+        // one integer; paying `core::fmt` plus an allocation for it linked the
+        // whole formatting machinery into a wasm module that never reports an
+        // error. It also means this fallback no longer needs `std`, so a
+        // firmware gets back the message P3 had to delete.
+        let mut buf = [0u8; 32];
+        out_fmt(render_error(&mut buf, err));
+    }
+}
+
+#[cfg(test)]
+mod render_error_tests {
+    use super::render_error;
+
+    /// Including the value that makes a naive `-err` overflow.
+    #[test]
+    fn renders_every_shape_without_a_formatter() {
+        let mut b = [0u8; 32];
+        assert_eq!(render_error(&mut b, 0), "rusty_alloc: error 0\n");
+        assert_eq!(render_error(&mut b, 7), "rusty_alloc: error 7\n");
+        assert_eq!(render_error(&mut b, 12345), "rusty_alloc: error 12345\n");
+        assert_eq!(render_error(&mut b, -1), "rusty_alloc: error -1\n");
+        assert_eq!(
+            render_error(&mut b, i32::MAX),
+            "rusty_alloc: error 2147483647\n"
+        );
+        assert_eq!(
+            render_error(&mut b, i32::MIN),
+            "rusty_alloc: error -2147483648\n"
+        );
     }
 }

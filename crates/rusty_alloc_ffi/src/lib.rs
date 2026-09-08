@@ -6,9 +6,16 @@
 //! M2 exports: the standard + extended allocation family (§5.1/§5.2 subset)
 //! and `mi_version`. Realloc/strdup land M3; posix/aligned family M5.
 //!
-//! Note: the *core* crate is no_std; this FFI shell links std (a no_std cdylib
-//! would need its own `#[panic_handler]`, which then collides with std in every
-//! test build). Panic across the C boundary aborts via the release profile.
+//! Note: the *core* crate can build `no_std` — `rusty_alloc`'s `std` feature is
+//! default-on and turning it off selects the single-heap profile (P3 of
+//! `docs/plans/small-metal.md`). **This shell always links std** and depends on
+//! the core with its default features, because a `no_std` cdylib would need its
+//! own `#[panic_handler]`, which then collides with std in every test build.
+//! Panic across the C boundary aborts via the release profile.
+//!
+//! Until 2026-09-07 this said "the core crate is no_std" flatly, and it was
+//! false: the core carried no `#![no_std]` at all. P0 of small-metal.md found
+//! it by reading, after the plan had already believed it.
 
 #![deny(missing_docs)]
 

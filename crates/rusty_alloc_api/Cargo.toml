@@ -14,9 +14,15 @@ readme = "README.md"
 [dependencies]
 # A published crate needs a VERSION alongside the path: the path is what the
 # workspace builds against, the version is what crates.io resolves.
-rusty_alloc = { path = "../rusty_alloc", version = "1.1.6" }
+rusty_alloc = { path = "../rusty_alloc", version = "2.0.0", default-features = false }
 
 [features]
+# Mirrors the core's (P3, docs/plans/small-metal.md). Default-on, so every
+# existing consumer is unchanged; a firmware takes `default-features = false`
+# and gets the single-heap no_std profile. This crate's own source has been
+# `no_std` since M2 — only the dependency's default features stood in the way.
+default = ["std"]
+std = ["rusty_alloc/std"]
 debug_checks = ["rusty_alloc/debug_checks"]
 profile = ["rusty_alloc/profile"]
 secure = ["rusty_alloc/secure"]

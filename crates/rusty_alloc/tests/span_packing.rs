@@ -12,8 +12,9 @@
 //! memory because on wasm a reservation is real, permanent memory.
 
 use rusty_alloc::alloc::{free, malloc, usable_size};
-use rusty_alloc::types::SEGMENT_SIZE;
+use rusty_alloc::types::{SEGMENT_SIZE, SEGMENT_SLICE_SIZE};
 
+#[cfg(not(ra_small_profile))]
 const MIB: usize = 1024 * 1024;
 
 fn segment_base(p: *mut u8) -> usize {
@@ -21,6 +22,7 @@ fn segment_base(p: *mut u8) -> usize {
 }
 
 /// Allocate, verify usability, and prove co-tenancy in one segment.
+#[cfg(not(ra_small_profile))]
 fn assert_share_one_segment(sizes: &[usize]) {
     let blocks: Vec<*mut u8> = sizes
         .iter()
@@ -58,6 +60,15 @@ fn assert_share_one_segment(sizes: &[usize]) {
 
 /// The report's 60 % row: 20 MiB (320 slices) now shares its segment —
 /// 8 MiB (128 slices) and ~3.9 MiB (62 slices) fit in the tail (510 ≤ 511).
+// Pinned to the SHIPPED 32 MiB geometry: these reproduce named rows of the
+// segment-tax field report (its 60 % row, its 27 % row, its 16 MiB face), and
+// a row is a size against a segment size. Under another geometry (P2,
+// `docs/plans/small-metal.md`) the same byte counts are not the same rows, so
+// re-expressing them in slices would keep them green while testing nothing
+// the report said. The geometry-INDEPENDENT half of this file
+// (`maximum_span_fills_one_segment_exactly`,
+// `one_past_the_boundary_is_huge_and_correct`) runs at every geometry.
+#[cfg(not(ra_small_profile))]
 #[test]
 fn twenty_mib_span_shares_its_segment() {
     assert_share_one_segment(&[20 * MIB, 8 * MIB, 62 * 64 * 1024]);
@@ -65,6 +76,15 @@ fn twenty_mib_span_shares_its_segment() {
 
 /// The report's 27 % row: a 25.1 MiB detector tensor (402 slices) leaves a
 /// 109-slice tail that a 6 MiB block (96 slices) fits inside.
+// Pinned to the SHIPPED 32 MiB geometry: these reproduce named rows of the
+// segment-tax field report (its 60 % row, its 27 % row, its 16 MiB face), and
+// a row is a size against a segment size. Under another geometry (P2,
+// `docs/plans/small-metal.md`) the same byte counts are not the same rows, so
+// re-expressing them in slices would keep them green while testing nothing
+// the report said. The geometry-INDEPENDENT half of this file
+// (`maximum_span_fills_one_segment_exactly`,
+// `one_past_the_boundary_is_huge_and_correct`) runs at every geometry.
+#[cfg(not(ra_small_profile))]
 #[test]
 fn detector_tensor_span_shares_its_segment() {
     assert_share_one_segment(&[402 * 64 * 1024, 6 * MIB]);
@@ -74,6 +94,15 @@ fn detector_tensor_span_shares_its_segment() {
 /// pair with ITSELF (2 x 256 slices > 511 usable), but its 255-slice tail is
 /// live real estate — a 15 MiB block (240 slices) shares the segment. This
 /// held before the routing change too; the test pins it against regression.
+// Pinned to the SHIPPED 32 MiB geometry: these reproduce named rows of the
+// segment-tax field report (its 60 % row, its 27 % row, its 16 MiB face), and
+// a row is a size against a segment size. Under another geometry (P2,
+// `docs/plans/small-metal.md`) the same byte counts are not the same rows, so
+// re-expressing them in slices would keep them green while testing nothing
+// the report said. The geometry-INDEPENDENT half of this file
+// (`maximum_span_fills_one_segment_exactly`,
+// `one_past_the_boundary_is_huge_and_correct`) runs at every geometry.
+#[cfg(not(ra_small_profile))]
 #[test]
 fn sixteen_mib_tail_is_usable() {
     assert_share_one_segment(&[16 * MIB, 15 * MIB]);
@@ -94,7 +123,7 @@ fn maximum_span_fills_one_segment_exactly() {
         *p.add(n - 1) = 0xA5;
         assert_eq!(
             p as usize - segment_base(p),
-            64 * 1024,
+            SEGMENT_SLICE_SIZE,
             "maximum span did not start at the first usable slice"
         );
         assert_eq!(*p, 0x5A);

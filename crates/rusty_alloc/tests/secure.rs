@@ -115,10 +115,17 @@ fn purge_returns_memory() {
     let before = rusty_alloc::alloc::stats().purges;
     let mut ps = Vec::new();
     for _ in 0..24 {
-        let p = malloc(600 * 1024); // multi-slice spans
+        // A span big enough to purge: `span_free` only purges spans of
+        // >= MEDIUM_PAGE_SLICES. Derived, because "600 KiB" encodes the
+        // shipped geometry — under a different one it can land past
+        // LARGE_OBJ_SIZE_MAX and become a huge segment, which is released
+        // rather than purged.
+        let span = rusty_alloc::types::SEGMENT_SLICE_SIZE * rusty_alloc::types::MEDIUM_PAGE_SLICES
+            + rusty_alloc::types::SEGMENT_SLICE_SIZE;
+        let p = malloc(span);
         assert!(!p.is_null());
         // SAFETY: live block; touch to commit.
-        unsafe { core::ptr::write_bytes(p, 1, 600 * 1024) };
+        unsafe { core::ptr::write_bytes(p, 1, span) };
         ps.push(p);
     }
     for p in ps {

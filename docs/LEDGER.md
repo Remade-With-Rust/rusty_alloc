@@ -4,6 +4,1141 @@ One entry per milestone/brick: what landed, the numbers with their method lines,
 what was reverted and **which kind** of revert (measured-worse vs within-noise).
 Newest first.
 
+## SMALL-METAL P5 — the six production blockers, closed (2026-09-07)
+
+"Is this commercial ready?" produced six blockers against the post-P4e state.
+This is what closing them cost and what it changed.
+
+### 1. CI gated none of the embedded work
+
+`ci.yml` built wasm but never set `ra_small_profile`, never passed
+`--no-default-features`, and never targeted a chip. Every defect P0-P4e found —
+five in shipped code — would have passed it. New `embedded` job: the
+small-profile test suite, clippy on the small profile AND `no_std`, and builds
+of BOTH bare-metal RISC-V targets at BOTH geometries, plus `rusty_alloc-api`.
+Xtensa stays out (not a stock rustup target); the board runs are evidence, not
+a gate. Every command in the job was run locally first.
+
+### 2. The release state was incoherent
+
+`Cargo.toml` 1.1.5, README "1.1.4", tags stopping at v1.1.4, and a commit titled
+`chore: release v2.0.0`. Cause: release-plz titled the PR after
+`rusty_alloc_api`'s major while the workspace went to 1.1.5. README now says
+what is released and that `main` is ahead; CHANGELOG `[Unreleased]` documents
+every fix and addition from this campaign, so the next release notes are true
+rather than generated from nothing.
+
+### 3. The published instruction counts were stale
+
+Measured at v1.1.5, predating every reclamation change. `bench/icount-arms.sh`
+already produces every column and nothing re-ran it. Scheduled `icount` CI job
+added (valgrind + oracle + override shim, uploads the table); README carries
+provenance and says the ratios are a FLOOR until re-run.
+
+### 4. Vacuous tests
+
+Four tests this campaign passed under the exact bug they guarded.
+`tools/gate-selftest.sh` reintroduces five real defects and requires the suite to
+go red for each — placement, collect-reclaims-last-page, the periodic collect,
+the reclaim-before-null, and split64's ordering normalisation. It refuses to
+count a mutation that did not apply or did not compile, so a moved anchor is a
+failure rather than a silent pass. Wired into CI beside `semgrep-selftest.sh`.
+All 5 fire; the script leaves every file byte-identical (verified with `cmp`).
+
+### 5. `retire_expire` — replaced with a measured sweep period
+
+Upstream ages a retired page out after ~16 generic trips. Implementing it needs
+a retired-bin range on the heap, and `alloc::retire_or_abort` is deliberately
+written to decide keep-one-warm from the page's own links so it never resolves
+the heap — a measured optimisation this machine cannot re-profile. Since
+`collect` now reclaims a bin's last page, the sweep period buys the same ageing.
+Swept on the board:
+
+| `generic_collect` | churn NULLs / 50,000 | ping | batch | churn | large |
+|---:|---:|---:|---:|---:|---:|
+| 10,000 (upstream) | 575 | 639 | 863 | 1,042 | 1,367 |
+| **512 (shipped)** | **357** | 640 | 871 | 1,069 | 1,380 |
+| 64 | 334 | 652 | 867 | **1,168** | 1,473 |
+
+64 costs 12 % of churn throughput for 23 fewer failures; 512 costs ~1 % for 218.
+Default is now geometry-aware: 10,000 shipped, 512 small profile. Upstream's
+per-page countdown stays unimplemented, recorded in §6.
+
+### 6. The `no_std` single-thread footgun
+
+`SingleThreadCell`'s `unsafe impl Sync`, `prim::fixed`'s constant thread id and
+spin lock, and `options`' split 64-bit atomics are sound only with one thread,
+and all three fail quietly. `no_std` now REFUSES to compile without
+`--cfg ra_single_threaded`; CI asserts the negative case.
+
+### A defect this pass created, and the tell that caught it
+
+Python's text-mode write emits `\r\n` on Windows, so every file rewritten by a
+helper script flipped LF -> CRLF. Real content diff: 85 lines in `heap.rs`.
+What git showed: 4,043. **`git diff -w` disagreeing with `git diff` by two
+orders of magnitude is the signature.** Normalised back to LF across 23 files;
+two files left CRLF because they are CRLF at HEAD.
+
+### Final numbers
+
+| workload | esp-alloc | rusty_alloc | speedup |
+|---|---:|---:|---:|
+| 32 B alloc/free | 1,638 | 640 | **2.56x** |
+| 64 mixed, batched | 1,792 | 871 | **2.06x** |
+| churn 64 live | 3,987 | 1,069 | **3.73x** |
+| 2048 B | 1,638 | 1,380 | 1.19x |
+
+Stress: capacity flat at 240 across the whole battery, 357 NULLs per 50,000
+churn allocations (from 22,533 before P4d). The two remaining refusals are the
+documented structural floor.
+
+### Verification
+
+106 tests / 33 suites / 0 failed (default); 89 / 19 / 0 (`ra_small_profile`);
+clippy `-D warnings` clean on default, small profile and `no_std`; fmt clean;
+unsafe census RATCHET OK; gate selftest 5/5 fire; both RISC-V targets at both
+geometries and wasm32 build; board kill test green at the 68 KiB floor.
+
+## SMALL-METAL P4e — reclamation fixed: churn NULLs 22,533 -> 575, capacity ratchet gone (2026-09-07)
+
+P4d found the capacity ratchet and fixed one third of it. P4e closes the rest and
+re-runs the whole esp-alloc comparison, stress and speed, on the XIAO ESP32-S3.
+
+### Three changes
+
+1. **Keep-one exemption removed from `collect` entirely.** P4d gated it on
+   `force`; that was a partial port. Upstream's `mi_heap_page_collect` frees an
+   all-free page at EVERY collect level ("this will free retired pages as well")
+   — the keep-one cache is `mi_page_retire`'s, on the free path.
+2. **`generic_collect` wired** — declared with a default of 10,000, read by
+   nothing. Now a per-heap countdown in the generic path, as upstream.
+3. **`malloc_generic` reclaims once before returning null.** The one that
+   mattered: the battery makes ~649 generic trips total, so a 10,000 threshold
+   never fires. An allocator must not report OOM while holding empty pages for
+   classes nobody asked for. Free on the happy path — it runs only on failure.
+
+### Stress, head to head at 192 KiB
+
+| test | esp-alloc | rusty BEFORE | rusty AFTER |
+|---|---|---|---|
+| boundaries / realloc chain / zalloc-over-dirty | PASS | FAIL | **PASS** |
+| fragmentation / exhaust-and-recover | PASS | PASS | PASS |
+| distinct classes held at once | 24 | 9 | **21** |
+| NULLs in 50,000 churn allocations | 0 | 22,533 | **575** |
+| 512 B capacity across the battery | flat 383 | **168 -> 8** | **flat 240** |
+
+Capacity no longer decays at all. The two remaining refusals are the documented
+structural floor: a `SEGMENT_SIZE`-aligned request needs a whole free 64 KiB
+segment, and 21-of-24 classes is what 30 slices hold once classes above 512 B
+cost four slices each.
+
+### Speed, and the price
+
+| workload | esp-alloc | rusty BEFORE | rusty AFTER | speedup |
+|---|---:|---:|---:|---:|
+| 32 B alloc/free | 1,638 | 625 | 639 | **2.56x** |
+| 64 mixed, batched | 1,792 | 844 | 863 | **2.08x** |
+| churn 64 live | 3,987 | 1,012 | 1,042 | **3.83x** |
+| 2048 B | 1,638 | 1,267 | 1,367 | 1.20x |
+
+**2.2-7.9 % of throughput**, for an allocator that no longer fails while holding
+reclaimable memory. esp-alloc reproduced to the nanosecond across sessions (same
+162 ns floor, same checksums), so the deltas are ours and not drift. README and
+crate README updated — the previously published 2.62x/2.12x/3.94x/1.29x are no
+longer what the code does.
+
+### The host test that asserted nothing, twice
+
+The reclaim-and-retry regression test passed WITH THE FIX REMOVED, in two
+versions running: (1) a 4-chunk arena is 128 MiB at the shipped geometry, where
+48 cached pages starve nothing — regated to `ra_small_profile`; (2) still
+passed, because the threshold was `served > 64` and the poisoned arm serves 128
+— both arms above it. Fixed by measuring both arms and putting the threshold
+between them: 240 with, 128 without, assert `> 192`. A threshold chosen before
+the arms are known is a guess.
+
+### Not implemented, and now on the list
+
+`mi_page_retire`'s `retire_expire` countdown does not exist here, which is why
+cached pages accumulate instead of ageing out. Also: the README's callgrind
+instruction counts predate these changes and need re-running under `LD_PRELOAD`
+before the next release.
+
+### Verification
+
+106 tests / 33 suites / 0 failed (default); 88 / 19 / 0 (`ra_small_profile`);
+three new tests, each poisoned to confirm it fires.
+
+## SMALL-METAL P4d — stress battery finds a collect defect: capacity decayed 168 -> 8 (2026-09-07)
+
+Every phase so far measured a workload that works. P4d ran eight adversarial
+tests on the board — routing boundaries, alignment to a whole segment, a realloc
+chain, zalloc over dirtied pages, a fragmentation adversary, exhaustion and
+recovery, a size-class sweep, and 50,000 churn ops — with every allocation
+null-checked so one failure does not end the run.
+
+### The defect
+
+`heap.rs::collect_inner` discarded `force` and applied the keep-one-page-per-bin
+exemption on every path, so `mi_collect(true)` could never reclaim a bin's last
+all-free page. Upstream's `mi_heap_page_collect` frees unconditionally at
+`MI_FORCE`; the keep-one cache belongs to `mi_page_retire`. Invisible at 512
+slices per segment, fatal at the small profile's 16:
+
+```
+512 B capacity as the battery touched classes: 168 -> 104 -> 72 -> 56 -> 24 -> 8
+collect(true):  8 before, 8 after   <- recovered nothing
+churn:          22,533 of 50,000 allocations NULL, with 61,440 bytes free
+```
+
+Fix is `force || !only_page_in_bin`. Measured on hardware:
+
+| | before | after |
+|---|---:|---:|
+| `collect(true)` capacity recovery, 192 KiB | 8 -> 8 | **8 -> 240** |
+| `collect(true)` capacity recovery, 68 KiB | — | **8 -> 120** |
+| NULLs in 50,000 churn ops, 192 KiB | 22,533 | **2,925** |
+| segments ever created (i.e. releasable) | 2 | **3** |
+
+Segments could not be released at all before: a single retained page pinned each
+one. Regression test `heaps::forced_collect_reclaims_a_bins_last_page` asserts
+both halves (unforced keeps the cache, forced reclaims it); poisoned it reports
+`retired 0 -> 0`.
+
+### The gap it exposed, deliberately not closed
+
+**`generic_collect` is declared with a default of 10,000 and never read.** The
+only collect callers are the two public entry points and teardown, so there is
+no automatic collect and the capacity a forced collect now recovers is never
+recovered on its own — which is why churn still returns NULL 2,925 times at
+192 KiB and 24,853 at 68 KiB from a heap one `collect(true)` restores. Wiring it
+moves behaviour on every platform including the published instruction counts, so
+it belongs to the callgrind harness, not a board. Now item 1 of the plan's §6.
+
+### Three structural limits, documented
+
+- **A whole-segment request needs a whole free segment.** 61,439 / 61,440 /
+  61,441 / 65,536 B and `align = 65,536` all return NULL at 192 KiB with 61,440
+  free, because that free space is not a contiguous aligned 64 KiB. Size an
+  embedded region as `k * 64 KiB + 4 KiB`.
+- **The `bins x page` floor, dynamically.** 21 of 24 classes in 2 segments — 30
+  usable slices, small classes 1 slice, classes above 512 B cost 4. It stops
+  exactly where §2.9's arithmetic says.
+- **68 KiB is workload-specific.** At that budget the battery holds 5 of 24
+  classes. §2.10's floor is the least that runs the fs sketch and nothing more;
+  the README now says so.
+
+### What did not break, and the control
+
+With reclamation between tests, `realloc_chain`, `zalloc_dirty`,
+`fragmentation` and `exhaust_recover` all PASS and capacity holds flat — prefix
+preservation across every routing boundary, re-zeroing of recycled dirty pages,
+2 KiB requests over a holed heap and full restoration after exhaustion are
+sound. Every failure was capacity, never correctness.
+
+**esp-alloc control: every test PASS, capacity flat at 383, no decay, no churn
+NULLs.** A linked-list heap has no per-class cache to starve on.
+
+### The battery's own double free
+
+The first run aborted in `page::double_free_abort` — a shared slot array the
+harness never cleared, so a later test freed stale addresses. The allocator was
+right and the harness was wrong, and the README's double-free claim is now
+demonstrated on silicon.
+
+### Verification
+
+105 tests / 33 suites / 0 failed (default); 87 / 19 / 0 (`ra_small_profile`) —
+both up one for the new regression test.
+
+## SMALL-METAL P4c — 2.1-3.9x faster than esp-alloc on silicon, at 8.5x the RAM (2026-09-07)
+
+Footprint was measured to death in P4b and esp-alloc wins it structurally.
+Throughput is the half rusty_alloc is actually built for and it was
+**unmeasured**, which made every claim about it an opinion. Measured now, on the
+same XIAO ESP32-S3 Sense at 240 MHz, same one-source-two-arms harness, both arms
+given the SAME 192 KiB.
+
+Nanoseconds per allocate/free pair, best of 5, NET of the measured harness floor:
+
+| workload | esp-alloc | rusty_alloc | speedup |
+|---|---:|---:|---:|
+| harness floor (no allocator call) | 162 | 162 | — |
+| 32 B alloc/free | 1,638 | **625** | **2.62x** |
+| 64 mixed blocks (8-512 B), batched | 1,792 | **844** | **2.12x** |
+| **churn: 64 live, random 8-512 B** | 3,987 | **1,012** | **3.94x** |
+| 2048 B alloc/free | 1,638 | **1,267** | 1.29x |
+
+Churn is the row that matters — the shape real code has, and the one that
+fragments a first-fit list. 2048 B is narrowest because 2 KiB is exactly
+`MEDIUM_OBJ_SIZE_MAX` here, so it takes a medium page rather than the small
+fast path.
+
+### The guards
+
+- **The harness measures itself.** A baseline arm — identical loop, identical
+  non-inlined `touch`, identical four volatile accesses, no allocator call —
+  cost **162 ns/op in BOTH arms** and is subtracted from every row. It is not
+  cosmetic: unsubtracted, churn reads 3.53x instead of 3.94x, because a constant
+  added to both arms drags any ratio toward 1.
+- **The optimiser cannot delete the work.** Volatile write/read per block folded
+  into a printed checksum. Without it an alloc/free pair is dead code and the
+  benchmark times an empty loop.
+- **Work parity proven, not assumed.** Every checksum matches across arms
+  (25474400, 13944320, 9029440, 25474400); sizes come from a seeded xorshift32.
+- **Null arm.** The same benchmark twice inside one arm reproduced to the
+  nanosecond in both arms (625/625, 1638/1638); spread <= 1 % on every row.
+
+### The first run was wrong and the number said so
+
+It reported 2,361 ns/op for a 32 B alloc/free pair — ~570 cycles for a path that
+should be tens. Cause: `esp_hal::Config::default()` leaves the S3 at 80 MHz.
+Pinning `CpuClock::max()` moved every row by almost exactly 3x, which is what
+confirmed the clock rather than the allocator had been under measurement.
+
+### The cost, now measured instead of estimated
+
+§2.9 estimated esp-alloc's floor at ~5.4 KiB from arithmetic. Measured by
+shrinking its heap until it fails: **esp-alloc runs the same fs workload in
+8 KiB**, versus rusty_alloc's 68 KiB. The honest headline is therefore
+**2.1-3.9x faster at 8.5x the RAM**, and both halves went into the README and
+the crate README — a speed claim published without its cost is one nobody should
+believe.
+
+### Validation re-run after the harness changed
+
+Footprint build re-flashed and green: 68 KiB region, `free 0` at peak,
+`PEAK 4,914`, app 127,088 bytes, kill test seen. No crate source changed in this
+phase — the benchmark lives entirely in the Janus harness.
+
+## SMALL-METAL P4b(iii) — 3.8 % page occupancy, and why 4 KiB is the floor (2026-09-07)
+
+Two questions left after 68 KiB: is the 4 KiB slice *right* or merely where we
+stopped, and is anything else cheap. Both answered on the same XIAO ESP32-S3,
+kill test green throughout, region still 68 KiB with `free 0` and `PEAK 4,914`.
+
+### The census that settles the geometry
+
+Request counts cannot say how full a page gets. A page serves one size class, so
+what matters is blocks live AT ONCE — a live/peak pair per bin:
+
+```
+block   4 B: PEAK live 1     block  64 B: PEAK live 1
+block   8 B: PEAK live 2     block  96 B: PEAK live 1
+block  16 B: PEAK live 4     block 320 B: PEAK live 1
+block  24 B: PEAK live 2     block 384 B: PEAK live 2
+block  32 B: PEAK live 1
+```
+
+**Nine pages, 36,864 bytes, holding 1,412 bytes at peak — 3.8 % occupancy.** No
+class ever holds more than four blocks. (The other 3,502 bytes of the peak are
+the 4 KiB allocations, which are large spans sized to the block and not part of
+this.)
+
+**4 KiB is a wall on both sides, and both walls were found by probing past
+them.** Below: `good_size` rounds to an OS page while the large path allocates
+slices, so `usable >= good_size` needs `slice >= page` (P4b(ii)). Above—
+strictly, below in slice size—the two largest small classes are 320 B and 384 B
+and `SMALL_OBJ_SIZE_MAX = SLICE / 8`. At 4 KiB that ceiling is 512 B and both
+sit in one-slice small pages, 8 KiB for the pair. At 2 KiB the ceiling is 256 B,
+both become MEDIUM, and `MEDIUM_PAGE_SIZE` cannot follow the slice down because
+`spans.rs` pins `MEDIUM_OBJ_SIZE_MAX` at 2 KiB — which pins a medium page at
+16 KiB. The pair would cost **32 KiB instead of 8**. Arithmetic from the measured
+profile, labelled as such.
+
+### The lever left on the table, with its number
+
+Coarsening the small bins to power-of-two classes would collapse nine pages to
+three or four, fit a 32 KiB segment, and take the region to roughly **36 KiB**.
+**Not taken**, deliberately:
+
+1. `bins.rs` says at the top of the file that the size -> `good_size` mapping IS
+   the ABI-visible contract, G2-pinned against the oracle. Every existing
+   small-profile divergence changes routing; none changes that mapping. This
+   would be the first — a decision, not an optimisation to slip in.
+2. It trades a BOUNDED cost for an UNBOUNDED one: page cost is per class
+   touched, internal fragmentation is per live object. This workload holds 10
+   tiny objects so it looks free — on a sample of one. Thousands of 24-byte
+   nodes would pay up to 2x each.
+
+### `portable-atomic` off the no_std path
+
+`options.rs` was the last 64-bit-atomic user on a 32-bit target (`VALUES`, an
+`i64` API frozen at v2.0.0; `HEARTBEAT`, a C-ABI `u64`). Its lock-based fallback
+provides atomicity nothing can observe — the crate already serves `no_std` only
+on single-threaded targets, which `SingleThreadCell`, `prim::fixed`'s constant
+thread id and its never-contended spin lock all rest on. Replaced by `split64`,
+two `AtomicU32` halves, **adding no unsafe** (a struct of `AtomicU32` is `Sync`).
+With `std` on a 32-bit target the shim stays: there, threads are real.
+
+| | .text | `.bss` symbols | `.bss` section |
+|---|---:|---:|---:|
+| `portable-atomic` | 84,907 | 136,423 | 201,996 |
+| `split64` | 84,587 | 132,135 | 201,996 |
+| | **−320** | **−4,288** | **0** |
+
+**The predicted 4,288-byte SRAM saving did not happen, and the section table is
+what said so.** `LOCKS` is the only differing symbol and it does leave, but
+`.bss` does not shrink — esp-hal's linker anchors its end, so the space becomes
+slack the application cannot claim. Kept for the dependency removal and 320
+bytes of flash, not for RAM. Recorded because the first A/B I ran measured
+*nothing*: a Python revert silently no-op'd on an MSYS `/f/...` path and both
+arms built identically — the equal numbers were the tell.
+
+### Two defects in the shim, both caught before shipping
+
+- **Forwarding the caller's `Ordering` aborts the firmware.** `AtomicU32::load`
+  rejects `Release`/`AcqRel`, and `options::set_default` performs
+  `compare_exchange(.., AcqRel, ..)`. Orderings are normalised (loads `Acquire`,
+  stores `Release`); the test passes exactly the orderings `options.rs` uses and,
+  poisoned, panics in `core`'s `atomic.rs`.
+- **The test could never run.** It sat inside a module `cfg`-gated to the target
+  that needs it, so it would not have executed anywhere anyone runs tests. The
+  module now also compiles under `test` — which is the only reason the ordering
+  bug was found.
+
+### Verification
+
+104 tests / 33 suites / 0 failed (default); 86 / 19 / 0 (`ra_small_profile`) —
+both up one, the shim's test runs in each; clippy `-D warnings` clean on default,
+small profile and `no_std`; fmt clean; census RATCHET OK (unchanged at 890 — the
+shim adds none); riscv32imac + riscv32imafc `no_std` at both geometries, and
+wasm32. Board: 68 KiB, `free 0`, `PEAK 4,914`, app 127,056 bytes, kill test green.
+
+## SMALL-METAL P4b(ii) — the levers, hammered: 192 KiB -> 68 KiB on the board (2026-09-07)
+
+§2.9 ranked the footprint levers. This entry is what taking them cost and
+bought, each step measured on the same XIAO ESP32-S3 Sense with the same
+`espino run --expect` kill test, still green at every step.
+
+| | region required | `PEAK` live | app image |
+|---|---:|---:|---:|
+| P4, as measured | 192 KiB | 4,914 | 127,328 |
+| + lever 1 (two-ended placement) | **132 KiB** | 4,914 | — |
+| + lever 2 (4 KiB slice) | **68 KiB** | 4,914 | 127,376 |
+
+**−64.6 % of the region. `PEAK` identical at every step**, which is the
+work-parity check: the allocator stayed the only variable. +48 bytes of flash
+across both, so this came out of geometry and not out of deleted code. Board
+counters: `pages_fresh` 10 -> 9, `segments` **2 -> 1**, `used` 135,168 -> 69,632
+(= one 64 KiB segment + one 4 KiB heap block, `free 0` at peak — the exact
+floor, confirmed the way P4 confirmed 192 KiB).
+
+### Lever 1 — a placement bug, not a leak
+
+The 61,440 stranded bytes were on the free list the whole time; nothing could
+*use* them, because no `SEGMENT_SIZE`-aligned request can start mid-segment.
+`prim::fixed` now places coarsely-aligned requests at the bottom of the lowest
+extent that fits and merely page-aligned ones at the TOP of the highest —
+requests that do not care about coarse alignment are the ones that can move.
+Shipped cost: one pure arithmetic `fn place`. **Zero new unsafe in shipped
+code**; the census went 883 -> 890 and all seven are `#[cfg(test)]`.
+
+**The test needed poisoning twice before it meant anything.** Written against
+the existing 512 KiB region it passed under the bug — a region that is an exact
+multiple of `SEGMENT_SIZE` cannot tell the two policies apart, since a page off
+either end costs a segment either way. `K * SEGMENT_SIZE + FIXED_PAGE` on an
+aligned base is what discriminates, and is what the board actually has. Poisoned
+separately, the two halves report offset 0 instead of `N - FIXED_PAGE`, and 7
+segments of reach instead of 8.
+
+### Lever 2 — the slice, and the invariant a failed probe uncovered
+
+`SEGMENT_SLICE_SIZE` 8 KiB -> 4 KiB with `SLICES_PER_SEGMENT` 8 -> 16, so
+`SEGMENT_SIZE` deliberately does not move: the quantity that mattered is
+pages-per-segment, 7 -> 15.
+
+**A 2 KiB probe then failed, and failing is what it was for.**
+`properties::usable_size_agrees_with_good_size`: `good_size(49_153)` promised
+53,248 while the 25-slice span delivered 51,200. `bins::good_size` answers the
+large range with `os::page_align_up` while the large path allocates EXACT
+SLICES, so `usable_size >= good_size` — ABI-visible — holds only while **a slice
+is at least an OS page**. Free at every other geometry (64 KiB slice, 4 KiB
+page), which is exactly why it was never written down. `good_size` is G2-pinned
+against the oracle, so the slice is the side that moves. Now a
+`const _: () = assert!` in `prim/fixed.rs`, at the one backend where the two can
+be tuned into conflict.
+
+### Three more findings, and one hypothesis killed
+
+- **`slice_pool::rejects_what_it_cannot_track`** — the module's last
+  byte-denominated test, and P2's defect shape verbatim. `MIB + 4096` was
+  "misaligned" only while a slice was 8 KiB; at 4 KiB it became slice-ALIGNED,
+  so the test *succeeded* at freeing two ranges it exists to refuse, and — the
+  pool being global first-fit — took down three other tests instead of itself.
+  Rewritten in slices, plus a drain assertion so a refusal that sets a bit fails
+  here rather than next door.
+- **`heaps.rs` arena** — `reserve_os_memory_ex(64 * 1024 * 1024, ...)` reads
+  "two chunks" at 32 MiB segments and "2048 chunks" at 32 KiB ones, past
+  `arena::MAX_CHUNKS` (1024). Now sized in chunks; the `.max(2)` keeps the
+  default profile at exactly the 64 MiB it always reserved.
+- **`MEDIUM_PAGE_SLICES` 4 -> 2 was a real regression, not a stale premise.** It
+  lowers `MEDIUM_OBJ_SIZE_MAX` to 1,024 B, collapsing the binned range so a
+  burst of 2 KiB objects takes a whole slice each instead of sharing a page.
+  `spans.rs` caught it. Held at 4.
+- **Killed cheaply:** `slice_pool::FREE` is a bitmap over the entire 32-bit
+  address space (`1 << (32 - SLICE_SHIFT)` bits) — 64 KiB of BSS at the small
+  profile, larger than the region. It costs nothing: every call site is
+  `#[cfg(all(target_arch = "wasm32", not(miri)))]` and the linker drops the
+  static everywhere else. Checked against the shipped firmware's symbol table,
+  not argued from the source.
+
+### What this does NOT do
+
+esp-alloc's floor is bytes-live-plus-headers (~5.4 KiB here); rusty_alloc's is
+`bins x slice`. These levers took 2.8x out of the gap and could not close it —
+§2.9's conclusion is unchanged. 68 KiB is below the 96 KiB the esp-alloc arm is
+*configured* with, but that is the example's number, not esp-alloc's floor, and
+saying otherwise would be the dishonest version of this row.
+
+### Verification
+
+103 tests / 33 suites / 0 failed (default); 85 tests / 19 suites / 0 failed
+(`ra_small_profile`); clippy `-D warnings` clean on default, small profile and
+`no_std`; fmt clean; unsafe census RATCHET OK at 890 with `UNSAFE.md` updated;
+builds for riscv32imac and riscv32imafc `no_std` at BOTH geometries, and wasm32.
+Board kill test green.
+
+## SMALL-METAL P4b — WHY it costs 192 KiB: ten bins, ten pages, thirteen slices (2026-09-07)
+
+P4 measured the price. It did not measure the cause, and the difference decides
+whether the gap to `esp-alloc` is a backlog or a floor. Asked on the board
+rather than reasoned about: arm B now prints rusty_alloc's always-on counters
+and a per-bin census of every `GlobalAlloc` request.
+
+**Method.** Same XIAO ESP32-S3 Sense, same one-source two-arm harness, same
+`espino run --expect` kill test (still green, 62 lines). Two additions to arm B
+only: `rusty_alloc::alloc::stats()` at each stage, and an `AtomicU32[74]`
+incremented at `rusty_alloc::bins::bin(size)` on every acquiring path
+(`alloc`/`alloc_zeroed`/`realloc`). The census is in the wrapper, outside the
+allocator, so it counts requests the workload makes, not decisions the
+allocator takes — the two can then be compared.
+
+```
+[pages] end: generic 25 pages_fresh 10 extends 11 segments 2 large 0 huge 0
+[bin] blocks touched: 4, 8, 16, 24, 32, 64, 96, 320, 384, 4096 B
+[bin] distinct bins touched: 10
+```
+
+### The number that answers the question
+
+**Distinct bins 10. Fresh pages 10.** An identity, not a correlation: a page
+serves one size class and is at minimum one SLICE, so the floor is
+`bins x slice`, independent of bytes demanded.
+
+| | slices | bytes |
+|---|---:|---:|
+| 9 small pages (all blocks ≤ `SMALL_OBJ_SIZE_MAX` = 1 KiB) | 9 | 73,728 |
+| 1 medium page (block 4,096 = `MEDIUM_OBJ_SIZE_MAX` exactly) | 4 | 32,768 |
+| **pages needed** | **13** | **106,496** |
+| usable slices per segment (8 − 1 header) | 7 | |
+| **segments** | | **2** — 14 usable, one spare |
+
+Region, to the byte: `4,096` (create_heap's one `os::alloc_aligned` page)
+`+ 61,440` (first-fit alignment hole) `+ 2 x 65,536` = `196,608` = the 192 KiB
+P4 found empirically by watching 128 KiB panic. The empirical number and the
+arithmetic now agree, which is the check that the decomposition is real.
+
+**Occupancy: 4,914 live bytes in 106,496 bytes of pages — 4.6 %.**
+
+### Ranked levers, and the part that is not a lever
+
+1. **Alignment hole — 61,440 B, 31 % of the region.** The only line that is a
+   defect. Fix `prim::fixed` to return the skipped prefix; 192 KiB → 132 KiB.
+   Arithmetic, not projection. Not yet done.
+2. **`SEGMENT_SLICE_SIZE`** multiplies all 106,496 B. `SEGMENT_SIZE` is not the
+   lever; the slice is. Coupled to `SMALL_WSIZE_MAX` via
+   `SMALL_OBJ_SIZE_MAX = SMALL_PAGE_SIZE/8`, which at 8 KiB lands exactly on
+   `SMALL_WSIZE_MAX * 8` = 1,024 — so the two must move together. Direction
+   certain, magnitude unmeasured, and it stays unmeasured until it is measured.
+3. **Retention.** At `end`, live 0 and region used still 135,168 — freed, not
+   returned. mimalloc keeps retired pages as a reuse cache; on an MCU that turns
+   the peak into the floor.
+4. Flash +11,296 B (+9.7 %) — real, not the scarce resource.
+
+**Not a lever:** esp-alloc's floor is `bytes live + headers` (~5.4 KiB here);
+rusty_alloc's is `bins x slice` (106 KiB here) **regardless of byte demand**.
+Different functions, not one function tuned differently. Levers 1 and 2 are
+worth taking on their own merits; they do not close 20x, and saying they might
+would be the dishonest version of this entry.
+
+**The corollary that is actually useful:** the page cost is roughly FIXED for a
+bin profile — the same 13 slices serve 5 KB or 500 KB. The crossover is where
+live bytes approach `bins x slice`. Below it esp-alloc wins by construction.
+
+**Kill test after instrumentation: still PASSED** (the counters are the
+instrument's tax, and it is paid in the arm being measured, so the region
+numbers are unchanged from P4: 135,168 used, 61,440 free, PEAK 4,914).
+
+## SMALL-METAL P4 — IT RUNS ON A CHIP, and the region costs 2x esp-alloc for a 4.9 KB workload (2026-09-07)
+
+P4 of `docs/plans/small-metal.md`, **on real hardware**: a Seeed XIAO
+ESP32-S3 Sense (esp32s3 rev v0.2, 8 MB flash, MAC 68:ee:8f:51:74:64) on COM4,
+Track B bare metal — `esp-hal` 1.2.0, `no_std`, `panic = "abort"`, the
+`ra_small_profile` geometry, `rusty_alloc-api` as `#[global_allocator]`.
+
+### Kill test: PASSED
+
+The plan asks that the board print the filesystem geometry, the config file and
+the page title, and blink at the file's rate, with this allocator underneath:
+
+```
+[heap] arm: rusty_alloc
+littlefs 2.0: 1261 blocks of 4096
+config.json: { "blink_ms": 250, "greeting": "hello from data/config.json" }
+index.html: 318 bytes, title "blink-fs"
+blinking GPIO21 every 250 ms
+```
+
+250 ms is the value **read from `config.json`**, not the 500 ms fallback the
+sketch uses when the filesystem is missing — which is what makes the line
+evidence that the whole path worked. Reproduced identically across runs.
+
+**One thing this session cannot confirm:** the LED itself. The firmware reports
+the interval it read; the espino ledger's own P1 row says "the LED confirmed by
+eye", and nobody's eye is on this board from here.
+
+### Method — and the control came first
+
+Both arms are ONE binary source in one cargo project
+(`espino/examples/blink-fs-p4`, copied from the green `blink-fs`), with the
+allocator selected by `--cfg ra_arm_rusty`. One dependency graph, one
+workload; the arms cannot drift.
+
+**A control arm ran before anything was changed**, and it earned its place: the
+unmodified example flashed to this board reported *"no filesystem at the
+record's partition"* and blinked at the 500 ms fallback — the board had no
+LittleFS image. Every later reading would have been ambiguous. `espino run`
+packs and flashes the filesystem alongside the app, and the control then passed
+the full kill test under `esp-alloc`.
+
+### The instrument had to be built, because neither allocator's own stats answer the question
+
+The first attempt printed `esp_alloc::HEAP.used()` at three stages. It read
+**`used 0` at every one** — the file buffers are dropped before each sample. A
+perfectly clean number measuring nothing. And esp-alloc's `max_usage` is behind
+a feature `rusty_alloc` has no counterpart for, so it would have compared
+against nothing.
+
+So the peak is measured **outside both**, by the same code in both arms: a
+`GlobalAlloc` wrapper tracking live bytes with `fetch_max`, forwarding
+`alloc`/`alloc_zeroed`/`dealloc`/`realloc` so each allocator keeps its own
+behaviour. esp-alloc's `global-allocator` feature is off so the wrapper can sit
+in front of it. Its two atomics per call are the instrument's tax, paid
+identically by both arms.
+
+### The numbers
+
+| | esp-alloc | rusty_alloc |
+|---|---:|---:|
+| **workload PEAK live bytes** (shared instrument) | **4,914** | **4,914** |
+| region given | 96 KiB | 192 KiB |
+| region consumed | 0 at every stage | **135,168** (132 KiB) |
+| smallest region that runs | — | **192 KiB** (128 KiB panics) |
+| app image | 116,032 B | **127,328 B** (+11,296, **+9.7 %**) |
+
+**PEAK is identical to the byte.** That is the work-parity check
+(`codec-measurement` §4) passing exactly: both arms performed the same
+allocation work, so the allocator is the only variable. It also discharges the
+caution P3 left for this phase — the mid ledger's `alloc`-rung measurement that
+first came back byte-identical because LTO dropped a rung nothing called. Here
+both allocators are provably reached: the counter moved in both arms, and
+rusty_alloc's region consumption moved from 0 to 132 KiB.
+
+### Where the 132 KiB goes, predicted before it was measured
+
+`135,168 = 4,096 + 2 x 65,536` — an arena descriptor plus two segments. And
+`free 61,440` is **60 KiB stranded by alignment**: `prim::fixed` is first-fit,
+so the 4 KiB page-aligned arena descriptor takes the bottom of the region, which
+pushes the first `SEGMENT_SIZE`-aligned segment to offset 64 KiB and the second
+to 128 KiB — so two segments need a 192 KiB region even though they occupy 132.
+
+That was written down as a prediction and then tested: **at a 128 KiB region the
+board panics in `handle_alloc_error`**, exactly as predicted, because only one
+segment can be placed and one segment's seven usable slices do not serve this
+workload.
+
+**The actionable half:** placing sub-segment allocations at the TOP of the
+region (or best-fit rather than first-fit) would make 132 KiB sufficient and
+recover a third of the region. That is a `prim::fixed` change, not an
+architecture change, and it is the single cheapest improvement P4 found.
+
+### The honest verdict on §5's "is the win real"
+
+The workload's true demand is **4.9 KB**. `esp-alloc` serves it from a 96 KiB
+heap that is already 20x the demand; `rusty_alloc` needs **192 KiB — 2x the
+region and 37 % of the S3's entire 512 KiB of SRAM** — plus **+9.7 % of app
+flash**, to serve the same 4.9 KB. The reason is structural rather than
+wasteful: a segment is the allocation unit, and 64 KiB is the smallest segment
+this geometry offers.
+
+So the performance case is not merely absent, it is negative on the axis a chip
+cares about, and §5's sentence stands as written: *"the safety argument has to
+carry the whole weight on its own, and it may not."* P4's contribution is that
+the sentence now has numbers under it instead of a suspicion — and that the
+allocator demonstrably RUNS, which was never certain before today.
+
+## SMALL-METAL P3 — it builds for a chip: 39 errors to 0, and a half-finished narrowing the whole battery could not see (2026-09-07)
+
+P3 of `docs/plans/small-metal.md`: decide `portable-atomic` versus narrowing
+**per site, with the reason recorded per site**, and add the single-heap
+profile. **Kill test met on every target.**
+
+| target | geometry | result |
+|---|---|---|
+| `riscv32imac-unknown-none-elf` | default + small | **builds**, debug and release |
+| `riscv32imafc-unknown-none-elf` | default + small | **builds** |
+| `xtensa-esp32s3-none-elf` (esp toolchain, `-Z build-std=core`) | default + small | **checks clean** |
+| x86-64 host, `--no-default-features` | — | builds |
+| `wasm32-unknown-unknown` | — | builds |
+
+Host battery unchanged: **33 suites / 105 tests / 0 failed** (104 + P3's new
+regression test); small profile 19 / 85 / 0; clippy `-D warnings` clean on the
+default, small-profile AND `no_std` configurations; fmt clean; census
+re-baselined with its entry.
+
+### The atomics decision, per site — narrow a CHOICE, shim a CONTRACT
+
+| site | what it is | decision |
+|---|---|---|
+| `arena.rs` `used` / `dirty` | the CAS'd chunk bitmaps — the **only correctness-path** 64-bit atomic in the crate | **narrow** `u64` → `u32` |
+| `segment_map.rs` `MAP` | window bitmap | **narrow** |
+| `slice_pool.rs` `FREE` | slice bitmap | **narrow** |
+| `random.rs` `COUNTER` | seed-mixing counter | **narrow** to `usize` |
+| `options.rs` `VALUES` | `options::{get,set}` are `i64` in an API **frozen at v2.0.0** | **`portable-atomic`** |
+| `options.rs` `HEARTBEAT` | handed to a `DeferredFreeFun` whose **C ABI** declares it `u64` | **`portable-atomic`** |
+
+The rule that falls out, and it decided all six: **a bitmap's word width is a
+free choice — same total bits either way — so narrowing costs nothing and keeps
+the claim/verify loop lock-free. A width that appears in a frozen signature or
+a C ABI is a contract, and hand-rolling a 64-bit atomic out of two 32-bit
+halves inside an allocator is exactly how you get a subtle bug.** Four narrowed,
+two shimmed.
+
+The dependency is `[target.'cfg(not(target_has_atomic = "64"))'.dependencies]`,
+so **the crate stays dependency-free on every target it currently ships to** —
+x86-64, aarch64, wasm32, Windows. It compiled on the Xtensa check and on
+nothing else, which is the confirmation the gate works.
+
+### The near-miss: a half-narrowed bitmap that 105 tests could not see
+
+After the element type moved to `u32`, **four loop bounds still said
+`div_ceil(64)` and `(w + 1) * 64`** — `arena.rs` lines 156, 157, 271, 275, 276,
+281, 301 and 592, which the first regex pass had missed because it only matched
+the `[idx / 64]` and `(idx % 64)` forms.
+
+**The entire battery passed.** Not because the bug is benign — a short scan
+means chunks past the first word are unreachable, and the `dirty` init
+under-marks — but because **every arena any test builds is 32 chunks or fewer,
+and at ≤32 chunks `div_ceil(64)` and `div_ceil(32)` are both 1.** The
+divergence starts at chunk 33. The largest arena in the suite was 2 chunks.
+
+That is `codec-measurement`'s "a green test can test the wrong scenario",
+arrived at from the inside: the suite was not weak, it was *unable to express*
+the defect. `tests/heaps.rs::arena_bitmap_reaches_past_its_first_word` now
+allocates 33 chunks from an exclusive arena, and poisoning one bound back to
+`64` reports precisely: **"chunk 32 of 33 refused — the bitmap scan stopped at
+word 1 of 2"**, chunk 32 being the first in word 1.
+
+**The test's own first version was wrong, and measured rather than reasoned.**
+It sized each allocation at `LARGE_OBJ_SIZE_MAX + 1` — "the smallest size that
+takes a whole chunk" — and failed at chunk 16 of 33. That is not the defect: a
+huge block's header pushes `header + size` into a **second** chunk, so 33 chunks
+is genuinely 16 allocations. `LARGE_OBJ_SIZE_MAX` exactly (the largest
+in-segment span, which fills a segment's usable region) is one chunk. The
+premise was fixed, not the allocator.
+
+### The three things the crate used `std` for
+
+- **`abort()`** (4 sites). `core` has none, so without `std` it panics — and a
+  `no_std` consumer **must** build with `panic = "abort"`, which every Janus
+  firmware profile already does. Documented at the function, because an abort
+  that unwinds into a C caller is the guarantee gone.
+- **`thread_local!` (4 sites) — this IS the single-heap profile.** With `std`
+  the macro expands to `std::thread_local!` verbatim, so the shipped build keeps
+  M10c's const-init initial-exec fast path untouched. Without it, a
+  thread-local becomes a plain `static`: one heap, **no TLS lookup at all**, a
+  *shorter* fast path than the threaded one. Sound because the crate serves
+  `no_std` only on single-threaded targets — the same standing assumption
+  `prim::fixed` already makes (constant thread id, TLS destructors that never
+  fire, a spin lock that never contends), and the one new `unsafe impl Sync`
+  says so and says what to revisit first if that changes.
+- **The environment and the diagnostics** (§2.5). Deleted under `cfg`, not
+  ported — a firmware has no environment, so every option keeps its compiled-in
+  default and the pass does not exist rather than existing and returning
+  nothing. **But the seam a firmware would actually use survives:**
+  `options::out_fmt` takes `&str` and needs no allocation, so a firmware that
+  registers an output hook still gets the allocator's messages over its serial
+  log. Only the `eprint!` fallback and the `format!`-using CALLERS are std-only,
+  and the error path still delivers the error *code* to a registered hook
+  without one.
+
+`std` is a **feature** (default on) where the geometry is a `--cfg`, and the
+contrast is the point: a feature is additive and unifies across a dependency
+graph, which is exactly right for "does this build have std" and exactly wrong
+for "how big is a segment".
+
+### A third instance of P0's bucket A
+
+`random::os_entropy` and `stats::process_info` both select on
+`windows` / `unix` / `wasm32` / `miri` — and a bare-metal target matches
+**none**, so neither had an arm at all. That is the same defect shape P0 found
+in `prim/mod.rs` and P1 fixed: **three instances in one crate of a four-way
+platform selection with no default.** Both have a fifth arm now (no OS entropy;
+no process accounting — the latter is what `process_info`'s doc already
+promised, "unknown fields read 0").
+
+## SMALL-METAL P2 — the geometry was TWO LINES, and it uncovered a real defect in the shipped allocator (2026-09-07)
+
+P2 of `docs/plans/small-metal.md`: make the segment size a compile-time
+parameter, add a small profile, and find out whether that ends in a port or in
+a documented "no". **It is a port**, and on the way it found an escape from the
+exclusive-arena API that is reachable in the SHIPPED configuration.
+
+**The ceiling probe first, and it is the headline.** Rather than refactor the
+~250 uses of the geometry constants across 14 files, change the constants and
+see what breaks. A small profile — `SEGMENT_SLICE_SIZE` 8 KiB,
+`SLICES_PER_SEGMENT` 8, so a **64 KiB segment** — behind a `--cfg`, built for
+the host:
+
+> **2 compile errors.** `segment_map.rs:27` and `slice_pool.rs:33` — both
+> hardcoded shifts with a const assert pinning them to the shipped geometry.
+
+`segment.rs`, `heap.rs`, `page.rs`, `alloc.rs`, `arena.rs` and `bins.rs`
+compiled **unchanged** at a segment 512x smaller. The geometry was already
+symbolic everywhere it mattered; two literals were the whole wall. Both are now
+derived (`SEGMENT_SIZE.trailing_zeros()`), and `ADDR_BITS` with them — it was a
+flat `48`, which on any 32-bit target sizes the map for 65,536x the memory that
+can exist.
+
+**Result: both profiles fully green.**
+
+| | suites | tests | failed |
+|---|---:|---:|---:|
+| default (32 MiB segments) | 33 | **104** | 0 |
+| small profile (64 KiB segments) | 19 | **84** | 0 |
+
+clippy `-D warnings` clean on both. The shipped artifact is unchanged in
+structure — dll 212,992 bytes and the same 316 exports as before P1 — though
+that is a coarse instrument at 4 KiB PE alignment and is **not** a claim of
+byte-identity on the fast path; the instruction counts need the Linux
+callgrind harness, which did not run here.
+
+### §2.6 confirmed, and it needed a third representation
+
+The window bitmap is sized by the **address space**, not by the memory owned,
+so shrinking the segment makes it *worse*: `WINDOW_SHIFT` 25 → 16 takes
+`MAP_BITS` from 2²³ to 2³², i.e. 1 MiB of BSS to 512 MiB. Parameterising §2.1's
+geometry alone would have made the crate LESS able to fit a chip.
+
+Replaced for the small profile by an exact 64-entry range table — **1 KiB of
+BSS against the bitmap's 1 MiB** — joining the wasm base table as a third
+representation of one question. No allocator code path forked; only the map.
+
+### Three defects, and only one of them was mine
+
+**1. `huge_alloc` ignored the owning heap's arena. This is in the shipped
+build.** `segment.rs` asked `arena::chunk_alloc_n(-1, chunks)` — a hardcoded
+"any non-exclusive arena" — while `segment_alloc` twenty lines away correctly
+passed `arena_id`. So a heap created with `create_heap(_, _, arena_id)`, whose
+entire purpose is that its memory comes from ONE region, served **every**
+allocation above `LARGE_OBJ_SIZE_MAX` from the default arena or straight from
+the OS. Upstream does not: `mi_segment_huge_page_alloc` takes a `req_arena_id`
+and both call sites pass `heap->arena_id`
+(`oracle/mimalloc/src/segment.c:1671,1683`).
+
+The small profile is what exposed it — at a 64 KiB segment the huge path starts
+at 56 KiB, so an ordinary 100 KB allocation escaped — but **the defect is in
+the 32 MiB geometry too**, reachable by any consumer of the exclusive-arena API
+making one allocation past 32 MiB − 64 KiB. Fixed by threading the id and
+refusing the OS fallback when `arena_id >= 0`, exactly as the normal path does.
+The regression test is written at the **default** geometry so it guards the
+shipped configuration, and it was poisoned back to the old behaviour to prove
+it fires: `huge block at 0x1fdae010000 escaped its exclusive arena
+[0x1fd9e000000, 0x1fdae000000)` — 64 KiB past the end.
+
+**2. `segments` and `segments_freed` could not both be right.** The huge path
+bumped `huge_allocs` and not `segments`, while the release path bumps
+`segments_freed` beside `huge_free` (heap.rs:1243). A workload cycling huge
+blocks therefore reports **more segments freed than allocated** — an impossible
+reading, from the counters this project uses as its work-parity instrument for
+every A/B. One line, and the test now asserts the pair.
+
+**3. Mine, and the interesting half is the DIRECTION, not the size.** The range
+table was sized at 32 entries; the host battery overflowed it and it dropped
+ranges silently, so `contains` returned false for legitimate pointers and the
+`debug_checks` guard began aborting good frees — three integration suites down.
+Raising the number to 4096 made them pass, which **confirmed the cause and was
+the wrong fix**: 64 KiB of BSS is not a chip-sized table.
+
+The real defect is that the module's own doc — *"a false negative for
+`is_in_heap_region`, never a false positive"* — is the wrong rule for this
+consumer. `contains` backs two callers, and they want opposite things: for the
+public query a false positive merely misleads; for the guard a false NEGATIVE
+aborts a legitimate program. So the table now degrades **permissively** once it
+can no longer decide, with a latch (`range_table_overflowed()`) that a test
+reads, and the size stays chip-sized at 64 entries / 1 KiB. The one test that
+asserts the negative direction now checks the degradation happened rather than
+skipping blind.
+
+Not a `debug_assert`: overflow is reachable in a VALID configuration (this
+battery manages orders of magnitude more segments than any chip), and an
+assertion should mean impossible, not "expected when you test off-target".
+
+### What the small profile actually costs
+
+- **Alignment ceiling is `SEGMENT_SIZE/2`** — 16 MiB shipped, **32 KiB** small.
+  Inherent: a segment cannot promise an alignment it cannot hold. `malloc_aligned`
+  returns null rather than aborting, which is the right failure.
+- **`good_size` leaves the oracle.** Above `MEDIUM_OBJ_SIZE_MAX` it page-rounds,
+  and that constant moves with the geometry, so the mimalloc-pinned bin table is
+  a default-profile fixture. The rows the two geometries share still run.
+- **Every per-segment structure scales as 1/`SEGMENT_SIZE`.** 512x smaller
+  segments is up to 512x more of them for the same bytes managed. The range
+  table noticed first; anything else sized by a guess will too.
+
+### The test suite was pinning the geometry in three different ways
+
+Nine tests failed at the small profile and **none of them was an allocator
+defect** — a distinction worth making, because the raw count says otherwise:
+
+- **A literal where the unit is slices** — `slice_pool` written in MiB ("1 MiB
+  = 16 slices" became 128), `spans` allocating "1 MiB → 16-slice span" which at
+  a 64 KiB segment is a HUGE block and never touches the span path at all.
+  Rewritten in slices and in `SEGMENT_SLICE_SIZE` multiples.
+- **A literal offset inside the segment** — the free-list link tests probed
+  "1 MiB into the segment", which a 64 KiB segment does not contain, inverting
+  three assertions about a predicate scoped to `SEGMENT_SIZE`.
+- **Field-report fixtures** — `span_packing` reproduces named rows of the
+  segment-tax report (its 60 % row at 20 MiB, its 27 % row at 25.1 MiB). A row
+  is a size *against a segment size*; re-expressing them in slices would keep
+  them green while testing nothing the report said, so they are gated to the
+  shipped geometry and say why.
+
+P1's §2.1 assertion behaved exactly as the plan asked: it was written one-sided
+("a segment cannot come out of a 512 KiB region"), P2 inverted it, and it is
+now two-sided — at the small profile it asserts that a **whole segment, at
+segment alignment, IS served from a 512 KiB region**, which is P2's deliverable
+demonstrated rather than described.
+
+### The verdict on §5's first open question
+
+*"Whether the small profile is the same allocator or a different one wearing the
+name. If P2 ends with two architectures in one crate, that is worse than saying
+no."*
+
+**It is the same allocator.** No allocator code path is forked: the free path,
+the page queues, the span carving, the cross-thread protocol, the arenas and
+the bins are the shipped code running on different constants. The only
+per-target divergence is the segment map's representation — which already had
+two, for wasm — and one `--cfg` selecting three constants. A cargo *feature*
+was deliberately not used: features are additive and unify across a dependency
+graph, so two consumers wanting different geometries would silently get one of
+them. The deliverable sets the cfg, the way a Janus firmware picks its chip.
+
+## SMALL-METAL P1 — the memory seam: 16 of 55 errors gone, the shipped artifact provably untouched, and a defect of my own caught by the instrument (2026-09-07)
+
+P1 of `docs/plans/small-metal.md`: introduce the primitive-memory seam and
+implement it twice — the existing platform path, and a fixed-region path —
+with nothing else changing.
+
+**What landed.** `crates/rusty_alloc/src/prim/fixed.rs`, plus a fifth arm in
+`prim/mod.rs`'s backend selection. P0 found that a bare-metal RISC-V target
+matches none of `windows` / `unix` / `wasm32` / `miri`, so no `sys` module was
+named at all; the new arm is `all(not(miri), not(windows), not(unix),
+not(target_arch = "wasm32"))`. The module is **always compiled** (so it is
+type-checked and unit-tested on the host) and **selected** only where no arm
+above it matches, which is what makes "nothing else changes" true rather than
+hoped.
+
+The backend serves a `&'static mut [u8]` handed over once: a first-fit free
+list of at most 32 extents in `AtomicUsize` arrays under a spin lock, with
+splitting on alloc and coalescing on free. It cannot allocate its own
+bookkeeping — it *is* the allocator's memory source — which is why the bound is
+fixed and why exceeding it is reported rather than papered over.
+
+**It adds zero unsafe dereferences to the shipped crate.** The census grew
+864 → 881, and every one of the 17 is either an `unsafe fn` signature the seam
+requires (6, with bodies containing no unsafe operation at all — the free list
+is atomics and the pointers come from the safe `with_exposed_provenance_mut`)
+or a test (11). `UNSAFE.md` carries the entry; re-baselined in the same change,
+as the ratchet demands.
+
+**The riscv debt, measured the way P0 established:**
+
+| bucket | P0 | P1 | |
+|---|---:|---:|---|
+| A. `prim` has no backend for this target | 16 | **0** | **P1's job** |
+| B. explicit `std::` paths | 10 | 10 | P3 |
+| C. 64-bit atomics | 5 | 5 | P3 |
+| D. alloc-dependent text | 13 | 13 | with P1's follow-up |
+| E. cascade from A and B | 11 | 11 | free once B lands |
+| **total (no_std probe)** | **55** | **39** | |
+
+Every bucket P1 did not target moved by **+0**. The raw (non-probe) count went
+224 → 237 — *up*, because with `sys` resolving, more code now reaches the
+prelude cascade. That is the P0 artifact again, and it is why the probe number
+is the one quoted.
+
+**Kill test, item by item.**
+
+1. **"The whole existing battery passes unchanged on the host."** 33 suites /
+   103 tests / 0 failed; `clippy --workspace --all-targets --all-features
+   -D warnings` clean; `fmt --check` clean; unsafe ratchet OK; `wasm32`
+   still builds and still selects its own arm.
+
+2. **"The benches move by less than the harness's own null-arm floor."** Met
+   more strongly than asked, and the instrument had to be replaced to say so.
+   The first attempt compared `sha256` of the shipped cdylib: it **differed**.
+   A **null arm** — identical source, built twice — differed too
+   (`c157c8e…` → `97a0ba8…`), because a PE embeds a build timestamp. **The
+   hash cannot answer "unchanged" on this platform, and reading it would have
+   manufactured a regression out of a clock.** On quantities that are
+   deterministic, the artifact is identical: **dll size 212,992 both ways,
+   delta 0**, and the exported-name set **316 vs 316, identical, zero
+   differences**. There is no delta for a bench to resolve.
+
+3. **"A new test builds an arena over a static 512 KiB region and serves
+   allocations from it."** The **seam half is done and proven at 512 KiB**;
+   the **arena half is blocked by §2.1** and cannot be written yet.
+   `arena::arena_register` computes `chunks = size / SEGMENT_SIZE` and returns
+   `Err` when `chunks == 0`, so **every region below 32 MiB is refused by
+   arithmetic**. P1's kill test was written before that was known; the honest
+   report is two-thirds met, with the third part deferred to P2 rather than
+   redefined.
+
+**§2.1 is executable for the first time.** P0 recorded that the wall ranked
+first has no compile-time signature. It now has a runtime one: on a registered,
+**entirely free** 512 KiB region, a `SEGMENT_SIZE` request fails, and so does a
+one-page request at `SEGMENT_SIZE` *alignment* — the half no larger region
+fixes, and P2's actual subject. Both leave the free list untouched.
+
+**Two process findings, both from distrusting a green result.**
+
+*A test that passed for the wrong reason.* The §2.1 assertion first lived in a
+`#[test]` of its own. Run alone it **passed with no region registered** — i.e.
+because `alloc` refuses before it looks at size, not because 32 MiB is too big.
+Measured, not assumed: the standalone test was run and observed passing in that
+state. It now sits inside the main test after the region is registered and
+verified fully free, where the only thing that can refuse a segment is its size.
+
+*The gate was poisoned to prove it fires.* Replacing
+`try_alignment.max(FIXED_PAGE)` with `FIXED_PAGE` made the test fail at exactly
+the alignment assertion; restoring it went green. A gate nobody has watched
+fail is a claim, not a gate.
+
+**And a defect of my own, caught by the bucket table.** The first version of
+this backend used an `AtomicU64` for its monotonic tick — a 64-bit atomic, in
+the backend written *for* the target that does not have them. Bucket C read
+**5 → 6** and named it. It is now two `AtomicU32` widened to `u64`, under a
+**separate** lock: `Guard` is not reentrant, so sharing the free-list lock
+would deadlock the first allocation path that wanted a timestamp. A 32-bit
+counter alone was rejected because wrapping inverts the purge *ordering* that
+is the only property this clock provides.
+
+Nothing else changed. `rust-toolchain.toml` also gained `wasm32-unknown-unknown`,
+which the cross-check needed and which the repo already claims to support.
+
+## SMALL-METAL P0 — 224 errors are 55, and the wall ranked first is invisible to this probe (2026-09-07)
+
+P0 of `docs/plans/small-metal.md`: add `riscv32imac-unknown-none-elf` to the
+toolchain file, build the core crate for it, **fix nothing**, and check the
+error list against the plan's four walls. Nothing shipped but the target line.
+
+**Method:** `rustup target add riscv32imac-unknown-none-elf --toolchain
+1.97.1`; `cargo build -p rusty_alloc --target riscv32imac-unknown-none-elf
+--message-format=json`, errors counted from the JSON rather than the human
+output. Deterministic — a compile, not a measurement, so no pinning, no ABBA
+and no noise floor. Reproducible from the target line alone.
+
+**The raw number is not the finding.** The first build reports **224 errors**
+(4 warnings). It is dominated by one root: two `E0463 can't find crate for
+std`. Without `std` there is **no prelude**, so `Option`, `Some`, `None`,
+`Result`, `Ok`, `Err`, `FnMut`, `Default`, `Sync`, `debug_assert`, `assert`,
+`format`, `cfg` and `derive` all resolve to nothing. Classified:
+
+| | errors |
+|---|---:|
+| prelude items + prelude macros (cascade) | **183** |
+| everything else | 41 |
+
+Acting on 224 would have meant "the plan is wrong, the list is materially
+larger than the four walls" — the kill test's own failure condition, reached
+entirely on an artifact. The rule this repository already writes down for
+timings holds for compiler output: **a count dominated by one root is
+measuring the root, not the program.**
+
+**The probe that makes the list legible.** One line, applied, measured,
+reverted — `#![cfg_attr(ra_p0_probe, no_std)]` at the top of `lib.rs`, built
+with `RUSTFLAGS="--cfg ra_p0_probe"`. Not a fix and not kept; it removes the
+single masking cause so the real debt can be read. **224 → 55.**
+
+| # | bucket | errors | sites | plan |
+|---|---|---:|---|---|
+| A | `prim`: no backend selected for this target | 16 | `prim/mod.rs` (1 cause) | §2.4 |
+| B | explicit `std::` paths — TLS, abort, io | 10 | `init.rs` 5, `options.rs` 3, `page.rs` 1, `random.rs` 1 | §2.3 |
+| C | 64-bit atomics | 5 | `arena.rs`, `options.rs`, `random.rs`, `segment_map.rs`, `slice_pool.rs` — one each | §2.2 |
+| D | alloc-dependent text | 13 | `options.rs` 7, `stats.rs` 3, `arena.rs` 2, `init.rs` 1 | **not in the plan** |
+| E | cascade from A and B | 11 | `init.rs` 10, `random.rs` 1 | — |
+
+**A is one cause, not sixteen.** `prim/mod.rs` selects its backend with four
+arms — `windows`, `unix`, `target_arch = "wasm32"`, `miri`. A bare-metal
+RISC-V target matches **none**, so no `sys` module is named at all and all
+sixteen call sites through it fail together. §2.4 confirmed, and cheaper than
+it reads.
+
+**C is confirmed and its open question is answered.** The five sites split
+one way on correctness: `arena.rs:51-52` `used`/`dirty` are the CAS'd chunk
+bitmaps — the **only correctness site**, and a bitmap whose word width is a
+free choice. `options.rs:195` `HEARTBEAT` and `random.rs:61` `COUNTER` are a
+heartbeat and a seed counter. `segment_map.rs:30` and `slice_pool.rs:38` are
+statics, discussed below. So `portable-atomic` may be needed nowhere;
+narrowing covers every site. That is the same call the Janus programme made
+for its own counters on 2026-09-06 (espino ledger: *"`AtomicU64` does not
+exist on 32-bit RISC-V … Counters are `AtomicU32` now, `Stats` still reports
+`u64`"*).
+
+**D is a fifth wall the plan does not have, and it is the cheapest one.**
+All thirteen are environment parsing and human-readable diagnostics:
+`options.rs::ensure_init` reads `RUSTY_ALLOC_*` / `MIMALLOC_*` through
+`std::env::var` with `to_uppercase` / `to_ascii_lowercase` / `format!`;
+`arena.rs:605` returns a `String` debug dump; `stats.rs::process_info`
+reports RSS, commit and page faults. **A firmware has no environment, no
+process and no stdout.** The fix is `cfg`-ing the layer out, not porting it —
+so D costs less than its error count suggests, and it is deletion rather than
+an `alloc` dependency.
+
+**§1 of the plan is wrong on its load-bearing claim.**
+`crates/rusty_alloc/src/lib.rs` has **no `#![no_std]`** — the core is a std
+crate, and its own module doc says so (*"A no_std profile returns post-v1"*).
+The plan's *"The core is `no_std`"* cites
+`crates/rusty_alloc_api/src/lib.rs:14`, which is the thin **API surface**, not
+the core. `rusty_alloc_ffi/src/lib.rs:9` asserts *"the core crate is no_std"*
+in a comment; that comment is false and should go with the P1 work. What IS
+true, and is better news than the claim it replaces: **the core crate has
+zero dependencies**, so nothing external can block the port.
+
+**§2.1 produced zero errors, and cannot produce any.** The wall the plan
+ranks first and calls "the wall" — a 32 MiB segment against a chip's whole
+address space — is a *space* property, not a *type* property. The compiler has
+no opinion on it. **P0 is structurally blind to §2.1**, exactly as `opscan`
+was blind to the park/unpark thrash, and for the same reason: the instrument
+does not enter the regime. Sizing it needs P2, or a link, not a check.
+
+Two statics found while reading C, both space rather than type, and neither in
+the plan: `segment_map::MAP` is `[AtomicU64; 131072]` — **1 MiB of BSS on
+every non-wasm target**, against a Janus firmware heap of 64–220 KiB and an
+ESP32-S3's 512 KiB of internal SRAM. `slice_pool::FREE` adds 8 KiB with no
+`cfg` at all, on every target, though it is only used on wasm. wasm already
+replaces the first wholesale with a 256 KiB base table, so the per-target
+precedent §1 claims for the arena exists here too, and is stronger.
+
+**Kill test — the plan stands, amended.** The list is not materially larger
+than the four walls: three are confirmed (A/§2.4, B/§2.3, C/§2.2), one is
+unmeasurable by this phase (§2.1), one new wall is real but cheap (D), and
+§1's premise is false. Rewriting is not needed; five corrections are. Nothing
+was fixed and nothing was kept except the toolchain target line.
+
 ## RE-BENCHMARK after the huge-path fix — zero cost, and the HARNESS was lying in the 4th digit (2026-08-19)
 
 Asked to confirm the `remove_huge_segment` fix cost nothing. It costs nothing,

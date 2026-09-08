@@ -117,6 +117,15 @@ fn aligned_allocations() {
         (300_000, 4096),
         (1024, 1 << 20),
     ] {
+        // The allocator's alignment ceiling is SEGMENT_SIZE/2 (alloc.rs:451,
+        // heap.rs:986) — it cannot promise an alignment a segment cannot hold.
+        // At the default 32 MiB geometry that is 16 MiB and every case below
+        // is far under it; under the small profile (P2, small-metal.md) it is
+        // 32 KiB, so the larger cases are refused BY DESIGN and are skipped
+        // rather than deleted, because the ceiling is what they document.
+        if align > rusty_alloc::types::SEGMENT_SIZE / 2 {
+            continue;
+        }
         let p = malloc_aligned(size, align);
         assert!(!p.is_null(), "malloc_aligned({size}, {align})");
         assert_eq!(p as usize % align, 0, "misaligned for ({size}, {align})");
@@ -224,6 +233,10 @@ fn aligned_at_offsets() {
         (100, 65536, 40),                // big align, small size
         (20 * 1024 * 1024, 1 << 20, 64), // huge placement
     ] {
+        // Same ceiling as `aligned_allocations` above: SEGMENT_SIZE/2.
+        if align > rusty_alloc::types::SEGMENT_SIZE / 2 {
+            continue;
+        }
         let p = malloc_aligned_at(size, align, offset);
         assert!(!p.is_null(), "malloc_aligned_at({size},{align},{offset})");
         assert_eq!(

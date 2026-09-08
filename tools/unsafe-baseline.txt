@@ -1,10 +1,12 @@
     94  crates/rusty_alloc/src/alloc.rs
     13  crates/rusty_alloc/src/arena.rs
-    67  crates/rusty_alloc/src/heap.rs
+    71  crates/rusty_alloc/src/heap.rs
     36  crates/rusty_alloc/src/init.rs
+     2  crates/rusty_alloc/src/lib.rs
      6  crates/rusty_alloc/src/options.rs
     12  crates/rusty_alloc/src/os.rs
     37  crates/rusty_alloc/src/page.rs
+    25  crates/rusty_alloc/src/prim/fixed.rs
      8  crates/rusty_alloc/src/prim/mock.rs
     17  crates/rusty_alloc/src/prim/mod.rs
     27  crates/rusty_alloc/src/prim/unix.rs

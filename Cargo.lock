@@ -159,6 +159,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
+name = "portable-atomic"
+version = "1.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
+
+[[package]]
 name = "ppv-lite86"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -269,24 +275,25 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rusty_alloc"
-version = "1.1.6"
+version = "2.0.0"
 dependencies = [
  "libc",
  "loom",
+ "portable-atomic",
  "proptest",
  "windows-sys",
 ]
 
 [[package]]
 name = "rusty_alloc-api"
-version = "1.1.6"
+version = "2.0.0"
 dependencies = [
  "rusty_alloc",
 ]
 
 [[package]]
 name = "rusty_alloc-bench"
-version = "1.1.6"
+version = "2.0.0"
 dependencies = [
  "libloading",
  "rusty_alloc",
@@ -295,14 +302,14 @@ dependencies = [
 
 [[package]]
 name = "rusty_alloc-ffi"
-version = "1.1.6"
+version = "2.0.0"
 dependencies = [
  "rusty_alloc",
 ]
 
 [[package]]
 name = "rusty_alloc-override"
-version = "1.1.6"
+version = "2.0.0"
 dependencies = [
  "rusty_alloc",
  "rusty_alloc-ffi",
@@ -310,7 +317,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_alloc-wasm"
-version = "1.1.6"
+version = "2.0.0"
 dependencies = [
  "rusty_alloc",
 ]

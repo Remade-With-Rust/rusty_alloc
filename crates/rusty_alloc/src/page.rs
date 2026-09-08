@@ -131,7 +131,7 @@ pub(crate) const fn bitmap_bytes(blocks: usize) -> usize {
 #[inline(never)]
 #[cfg(feature = "blockmap")]
 pub(crate) fn blockmap_abort() -> ! {
-    std::process::abort()
+    crate::abort()
 }
 
 /// `blockmap`: flip `b`'s liveness bit, requiring it to currently be the
@@ -712,7 +712,7 @@ pub unsafe fn page_push_local(page: *mut Page, block: *mut Block) -> u32 {
 #[cold]
 #[inline(never)]
 pub(crate) fn double_free_abort() -> ! {
-    std::process::abort()
+    crate::abort()
 }
 
 /// A corrupted free-list link was detected on decode (`secure` builds).
@@ -729,7 +729,7 @@ pub(crate) fn double_free_abort() -> ! {
 #[inline(never)]
 #[cfg(any(feature = "secure", feature = "linkcheck"))]
 pub(crate) fn corrupt_free_list_abort() -> ! {
-    std::process::abort()
+    crate::abort()
 }
 
 /// Remote (non-owner) free — the loom-modeled protocol.
@@ -864,7 +864,7 @@ pub unsafe fn page_set_flag(page: *mut Page, flag: usize) {
 ///
 /// # Safety
 /// `page` owned by the calling thread.
-pub unsafe fn page_collect(page: *mut Page) {
+pub unsafe fn page_collect(page: *mut Page) -> bool {
     // SAFETY: forwarded contract; PRESERVE the protocol flag.
     unsafe { page_collect_impl::<false>(page, 0) }
 }
@@ -884,7 +884,7 @@ pub unsafe fn page_collect(page: *mut Page) {
 /// As [`page_collect`].
 pub unsafe fn page_collect_and_set_flag(page: *mut Page, flag: usize) {
     // SAFETY: forwarded contract.
-    unsafe { page_collect_impl::<true>(page, flag) }
+    let _stole = unsafe { page_collect_impl::<true>(page, flag) };
 }
 
 /// The body of both. `SET_FLAG` is a const parameter so neither caller pays a
@@ -893,7 +893,7 @@ pub unsafe fn page_collect_and_set_flag(page: *mut Page, flag: usize) {
 /// # Safety
 /// As [`page_collect`].
 #[inline]
-unsafe fn page_collect_impl<const SET_FLAG: bool>(page: *mut Page, flag: usize) {
+unsafe fn page_collect_impl<const SET_FLAG: bool>(page: *mut Page, flag: usize) -> bool {
     // SAFETY: owner-only lists plus designed atomic steal.
     unsafe {
         if (*page).free.is_null() {
@@ -913,7 +913,7 @@ unsafe fn page_collect_impl<const SET_FLAG: bool>(page: *mut Page, flag: usize) 
         // Steal the cross-thread chain, preserving the protocol flag — or,
         // when SET_FLAG, replacing it in the same CAS.
         if !SET_FLAG && ((*page).xthread_free.load(Ordering::Acquire) & !XMASK) == 0 {
-            return;
+            return false;
         }
         loop {
             let x = (*page).xthread_free.load(Ordering::Acquire);
@@ -933,7 +933,7 @@ unsafe fn page_collect_impl<const SET_FLAG: bool>(page: *mut Page, flag: usize) 
                 {
                     continue;
                 }
-                break;
+                return false;
             }
             let want = if SET_FLAG { flag } else { x & XMASK };
             if (*page)
@@ -988,6 +988,9 @@ unsafe fn page_collect_impl<const SET_FLAG: bool>(page: *mut Page, flag: usize) 
             (*page).used -= n;
             break;
         }
+        // Reached only by breaking out of the steal arm above, i.e. a
+        // cross-thread chain was actually taken.
+        true
     }
 }
 
@@ -1246,8 +1249,18 @@ mod link_tests {
     /// precisely why it can be pinned this exactly. The end-to-end proof that
     /// a bad link actually ABORTS lives in `tests/corruption.rs`.
     const BASE: usize = 0x0000_4000_0000_0000;
-    /// A block sitting 1 MiB into that segment.
-    const B: usize = BASE + 0x10_0000;
+    /// An offset well inside a segment at ANY geometry.
+    ///
+    /// Derived rather than the literal 1 MiB it used to be: the predicate
+    /// under test is scoped to `SEGMENT_SIZE`, so a fixed offset silently
+    /// stops testing the inside of the segment the moment that constant
+    /// moves — under the small profile (P2, `docs/plans/small-metal.md`) a
+    /// 64 KiB segment does not contain a 1 MiB offset at all, and three of
+    /// these assertions inverted. `/8` keeps the +-4096 probes below inside
+    /// the segment at every geometry this crate builds.
+    const OFF: usize = SEGMENT_SIZE / 8;
+    /// A block sitting `OFF` bytes into that segment.
+    const B: usize = BASE + OFF;
 
     #[test]
     fn accepts_genuine_links_anywhere_in_the_same_segment() {
@@ -1322,8 +1335,8 @@ mod link_tests {
             "the neighbouring block is reachable by design — see R-005"
         );
         assert!(
-            link_is_plausible(B + 0x10_0000, B),
-            "1 MiB away, still the same segment"
+            link_is_plausible(B + OFF, B),
+            "far away in bytes, still the same segment"
         );
     }
 }

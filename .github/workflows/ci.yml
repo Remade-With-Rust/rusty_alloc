@@ -93,6 +93,15 @@ jobs:
       # documented in UNSAFE.md and re-baselined in the same commit.
       - name: unsafe census ratchet
         run: bash tools/unsafe-census.sh
+      # The same argument as `prove the rules are not vacuous`, applied to the
+      # TESTS: reintroduce each defect a load-bearing test guards and require the
+      # suite to go red. Four tests in this repo have passed under the exact bug
+      # they existed to catch; this is what stops the fifth.
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+      - name: prove the gates are not vacuous
+        run: bash tools/gate-selftest.sh
 
   # H-30: the proofs must keep proving. Kani is slow, so this runs on a
   # schedule and on demand rather than blocking every PR — the harnesses
@@ -147,6 +156,114 @@ jobs:
       - name: check windows target from linux
         run: cargo check --workspace --target x86_64-pc-windows-msvc
 
+  # The EMBEDDED surface: `no_std`, the `ra_small_profile` geometry, and a
+  # bare-metal target with no 64-bit atomics.
+  #
+  # Everything the small-metal campaign added — the fixed-region prim backend,
+  # the second geometry, the `split64` shim, the reclamation fixes — was
+  # verified by hand and by NOTHING ELSE until this job existed. Five real
+  # defects were found in that surface in a single session; every one of them
+  # would have passed the jobs above, because none of them build `no_std`, none
+  # set `ra_small_profile`, and none target a chip.
+  #
+  # riscv32imac/imafc rather than Xtensa: they are stock rustup targets, and
+  # they exercise the properties that matter — `no_std`, a 32-bit `usize`, and
+  # `cfg(not(target_has_atomic = "64"))`, which is what selects `split64` over
+  # `portable-atomic`. The ESP32-S3 board runs are in
+  # `docs/plans/small-metal.md`; they need hardware and cannot gate a PR.
+  embedded:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+          components: clippy
+          targets: riscv32imac-unknown-none-elf, riscv32imafc-unknown-none-elf
+      # The second geometry is a full test run, not a build check: it changes
+      # segment/slice/page arithmetic that most of the suite depends on.
+      - name: test (small profile)
+        run: cargo test -p rusty_alloc
+        env:
+          RUSTFLAGS: --cfg ra_small_profile
+      - name: clippy (small profile)
+        run: cargo clippy -p rusty_alloc --all-targets -- -D warnings
+        env:
+          RUSTFLAGS: --cfg ra_small_profile
+      # The no_std build REFUSES to compile without `ra_single_threaded`: its
+      # soundness rests on there being exactly one thread, and that has to be
+      # opted into rather than inherited. The gate's negative case is asserted
+      # below, in the same spirit as `prove the rules are not vacuous`.
+      - name: clippy (no_std)
+        run: cargo clippy -p rusty_alloc --no-default-features -- -D warnings
+        env:
+          RUSTFLAGS: --cfg ra_single_threaded
+      - name: prove the single-thread gate is not vacuous
+        run: |
+          if cargo check -p rusty_alloc --no-default-features \
+               --target riscv32imac-unknown-none-elf 2>/dev/null; then
+            echo "no_std built WITHOUT --cfg ra_single_threaded; the gate is gone" >&2
+            exit 1
+          fi
+          echo "gate fires: no_std refuses to build without the opt-in"
+      # BOTH geometries on BOTH bare-metal targets. The matrix is the point:
+      # `ra_small_profile` and `no_std` are independent axes, and a defect that
+      # needs both is exactly the kind this job exists to catch.
+      - name: build no_std bare metal (both targets, both geometries)
+        run: |
+          set -euo pipefail
+          for target in riscv32imac-unknown-none-elf riscv32imafc-unknown-none-elf; do
+            for flags in "" "--cfg ra_small_profile"; do
+              echo "::group::$target ${flags:-default geometry}"
+              RUSTFLAGS="--cfg ra_single_threaded $flags" cargo build -p rusty_alloc \
+                --no-default-features --target "$target"
+              echo "::endgroup::"
+            done
+          done
+      # `rusty_alloc-api` is what a firmware actually depends on, so its
+      # `no_std` path is gated too rather than assumed from the core crate.
+      - name: build rusty_alloc-api no_std
+        run: cargo build -p rusty_alloc-api --no-default-features --target riscv32imac-unknown-none-elf
+        env:
+          RUSTFLAGS: --cfg ra_small_profile --cfg ra_single_threaded
+
+  # The README quotes instruction-count ratios against mimalloc, jemalloc and
+  # glibc. `bench/icount-arms.sh` is what produces every column of them, but
+  # nothing RE-RAN it, so the published figures aged silently: P4e's reclamation
+  # fixes cost 2.2-7.9 % on hardware and the host table still predated them.
+  #
+  # Scheduled rather than per-PR because callgrind is slow — the same reasoning
+  # as `proofs`. It uploads the table so a release can be cut against a number
+  # that was measured rather than remembered.
+  icount:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+      - name: install valgrind and jemalloc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y valgrind libjemalloc2
+      - name: build oracle arms
+        run: bash oracle/build.sh
+      - name: build the override shim
+        run: cargo build --release -p rusty_alloc-override
+      - name: instructions retired, all arms
+        run: |
+          set -o pipefail
+          RA_OVERRIDE_LIB="$PWD/target/release/librusty_alloc_override.so" \
+            bash bench/icount-arms.sh 2>&1 | tee icount.txt
+      - name: publish the table
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: icount-${{ github.sha }}
+          path: icount.txt
+
   # G4: the os-layer logic must stay UB-free under miri against the mock prim.
   miri:
     runs-on: ubuntu-latest
@@ -179,6 +296,12 @@ jobs:
         run: cargo build -p rusty_alloc-wasm --target wasm32-unknown-unknown --release
       - name: run self-test inside a WebAssembly VM
         run: node bench/wasm-selftest.mjs target/wasm32-unknown-unknown/release/rusty_alloc_wasm.wasm
+      # SIZE is a shipped property of a wasm allocator: every byte is downloaded
+      # by every visitor to every page using it. Nothing measured it, so a
+      # 3,700-byte-gzipped regression sat in the crate for its whole life until
+      # an integrator reported it. See docs/plans/wasm-size.md.
+      - name: wasm size ratchet
+        run: bash tools/wasm-size.sh
 
   oracle:
     runs-on: ubuntu-latest

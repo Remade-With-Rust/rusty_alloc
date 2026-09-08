@@ -29,11 +29,27 @@ does not offer.
   cross-thread path and abort.
 - **~150 of mimalloc's ~157 `mi_*` entry points**, gated against the C
   implementation as a differential oracle on every change.
-- **Runs on WebAssembly** with no C toolchain and no emscripten.
+- **Runs on WebAssembly** with no C toolchain and no emscripten, and **2.0.0
+  halves what it adds to a gzipped bundle** (+7,760 -> +3,829 bytes on a minimal
+  module) — see [Shipping it to a browser](#shipping-it-to-a-browser).
+- **Runs on a microcontroller, and is 2.0-3.7x faster than `esp-alloc` there** —
+  measured on a XIAO ESP32-S3 at 240 MHz, both allocators built from one source.
+  It costs more RAM to get that (68 KiB vs 8 KiB); both numbers are below.
 
-> **Status: `1.1.4` — the API is frozen; changes follow semver from here.**
-> `1.1.0` is additive only (one new public item); every `1.0.x` user compiles
-> unchanged.
+> **Status: `2.0.0`.** The API is frozen and changes follow semver.
+>
+> **What breaks, and why it is a major.** Two things, neither of which touches a
+> consumer on default features: `default-features = false` now selects the
+> `no_std` profile (it used to be identical to the default, because there were
+> no default features), and `heap::Heap` gained a field, which a struct literal
+> would notice. If you set `default-features = false` and want what you had, add
+> `features = ["std"]`. `CHANGELOG.md` has the detail.
+>
+> **What you gain**: `no_std` on bare metal, a second geometry for parts with
+> kilobytes instead of gigabytes, and three reclamation fixes — one of which
+> could leave a long-running heap reporting OOM while holding memory it could
+> have reclaimed.
+>
 > Upgrading from 0.3.x or earlier is mandatory, not optional: 0.4.0 fixed
 > three platform-independent use-after-frees, so **treat 0.3.2 and earlier as
 > unsound on every target.**
@@ -54,6 +70,15 @@ WHOLE-PROGRAM instructions:
 
 jemalloc is 5.3.0; all four arms are the same neutral binary under `LD_PRELOAD`,
 same callgrind method.
+
+> **Provenance, and a caveat.** These were measured at `v1.1.5` (2026-08-28) and
+> **predate the reclamation fixes on `main`** — `collect` reclaiming a bin's last
+> page, the periodic `generic_collect`, and the reclaim-and-retry before the
+> generic path returns null. Those cost **2.2-7.9 % of allocation throughput**
+> measured on an ESP32-S3, so the ratios above are the floor of what the current
+> `main` would report, not the number. `bench/icount-arms.sh` regenerates every
+> column, and the `icount` CI job runs it on a schedule; **re-run it before
+> quoting these for a release.**
 
 Those are whole-program ratios, and they understate the allocator by design,
 because in a real program most instructions are not the allocator. The same
@@ -138,6 +163,180 @@ than the cost.
 **RSS:** long-lived services should set `purge_delay >= 0` — that is the
 configuration with flat, measured RSS (a 6-minute thread-churn soak held
 9.4 MiB, slope −0.02 MiB/min). The shipped default leaves purging opt-in.
+
+## Embedded: bare metal, measured on silicon
+
+`rusty_alloc` builds `no_std` and runs as the `#[global_allocator]` on an
+ESP32-S3. Everything below was measured on a **Seeed XIAO ESP32-S3 Sense at
+240 MHz**, against **`esp-alloc` 0.11**, the standard allocator for the
+`esp-hal` bare-metal track.
+
+### Throughput — 2.0x to 3.7x faster
+
+Nanoseconds per allocate/free pair, lower is better:
+
+| workload | `esp-alloc` | `rusty_alloc` | speedup |
+|---|---:|---:|---:|
+| 32 B alloc/free, one size | 1,638 | **647** | **2.53x** |
+| 64 mixed blocks (8-512 B), batch out then back | 1,792 | **881** | **2.03x** |
+| **churn: 64 live, random sizes 8-512 B, random replacement** | 3,987 | **1,087** | **3.67x** |
+| 2048 B alloc/free | 1,638 | **1,200** | **1.37x** |
+
+Both arms measured in the same session, same floor (162 ns/op in each), with
+matching checksums. These include the reclamation fixes a stress battery forced
+(see below), and the 2 KiB row also carries the medium-band collect-and-retry
+that took it from 1.19x to 1.37x.
+
+The churn row is the one to read. It is the shape real code has, and the shape
+that fragments a first-fit free list — which is exactly what a size-class page
+allocator with per-class free lists is built not to do. The 2048 B row is the
+weakest because at this geometry 2 KiB is the top of the binned range and lands
+in a medium page.
+
+**How the arms are kept honest:**
+
+- **One binary source.** Both arms are the same firmware; `--cfg` picks the
+  allocator, so the dependency graph and every other line are identical.
+- **Equal budgets.** Both get the same 192 KiB for the speed run, so neither is
+  advantaged by having more (or less) memory to walk.
+- **The harness measures itself.** A baseline arm runs the identical loop,
+  non-inlined touch and four volatile accesses with *no allocator call*. It cost
+  **162 ns/op in both arms** and is subtracted from every row above. Without
+  that subtraction the harness overhead sits inside both arms and compresses the
+  ratio.
+- **Work parity is proven, not assumed.** Every block is written and read back
+  through `write_volatile`/`read_volatile` (so the optimiser cannot delete an
+  alloc/free pair and time an empty loop), folded into a checksum that is
+  printed. **Every checksum matches across the two arms**, so both allocators
+  provably did the same work.
+- **A null arm.** The same benchmark twice within one arm reproduced to the
+  nanosecond (625 and 625; 1,638 and 1,638), so the resolution floor is below
+  any gap claimed here. Best-of-5, spread <= 1% on every row.
+
+### Footprint — this is the cost, not a win
+
+| | `esp-alloc` | `rusty_alloc` |
+|---|---:|---:|
+| smallest heap that runs the same workload | **8 KiB** | 68 KiB |
+| peak live bytes (identical, the parity check) | 4,914 | 4,914 |
+| app image | 116,032 B | 127,088 B (+9.5%) |
+
+**`esp-alloc` wins this by 8.5x, and the reason is structural rather than a
+missing optimisation.** A linked-list heap's floor is `bytes live + per-block
+header`. A size-class page allocator's floor is `(size classes touched) x (page
+size)` — independent of how many bytes you actually asked for. The measured
+workload touches 10 classes and holds 4,914 bytes; nine of its pages hold 1,412
+bytes between them.
+
+**Read 68 KiB as this workload's floor, not a general budget.** It is the least
+memory that runs *this* sketch. A stress battery that touches 24 distinct size
+classes holds only 5 of them at 68 KiB — because the floor scales with the
+number of classes a program uses, which is the same sentence as above read from
+the other end.
+
+That floor is roughly **fixed** for a given mix of sizes: the same pages serve a
+5 KB working set or a 500 KB one. So the crossover is where live bytes approach
+`classes x page size` — below it `esp-alloc` wins by construction, above it the
+page allocator starts earning what it charges, and the throughput above is what
+it buys.
+
+We got from 192 KiB to 68 KiB by fixing a placement bug in the fixed-region
+backend and halving the slice; the full decomposition, the levers taken and the
+one deliberately left on the table are in
+[`docs/plans/small-metal.md`](docs/plans/small-metal.md).
+
+### Stress: what a hostile workload does to each
+
+Eight adversarial tests — every routing boundary, alignment up to a whole
+segment, a realloc chain, `alloc_zeroed` over deliberately dirtied memory, a
+fragmentation adversary, exhaustion and recovery, a 24-class sweep, and 50,000
+random-replacement churn ops:
+
+| | `esp-alloc` | `rusty_alloc` |
+|---|---|---|
+| routing boundaries, realloc chain, zeroing, fragmentation, exhaustion | PASS | PASS |
+| 24 distinct size classes held at once | 24 | 21 |
+| 64 KiB-aligned request | served | refused |
+| NULLs in 50,000 churn allocations | 0 | 357 |
+| 512 B capacity over the whole battery | flat 383 | flat 240 |
+
+**The battery found a real bug and we fixed it.** `collect` was borrowing
+`mi_page_retire`'s keep-one-page-per-class rule, so no collect at any level
+could return a class's page to a different class, and nothing collected
+automatically. On a heap with 16 slices per segment that compounded: capacity
+decayed 168 -> 8 blocks and **22,533 of 50,000** churn allocations returned null
+while 61,440 bytes sat free. With the fixes, capacity no longer decays at all
+and the same churn returns 357.
+
+The two remaining refusals are the size-class floor, not defects: a 64 KiB-aligned
+request needs a whole free 64 KiB segment, and 21-of-24 classes is exactly what
+30 slices hold once classes above 512 B cost four slices each.
+
+**Use it on a microcontroller when** allocation throughput or fragmentation
+under churn matters and you have RAM to spare. **Use `esp-alloc` when** the
+budget is tight — which on many parts it is. We would rather say that than sell
+you the wrong one.
+
+## Shipping it to a browser
+
+An integrator reported `rusty_alloc` adding ~12 % to their gzipped wasm bundle.
+It was measured, and most of it is gone in 2.0.0.
+
+| | raw | gzip | overhead vs the Rust default |
+|---|---:|---:|---:|
+| dlmalloc (Rust default for wasm32) | 15,536 | 6,706 | — |
+| rusty_alloc 1.1.x | 34,285 | 14,466 | +7,760 |
+| **rusty_alloc 2.0.0** | **25,734** | **10,535** | **+3,829** |
+
+Measured on a minimal consumer built the way you would ship it (`opt-level="z"`,
+`lto="fat"`, `panic="abort"`, `strip`), attributed by a set difference against
+the same module without the allocator. The cause was an option-environment pass
+that ran on `wasm32-unknown-unknown`, where `std::env::var` is a stub that always
+fails: 38 iterations formatting 76 strings every startup, to read an environment
+that target does not have. `tools/wasm-size.sh` is now a CI gate so it cannot
+come back. The method and what was ruled out are in
+[`docs/plans/wasm-size.md`](docs/plans/wasm-size.md).
+
+### What the bytes buy
+
+Same module, run in node — nanoseconds per allocate/free pair, net of a measured
+harness floor, with checksums proving both allocators did identical work:
+
+| workload | dlmalloc | rusty_alloc | |
+|---|---:|---:|---|
+| **churn: 64 live blocks, random 8-512 B** | ~71-78 ns | ~10-15 ns | **4.9-7.3x faster** |
+| 2048 B tight alloc/free | ~9-14 ns | ~16-22 ns | 0.55-0.83x |
+| 32 B tight alloc/free, and 64 mixed batched | — | — | within noise |
+
+Churn is the shape real code has, and the one that fragments a free list. The
+2048 B row is a tight same-size loop, where a boundary-tag allocator's
+free-then-alloc is a single list push and pop; `alloc.rs` carries a dated,
+measured note explaining why the obvious fix for it is a regression elsewhere.
+Only the two outer rows are claims — the middle two straddle 1.0 across repeats
+and are reported as such. Ranges are five runs; reproduce with
+[`bench/wasm-speed/`](bench/wasm-speed/).
+
+**To ship it small:**
+
+```toml
+[profile.release]
+opt-level = "z"      # "s" if you would rather have the speed
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+```
+
+```sh
+# Another ~16% off the RAW size (parse time and memory; gzip already
+# captures most of what this does, so the download barely moves).
+wasm-opt -Oz --enable-bulk-memory --strip-debug --strip-producers in.wasm -o out.wasm
+```
+
+**And check your own artifact for build paths.** Rust embeds panic locations as
+absolute paths, so a published `.wasm` can carry your home directory and
+username. `RUSTFLAGS="--remap-path-prefix=$PWD=."` fixes it on stable; Cargo's
+`trim-paths` is still nightly.
 
 ## Correctness evidence
 

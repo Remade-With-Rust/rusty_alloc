@@ -9,7 +9,20 @@
 //! (ever-used → its memory is NOT zero — feeds the segment zero-tracking).
 
 use core::ptr;
-use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+
+/// Word type of the chunk bitmaps.
+///
+/// `u32`, not `u64`: a bitmap's word width is a FREE CHOICE — the same total
+/// bits either way — and 32-bit RISC-V (ESP32-C3/C6) and Xtensa (ESP32-S3)
+/// have no 64-bit atomic at all. This is the one CORRECTNESS-path 64-bit
+/// atomic the crate had (P3 of `docs/plans/small-metal.md`, §2.2), and
+/// narrowing it keeps the claim/verify loop lock-free rather than routing it
+/// through `portable-atomic`'s fallback lock.
+type BitWord = u32;
+type AtomicBitWord = AtomicU32;
+/// Bits per bitmap word.
+const WORD_BITS: usize = BitWord::BITS as usize;
 
 use crate::os;
 use crate::types::SEGMENT_SIZE;
@@ -48,8 +61,8 @@ pub struct Arena {
     pub owned: bool,
     /// Advisory NUMA node (recorded; placement lands post-v1).
     pub numa_node: i32,
-    used: [AtomicU64; MAX_CHUNKS / 64],
-    dirty: [AtomicU64; MAX_CHUNKS / 64],
+    used: [AtomicBitWord; MAX_CHUNKS / WORD_BITS],
+    dirty: [AtomicBitWord; MAX_CHUNKS / WORD_BITS],
 }
 
 static ARENAS: [AtomicPtr<Arena>; MAX_ARENAS] =
@@ -73,7 +86,7 @@ fn arena_register(
     let desc = os::alloc_aligned(core::mem::size_of::<Arena>(), os::page_size(), true, false)
         .map_err(|_| ())?;
     let a: *mut Arena = desc.ptr.cast();
-    // SAFETY: fresh zeroed mapping; AtomicU64 zero bit-pattern is valid, so
+    // SAFETY: fresh zeroed mapping; the bitmap words' zero bit-pattern is valid, so
     // only the scalar fields need writing.
     unsafe {
         (*a).base = base;
@@ -140,11 +153,11 @@ pub fn manage_os_memory_ex(
     // SAFETY: freshly registered arena descriptor.
     unsafe {
         let chunks = (*a).chunks_live.load(Ordering::Acquire);
-        for w in 0..chunks.div_ceil(64) {
-            let bits = if (w + 1) * 64 <= chunks {
-                u64::MAX
+        for w in 0..chunks.div_ceil(WORD_BITS) {
+            let bits = if (w + 1) * WORD_BITS <= chunks {
+                BitWord::MAX
             } else {
-                (1u64 << (chunks % 64)) - 1
+                ((1 as BitWord) << (chunks % WORD_BITS)) - 1
             };
             (*a).dirty[w].store(bits, Ordering::Relaxed);
         }
@@ -255,20 +268,20 @@ fn chunk_alloc_inner(restrict_id: i32) -> Option<(*mut u8, bool)> {
                 continue;
             }
             let chunks = (*a).chunks_live.load(Ordering::Acquire);
-            let words = chunks.div_ceil(64);
+            let words = chunks.div_ceil(WORD_BITS);
             for w in 0..words {
                 loop {
                     let cur = (*a).used[w].load(Ordering::Acquire);
-                    let limit = if (w + 1) * 64 <= chunks {
-                        64
+                    let limit = if (w + 1) * WORD_BITS <= chunks {
+                        WORD_BITS
                     } else {
-                        chunks % 64
+                        chunks % WORD_BITS
                     };
                     let free_bits = !cur
-                        & if limit == 64 {
-                            u64::MAX
+                        & if limit == WORD_BITS {
+                            BitWord::MAX
                         } else {
-                            (1u64 << limit) - 1
+                            ((1 as BitWord) << limit) - 1
                         };
                     if free_bits == 0 {
                         break;
@@ -285,7 +298,7 @@ fn chunk_alloc_inner(restrict_id: i32) -> Option<(*mut u8, bool)> {
                     {
                         continue;
                     }
-                    let idx = w * 64 + bit;
+                    let idx = w * WORD_BITS + bit;
                     let was_dirty =
                         (*a).dirty[w].fetch_or(1 << bit, Ordering::AcqRel) & (1 << bit) != 0;
                     let p = (*a).base.add(idx * SEGMENT_SIZE);
@@ -348,7 +361,8 @@ fn chunk_alloc_n_inner(restrict_id: i32, n: usize) -> Option<(*mut u8, bool)> {
                 let mut run = 0usize;
                 let mut idx = 0usize;
                 while idx < chunks {
-                    let bit = (*a).used[idx / 64].load(Ordering::Acquire) & (1 << (idx % 64));
+                    let bit = (*a).used[idx / WORD_BITS].load(Ordering::Acquire)
+                        & (1 << (idx % WORD_BITS));
                     run = if bit == 0 { run + 1 } else { 0 };
                     if run == n {
                         let start = idx + 1 - n;
@@ -362,15 +376,17 @@ fn chunk_alloc_n_inner(restrict_id: i32, n: usize) -> Option<(*mut u8, bool)> {
                         // the parallel-test corruption found in M8.
                         let mut conflict = None;
                         for j in start..=idx {
-                            let prev = (*a).used[j / 64].fetch_or(1 << (j % 64), Ordering::AcqRel);
-                            if prev & (1 << (j % 64)) != 0 {
+                            let prev = (*a).used[j / WORD_BITS]
+                                .fetch_or(1 << (j % WORD_BITS), Ordering::AcqRel);
+                            if prev & (1 << (j % WORD_BITS)) != 0 {
                                 conflict = Some(j);
                                 break;
                             }
                         }
                         if let Some(c) = conflict {
                             for j in start..c {
-                                (*a).used[j / 64].fetch_and(!(1 << (j % 64)), Ordering::AcqRel);
+                                (*a).used[j / WORD_BITS]
+                                    .fetch_and(!(1 << (j % WORD_BITS)), Ordering::AcqRel);
                             }
                             run = 0;
                             idx = c + 1;
@@ -378,9 +394,9 @@ fn chunk_alloc_n_inner(restrict_id: i32, n: usize) -> Option<(*mut u8, bool)> {
                         }
                         let mut any_dirty = false;
                         for j in start..=idx {
-                            any_dirty |= (*a).dirty[j / 64]
-                                .fetch_or(1 << (j % 64), Ordering::AcqRel)
-                                & (1 << (j % 64))
+                            any_dirty |= (*a).dirty[j / WORD_BITS]
+                                .fetch_or(1 << (j % WORD_BITS), Ordering::AcqRel)
+                                & (1 << (j % WORD_BITS))
                                 != 0;
                         }
                         let p = (*a).base.add(start * SEGMENT_SIZE);
@@ -413,7 +429,7 @@ pub fn chunk_free_n(p: *mut u8, n: usize) -> bool {
             {
                 let start = (addr - (*a).base.addr()) / SEGMENT_SIZE;
                 for j in start..start + n {
-                    (*a).used[j / 64].fetch_and(!(1 << (j % 64)), Ordering::AcqRel);
+                    (*a).used[j / WORD_BITS].fetch_and(!(1 << (j % WORD_BITS)), Ordering::AcqRel);
                 }
                 return true;
             }
@@ -438,7 +454,7 @@ pub fn chunk_free(p: *mut u8) -> bool {
                 && addr < (*a).base.addr() + (*a).chunks_live.load(Ordering::Acquire) * SEGMENT_SIZE
             {
                 let idx = (addr - (*a).base.addr()) / SEGMENT_SIZE;
-                (*a).used[idx / 64].fetch_and(!(1 << (idx % 64)), Ordering::AcqRel);
+                (*a).used[idx / WORD_BITS].fetch_and(!(1 << (idx % WORD_BITS)), Ordering::AcqRel);
                 return true;
             }
         }
@@ -515,8 +531,8 @@ pub(crate) fn adopt_os_block(ptr: *mut u8, size: usize) -> Option<i32> {
                 // Dirty bits FIRST, counts after: a reader that observes the
                 // new count must observe the new chunks as dirty.
                 for j in chunks..chunks + n {
-                    (*a).dirty[j / 64].fetch_or(1 << (j % 64), Ordering::AcqRel);
-                    (*a).used[j / 64].fetch_and(!(1 << (j % 64)), Ordering::AcqRel);
+                    (*a).dirty[j / WORD_BITS].fetch_or(1 << (j % WORD_BITS), Ordering::AcqRel);
+                    (*a).used[j / WORD_BITS].fetch_and(!(1 << (j % WORD_BITS)), Ordering::AcqRel);
                 }
                 (*a).chunks_live.store(chunks + n, Ordering::Release);
                 return Some(id as i32);
@@ -535,7 +551,7 @@ pub(crate) fn adopt_os_block(ptr: *mut u8, size: usize) -> Option<i32> {
     // SAFETY: freshly registered live descriptor.
     unsafe {
         for j in 0..n {
-            (*a).dirty[j / 64].fetch_or(1 << (j % 64), Ordering::AcqRel);
+            (*a).dirty[j / WORD_BITS].fetch_or(1 << (j % WORD_BITS), Ordering::AcqRel);
         }
     }
     Some(id)
@@ -560,6 +576,11 @@ pub fn arena_area(id: i32) -> (*mut u8, usize) {
 }
 
 /// Debug print of arena occupancy (mi_debug_show_arenas / mi_arenas_print).
+///
+/// std-only: each line is built as an owned string (P3, §2.5). The occupancy
+/// itself is readable without it — `arena_area` and the chunk counters are not
+/// gated; only the human formatting is.
+#[cfg(feature = "std")]
 #[allow(clippy::needless_range_loop)] // indexed scan over a fixed atomic table
 pub fn arenas_print(out: &mut dyn FnMut(&str)) {
     let n = ARENA_COUNT.load(Ordering::Acquire).min(MAX_ARENAS);
@@ -576,7 +597,7 @@ pub fn arenas_print(out: &mut dyn FnMut(&str)) {
         unsafe {
             let chunks = (*a).chunks_live.load(Ordering::Acquire);
             let mut used = 0usize;
-            for w in 0..chunks.div_ceil(64) {
+            for w in 0..chunks.div_ceil(WORD_BITS) {
                 used += (*a).used[w].load(Ordering::Relaxed).count_ones() as usize;
             }
             let mut line = heapless_fmt(
@@ -595,6 +616,7 @@ pub fn arenas_print(out: &mut dyn FnMut(&str)) {
 
 // Tiny fixed formatting helper (no allocation inside the allocator's own
 // diagnostics).
+#[cfg(feature = "std")]
 fn heapless_fmt(
     id: usize,
     base: usize,
@@ -602,8 +624,8 @@ fn heapless_fmt(
     used: usize,
     chunks: usize,
     excl: bool,
-) -> String {
-    format!(
+) -> std::string::String {
+    std::format!(
         "arena {id}: base {base:#x} size {} MiB, {used}/{chunks} chunks used{}\n",
         size / (1024 * 1024),
         if excl { " (exclusive)" } else { "" }

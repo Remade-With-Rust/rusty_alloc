@@ -1,0 +1,23 @@
+[package]
+name = "speedprobe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+rusty_alloc-api = { path = "../../crates/rusty_alloc_api", optional = true }
+rusty_alloc = { path = "../../crates/rusty_alloc", optional = true }
+
+[features]
+ra = ["dep:rusty_alloc-api", "dep:rusty_alloc"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[workspace]

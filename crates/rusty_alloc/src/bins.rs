@@ -231,6 +231,19 @@ mod tests {
             (4097, 5120),
             (65536, 65536), // last binned size
         ] {
+            // These are pinned against the mimalloc v2.4.5 oracle, which
+            // exists only at the shipped geometry. `good_size` bins up to
+            // MEDIUM_OBJ_SIZE_MAX and PAGE-ROUNDS above it, so under a
+            // different geometry (P2, `docs/plans/small-metal.md`) the
+            // largest rows here move out of the binned range and stop being
+            // oracle facts. Filtering keeps every row the two geometries
+            // share instead of disabling the whole fixture — and the
+            // page-rounded half is already covered, as a PROPERTY rather
+            // than a literal, by `good_size_above_binned_range_is_page_rounded`
+            // below.
+            if size > crate::types::MEDIUM_OBJ_SIZE_MAX {
+                continue;
+            }
             assert_eq!(good_size(size), good, "good_size({size})");
         }
     }

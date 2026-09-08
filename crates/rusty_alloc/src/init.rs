@@ -289,7 +289,7 @@ mod heap_tls {
     use super::HeapBox;
     use core::cell::Cell;
 
-    std::thread_local! {
+    ra_thread_local! {
         /// Fast-path heap pointer. Const-init + !Drop ⇒ plain TLS access, no
         /// lazy-init branch, no allocation ever. Initialised to the
         /// empty-heap SENTINEL (never null) so the malloc fast path can read
@@ -308,7 +308,7 @@ mod heap_tls {
     }
 }
 
-std::thread_local! {
+ra_thread_local! {
     /// Cached OS thread id. `free` needs the calling thread's id on EVERY
     /// call to route local-vs-remote; the raw `prim::thread_id()` is a libc
     /// call (`pthread_self` through the PLT from a cdylib) measured at
@@ -576,7 +576,7 @@ fn init_thread_heap() -> *mut HeapBox {
     hb
 }
 
-std::thread_local! {
+ra_thread_local! {
     /// The thread's original (backing) heap — what `mi_heap_get_backing`
     /// returns regardless of `mi_heap_set_default` swaps.
     static BACKING_PTR: Cell<*mut HeapBox> = const { Cell::new(ptr::null_mut()) };
@@ -625,7 +625,7 @@ fn done_slot() -> prim::TlsSlot {
         // resource failure into a silent process-wide hang. Fail loudly and
         // deterministically instead, identically in debug and release.
         let Some(slot) = prim::TlsSlot::new(Some(thread_done_cb)) else {
-            std::process::abort();
+            crate::abort();
         };
         RAW.store(slot.into_raw() + 1, Ordering::Release); // +1: 0 is the unset sentinel
     }
@@ -918,7 +918,7 @@ static SUBPROC_NEXT: AtomicUsize = AtomicUsize::new(1);
 /// Diagnostic: segments currently abandoned (all subprocs).
 pub static ABANDONED_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-std::thread_local! {
+ra_thread_local! {
     static SUBPROC: Cell<usize> = const { Cell::new(0) };
 }
 
