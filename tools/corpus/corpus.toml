@@ -1,0 +1,51 @@
+# The downstream corpus: crates that ship rusty_alloc to production.
+#
+# A major version is a promise that consumers can keep compiling. 2.0.0 makes
+# two breaking changes -- `default-features = false` now selects `no_std`, and
+# `heap::Heap` gained a field -- and neither is visible from inside this repo.
+# The only way to know what they cost is to build the things that depend on us.
+#
+# `path` is absolute because these are sibling checkouts, not submodules; a
+# consumer whose path is missing is SKIPPED and reported as such, never silently
+# passed. Add a consumer here the moment it takes a dependency on this crate.
+#
+# `features`/`no_default` describe the configuration that actually SHIPS. There
+# is no value in testing a shape nobody deploys.
+
+[[consumer]]
+name = "spacedb-sdk"
+path = "F:/coding/mata-master/packages/spacedb"
+pkg = "spacedb-sdk"
+synth = "yes"
+# `rusty-alloc` is default-ON here on purpose: a SpaceDB replica often runs on a
+# machine its operator does not control, so the unconfigured node is the
+# hardened one. That makes this the shape in production.
+features = ""
+note = "rusty_alloc-api pinned =1.1.6, optional, default-on"
+
+[[consumer]]
+name = "spacedb-sdk (secure)"
+path = "F:/coding/mata-master/packages/spacedb"
+pkg = "spacedb-sdk"
+synth = "yes"
+features = "secure"
+note = "forwards rusty_alloc-api/secure -- guard pages + encrypted free lists"
+
+[[consumer]]
+name = "rusty_alloc_default"
+path = "F:/coding/rusty_alloc_default"
+features = ""
+note = "the #[global_allocator] shim every Remade UI crate installs; rusty_zstd reaches us THROUGH it"
+
+[[consumer]]
+name = "rusty_zstd"
+path = "F:/coding/rusty_zstd"
+features = "rusty-alloc"
+pkg = "rusty_zstd"
+note = "depends via rusty_alloc_default, not directly"
+
+[[consumer]]
+name = "rusty_maplibre"
+path = "F:/coding/rusty_maplibre"
+features = ""
+note = "KNOWN RISK: takes rusty_alloc AND rusty_alloc-api with default-features = false, which is exactly what 2.0.0 redefines"
