@@ -81,7 +81,7 @@ perl produce **byte-identical output** under rusty_alloc, mimalloc and glibc;
 the full mimalloc-bench corpus (19 configurations, including the 8–16-thread
 storms) runs clean; Miri is clean over the whole target.
 
-## Embedded: 2.1-3.7x faster than `esp-alloc` on an ESP32-S3
+## Embedded: 2.0-3.7x faster than `esp-alloc` on an ESP32-S3
 
 Builds `no_std` and runs as the `#[global_allocator]` on bare metal. Measured on
 a Seeed XIAO ESP32-S3 Sense at 240 MHz against `esp-alloc` 0.11 — nanoseconds
@@ -89,10 +89,10 @@ per allocate/free pair, lower is better:
 
 | workload | `esp-alloc` | `rusty_alloc` | speedup |
 |---|---:|---:|---:|
-| 32 B alloc/free | 1,638 | **640** | **2.56x** |
-| 64 mixed blocks (8-512 B), batched | 1,792 | **871** | **2.06x** |
-| **churn: 64 live, random 8-512 B** | 3,987 | **1,069** | **3.73x** |
-| 2048 B alloc/free | 1,638 | **1,380** | 1.19x |
+| 32 B alloc/free | 1,638 | **647** | **2.53x** |
+| 64 mixed blocks (8-512 B), batched | 1,792 | **881** | **2.03x** |
+| **churn: 64 live, random 8-512 B** | 3,987 | **1,087** | **3.67x** |
+| 2048 B alloc/free | 1,638 | **1,200** | **1.37x** |
 
 Both arms are one firmware source with `--cfg` picking the allocator, given
 equal budgets. A baseline arm with no allocator call measured 162 ns/op in both

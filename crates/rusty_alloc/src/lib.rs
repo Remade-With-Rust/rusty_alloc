@@ -81,25 +81,25 @@ macro_rules! ra_thread_local {
     };
 }
 
-/// The `no_std` build asserts single-threadedness, so it must be OPTED INTO.
-///
-/// Three things in a `no_std` build are sound only because there is exactly one
-/// thread: [`SingleThreadCell`]'s `unsafe impl Sync`, `prim::fixed`'s constant
-/// thread id and never-contended spin lock, and `options`' 64-bit atomics split
-/// into `AtomicU32` halves. None of them is checkable at compile time, and none
-/// of them fails loudly if the assumption breaks — they corrupt quietly.
-///
-/// A doc comment is not a guard. `no_std` here therefore requires
-/// `--cfg ra_single_threaded`, so that using this allocator on a bare-metal
-/// target is a decision somebody wrote down rather than a default they
-/// inherited. There is no cost to it and no way around it:
-///
-/// ```text
-/// RUSTFLAGS="--cfg ra_single_threaded" cargo build --no-default-features
-/// ```
-///
-/// If your target has more than one thread touching the allocator, do not set
-/// it — enable the `std` feature instead, or the port is not done.
+// The `no_std` build asserts single-threadedness, so it must be OPTED INTO.
+//
+// Three things in a `no_std` build are sound only because there is exactly one
+// thread: [`SingleThreadCell`]'s `unsafe impl Sync`, `prim::fixed`'s constant
+// thread id and never-contended spin lock, and `options`' 64-bit atomics split
+// into `AtomicU32` halves. None of them is checkable at compile time, and none
+// of them fails loudly if the assumption breaks — they corrupt quietly.
+//
+// A doc comment is not a guard. `no_std` here therefore requires
+// `--cfg ra_single_threaded`, so that using this allocator on a bare-metal
+// target is a decision somebody wrote down rather than a default they
+// inherited. There is no cost to it and no way around it:
+//
+// ```text
+// RUSTFLAGS="--cfg ra_single_threaded" cargo build --no-default-features
+// ```
+//
+// If your target has more than one thread touching the allocator, do not set
+// it — enable the `std` feature instead, or the port is not done.
 #[cfg(all(not(feature = "std"), not(ra_single_threaded), not(doc)))]
 compile_error!(
     "rusty_alloc's no_std build assumes a SINGLE THREAD (SingleThreadCell's \

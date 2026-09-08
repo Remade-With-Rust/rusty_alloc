@@ -32,7 +32,7 @@ does not offer.
 - **Runs on WebAssembly** with no C toolchain and no emscripten, and **2.0.0
   halves what it adds to a gzipped bundle** (+7,760 -> +3,829 bytes on a minimal
   module) — see [Shipping it to a browser](#shipping-it-to-a-browser).
-- **Runs on a microcontroller, and is 2.1-3.7x faster than `esp-alloc` there** —
+- **Runs on a microcontroller, and is 2.0-3.7x faster than `esp-alloc` there** —
   measured on a XIAO ESP32-S3 at 240 MHz, both allocators built from one source.
   It costs more RAM to get that (68 KiB vs 8 KiB); both numbers are below.
 
@@ -171,19 +171,21 @@ ESP32-S3. Everything below was measured on a **Seeed XIAO ESP32-S3 Sense at
 240 MHz**, against **`esp-alloc` 0.11**, the standard allocator for the
 `esp-hal` bare-metal track.
 
-### Throughput — 2.1x to 3.7x faster
+### Throughput — 2.0x to 3.7x faster
 
 Nanoseconds per allocate/free pair, lower is better:
 
 | workload | `esp-alloc` | `rusty_alloc` | speedup |
 |---|---:|---:|---:|
-| 32 B alloc/free, one size | 1,638 | **640** | **2.56x** |
-| 64 mixed blocks (8-512 B), batch out then back | 1,792 | **871** | **2.06x** |
-| **churn: 64 live, random sizes 8-512 B, random replacement** | 3,987 | **1,069** | **3.73x** |
-| 2048 B alloc/free | 1,638 | **1,380** | 1.19x |
+| 32 B alloc/free, one size | 1,638 | **647** | **2.53x** |
+| 64 mixed blocks (8-512 B), batch out then back | 1,792 | **881** | **2.03x** |
+| **churn: 64 live, random sizes 8-512 B, random replacement** | 3,987 | **1,087** | **3.67x** |
+| 2048 B alloc/free | 1,638 | **1,200** | **1.37x** |
 
-These include the reclamation fixes a stress battery forced (see below), which
-cost 2-8% of throughput and were worth every point of it.
+Both arms measured in the same session, same floor (162 ns/op in each), with
+matching checksums. These include the reclamation fixes a stress battery forced
+(see below), and the 2 KiB row also carries the medium-band collect-and-retry
+that took it from 1.19x to 1.37x.
 
 The churn row is the one to read. It is the shape real code has, and the shape
 that fragments a first-fit free list — which is exactly what a size-class page
