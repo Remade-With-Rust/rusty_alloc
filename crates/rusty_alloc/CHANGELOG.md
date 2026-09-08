@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.1](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.0.0...rusty_alloc-v2.0.1) - 2026-09-08
+
+### Fixed
+
+- *(prim)* refuse a region that cannot hold a segment, and diagnose reentrancy
+
+### Other
+
+- *(deps)* pull portable-atomic only where it is reachable
+
 ### Added
 
 - `prim::fixed::MIN_REGION` and `prim::fixed::usable_bytes(base, len)` — a
