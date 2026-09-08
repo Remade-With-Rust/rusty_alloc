@@ -9,14 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.0.1](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.0.0...rusty_alloc-v2.0.1) - 2026-09-08
 
-### Fixed
-
-- *(prim)* refuse a region that cannot hold a segment, and diagnose reentrancy
-
-### Other
-
-- *(deps)* pull portable-atomic only where it is reachable
-
 ### Added
 
 - `prim::fixed::MIN_REGION` and `prim::fixed::usable_bytes(base, len)` — a
@@ -50,6 +42,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   All four reported by the first outside firmware to adopt 2.0.0
   (`docs/plans/embedded-adoption.md`).
+
+### Changed
+
+- `portable-atomic` is `optional` and enabled by `std`, so it is pulled only
+  where it is reachable — a target without 64-bit atomics that also has `std`.
+  A `no_std` firmware was fetching and compiling a crate it then discarded at
+  link time. Costs nothing on the device either way; it buys an accurate
+  dependency graph in an SBOM or a `cargo audit`.
 
 ## [2.0.0](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v1.1.6...rusty_alloc-v2.0.0) - 2026-09-07
 
