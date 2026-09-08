@@ -187,6 +187,38 @@ boundary-tag allocator's free-then-alloc of one size is a list push and pop.
 **The repo had already tried the fix and measured it worse.** Recorded here so
 the third person to notice the row does not try it again.
 
+### And a second attempt at it, also reverted (2026-09-08)
+
+The refuted experiment added a *peek*. A peek cannot hit, because `free` is dry.
+So the obvious next idea is to add the **collect** — swap `local_free` into
+`free` before popping, which is the same swap `malloc_generic_walk` performs a
+few lines later, and is cheap in the common case (a local list swap plus one
+acquire load; `page_collect` peeks before entering its exchange loop). Guarded
+on `size <= MEDIUM_OBJ_SIZE_MAX`, so it cannot reproduce the refuted version's
+`big`/`large` +25 Ir/op.
+
+It works, and it is still not worth it:
+
+| workload | effect, both orders agreeing |
+|---|---|
+| 2048 B tight loop | **~7 % faster** (1.08x and 1.07x) |
+| **32 B tight loop** | **~3-4 % SLOWER** |
+| churn, batched | orders disagree — noise |
+
+**Reverted.** 32 B is the commonest allocation there is, and 7 % does not flip
+the row it helps: 2 KiB still loses to dlmalloc. Paying the hottest path to
+narrow a microbenchmark that stays lost is the wrong trade, and the native
+instruction-count cost cannot be measured from a Windows box anyway.
+
+**Getting to that answer needed a better instrument, and that is the durable
+part.** The first two A/B attempts produced orderings that disagreed in SIGN,
+because the harness measured one module to completion and then the other, so any
+drift — another process waking, a thermal step, the scheduler — landed entirely
+on one arm. `bench/wasm-speed/run.mjs` now **interleaves** the arms within each
+repeat and takes the per-arm minimum, which cancels drift slower than one repeat
+and is what made a 7 % effect resolvable at all. Both orders then agreed on both
+sign and magnitude.
+
 ## 7. The gate
 
 `tools/wasm-size.sh` builds the fixture under `bench-dist` (the repo's `release`

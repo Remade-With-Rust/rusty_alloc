@@ -7,7 +7,7 @@ const WORK = [
   { kind: 3, name: 'churn 64 live, 8-512 B', iters: 200_000, ops: 200_000 },
   { kind: 4, name: '2048 B alloc/free', iters: 200_000, ops: 200_000 },
 ];
-const RUNS = 7;
+const RUNS = 11;
 
 async function load(path) {
   const bytes = readFileSync(path);
@@ -27,18 +27,37 @@ function best(fn, kind, iters) {
   return { ns, sum };
 }
 
-const arms = {};
-for (const [name, path] of [['dlmalloc', process.argv[2]], ['rusty_alloc', process.argv[3]]]) {
-  const fn = await load(path);
-  // Warm EVERY branch, not just one. V8 tiers wasm up per code path, so timing
-  // a cold branch against a hot one produced a "floor" that differed 8x between
-  // two modules running IDENTICAL floor code -- the tell that the harness, not
-  // the allocator, was being measured.
-  for (const k of [0, 1, 2, 3, 4]) fn(k, k === 2 ? 300 : 20_000);
-  const floor = best(fn, 0, 200_000);
-  const rows = {};
-  for (const w of WORK) rows[w.name] = best(fn, w.kind, w.iters);
-  arms[name] = { floor, rows };
+// INTERLEAVED, not arm-A-then-arm-B. Measuring one module to completion and
+// then the other lets slow drift -- another process waking up, a thermal step,
+// the OS scheduler -- land entirely on one arm. That produced two orderings
+// that disagreed in SIGN on the same change. Alternating the arms within each
+// repeat and taking the per-arm minimum cancels any drift slower than one
+// repeat, which is what makes a 10% effect resolvable at all.
+const names = ['dlmalloc', 'rusty_alloc'];
+const fns = [await load(process.argv[2]), await load(process.argv[3])];
+// Warm EVERY branch of BOTH modules first. V8 tiers wasm up per code path, so
+// timing a cold branch against a hot one produced a "floor" that differed 8x
+// between two modules running IDENTICAL floor code -- the tell that the
+// harness, not the allocator, was being measured.
+for (const fn of fns) for (const k of [0, 1, 2, 3, 4]) fn(k, k === 2 ? 300 : 20_000);
+
+const arms = { dlmalloc: { floor: null, rows: {} }, rusty_alloc: { floor: null, rows: {} } };
+const acc = new Map(); // "arm|kind" -> {ns, sum}
+for (let r = 0; r < RUNS; r++) {
+  for (const w of [{ kind: 0, name: '__floor', iters: 200_000 }, ...WORK]) {
+    for (let a = 0; a < 2; a++) {
+      const t0 = process.hrtime.bigint();
+      const sum = fns[a](w.kind, w.iters) >>> 0;
+      const d = Number(process.hrtime.bigint() - t0);
+      const key = `${a}|${w.name}`;
+      const cur = acc.get(key);
+      if (!cur || d < cur.ns) acc.set(key, { ns: d, sum });
+    }
+  }
+}
+for (let a = 0; a < 2; a++) {
+  arms[names[a]].floor = acc.get(`${a}|__floor`);
+  for (const w of WORK) arms[names[a]].rows[w.name] = acc.get(`${a}|${w.name}`);
 }
 
 const f0 = arms.dlmalloc.floor.ns / 200_000;

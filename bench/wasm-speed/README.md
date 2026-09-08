@@ -22,6 +22,12 @@ had been warmed. Every branch is warmed now.
 proves both allocators serviced the identical size sequence, and that the
 optimiser did not delete an alloc/free pair and leave an empty loop being timed.
 
+**Arms are INTERLEAVED within each repeat**, not measured one after the other.
+Two A/B attempts that measured arm A to completion and then arm B produced
+orderings that disagreed in *sign*, because drift landed entirely on one arm.
+Interleaving cancels anything slower than one repeat; a 7 % effect became
+resolvable, and both orders then agreed on sign and magnitude.
+
 **Repeat before believing a row.** Between-process variance is ±25 %, so a 10 %
 effect is not resolvable here. Only churn (~5x) and 2048 B (~0.7x) survive
 repeats; the other two straddle 1.0 and are reported as ranges.
