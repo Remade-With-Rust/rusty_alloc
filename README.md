@@ -171,6 +171,49 @@ ESP32-S3. Everything below was measured on a **Seeed XIAO ESP32-S3 Sense at
 240 MHz**, against **`esp-alloc` 0.11**, the standard allocator for the
 `esp-hal` bare-metal track.
 
+### What a firmware has to set
+
+**All three of these, not two.** Every number in this section is *of this
+configuration*; the 68 KiB floor below is meaningless without the geometry flag.
+
+```toml
+rusty_alloc-api = { version = "2", default-features = false }
+```
+
+```sh
+RUSTFLAGS="--cfg ra_single_threaded --cfg ra_small_profile"
+```
+
+```rust
+// A region the linker owns, aligned to a segment. Hand it over once, before
+// the first allocation.
+#[repr(align(65536))]
+struct Region([u8; 68 * 1024]);
+static mut REGION: Region = Region([0; 68 * 1024]);
+
+// SAFETY: the only reference ever taken to REGION.
+rusty_alloc::prim::fixed::init_region(unsafe { &mut (*(&raw mut REGION)).0 })
+    .expect("region is large enough and registered once");
+```
+
+| flag | what happens without it |
+|---|---|
+| `--cfg ra_single_threaded` | **build fails**, with a message telling you to set it |
+| `--cfg ra_small_profile` | **builds and links clean, then nothing allocates** — `SEGMENT_SIZE` stays 32 MiB, a kilobyte-scale region yields zero segments, and the first `Vec` returns null |
+| `init_region` | every allocation fails; the backend has no memory |
+
+That middle row is the trap, and it was reported by the first outside firmware
+to adopt 2.0.0 (`docs/plans/embedded-adoption.md`). `ra_single_threaded`
+announces itself, so an integrator reasonably concludes the crate tells you what
+it needs — and `ra_small_profile` did not. `init_region` now refuses a region
+that cannot hold one segment at the active geometry, so the mistake is an `Err`
+at startup rather than a wasted board run; **`--cfg ra_small_profile` is still
+what you want to set**, because refusing early is a diagnosis, not a fix.
+
+`ra_small_profile` is a `--cfg` and not a Cargo feature on purpose: it is
+non-additive. Two crates in one graph cannot disagree about `SEGMENT_SIZE` the
+way they can harmlessly disagree about `std`.
+
 ### Throughput — 2.0x to 3.7x faster
 
 Nanoseconds per allocate/free pair, lower is better:
@@ -217,7 +260,7 @@ in a medium page.
 
 | | `esp-alloc` | `rusty_alloc` |
 |---|---:|---:|
-| smallest heap that runs the same workload | **8 KiB** | 68 KiB |
+| smallest heap that runs the same workload | **8 KiB** | 68 KiB *(needs `--cfg ra_small_profile`)* |
 | peak live bytes (identical, the parity check) | 4,914 | 4,914 |
 | app image | 116,032 B | 127,088 B (+9.5%) |
 

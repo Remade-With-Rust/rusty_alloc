@@ -106,8 +106,15 @@ realloc chains, zeroing over dirtied memory, fragmentation, exhaustion); it
 found and fixed a real reclamation bug on the way, after which 512 B capacity no
 longer decays and churn NULLs fell from 22,533 to 357 per 50,000.
 
+**A firmware must set three things**, not two: `default-features = false`,
+`--cfg ra_single_threaded` (the build fails without it, loudly) and
+**`--cfg ra_small_profile`** (nothing tells you, and without it `SEGMENT_SIZE`
+stays 32 MiB, a kilobyte-scale region yields zero segments and every allocation
+fails) — then hand the backend its memory with
+`prim::fixed::init_region`. The full recipe is in the repository README.
+
 **It costs RAM to get that.** The smallest heap that runs the same workload is
-**68 KiB for `rusty_alloc` against 8 KiB for `esp-alloc`** — a linked-list
+**68 KiB for `rusty_alloc` (at that geometry) against 8 KiB for `esp-alloc`** — a linked-list
 heap's floor is `bytes live + header`, while a size-class page allocator's is
 `(classes touched) x (page size)`, independent of bytes requested. That floor is
 roughly fixed, so it amortises as the working set grows. Reach for `esp-alloc`

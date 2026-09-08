@@ -198,6 +198,13 @@ jobs:
         run: cargo clippy -p rusty_alloc --no-default-features -- -D warnings
         env:
           RUSTFLAGS: --cfg ra_single_threaded
+      # The reentrancy detector only exists under `ra_single_threaded`, so the
+      # normal test run cannot see it. An allocating ISR is the one bare-metal
+      # failure that used to be an unbounded spin with no message.
+      - name: reentrancy detector (single-context builds)
+        run: cargo test -p rusty_alloc --lib prim::fixed
+        env:
+          RUSTFLAGS: --cfg ra_single_threaded
       - name: prove the single-thread gate is not vacuous
         run: |
           if cargo check -p rusty_alloc --no-default-features \
