@@ -6,15 +6,33 @@ use rusty_alloc::alloc::{expand, free, malloc, realloc, stats, usable_size, zall
 
 #[test]
 fn span_lifecycle_and_realloc() {
+    // Sizes derived from the geometry, not written in MiB. "1 MiB" is a
+    // 16-slice large span at the shipped 32 MiB segment and a HUGE block at a
+    // 64 KiB one (P2, `docs/plans/small-metal.md`), so a literal silently
+    // stops testing the large path the moment the geometry moves. `L` is one
+    // slice past a medium page — large by definition — and `L2` is twice that,
+    // both comfortably inside `LARGE_OBJ_SIZE_MAX` at either geometry.
+    use rusty_alloc::segment::USABLE_SLICES;
+    use rusty_alloc::types::SEGMENT_SLICE_SIZE;
+    // Two slices is past MEDIUM_OBJ_SIZE_MAX at every geometry this crate
+    // builds, so `l` is a large SPAN; `l2` doubles it and both stay well
+    // inside `USABLE_SLICES` (511 at the shipped geometry, 7 at the small
+    // profile — which is what a fixed `2 MiB` overshot).
+    let l: usize = SEGMENT_SLICE_SIZE * 2;
+    let l2: usize = SEGMENT_SLICE_SIZE * 4;
+    // A span filling a large FRACTION of a segment, for the coalescing check
+    // below — the point is "most of one segment", not "12 MiB".
+    let big_span: usize = SEGMENT_SLICE_SIZE * (USABLE_SLICES * 3 / 8);
+
     // --- Large path basics -------------------------------------------------
     let s0 = stats();
-    let p = malloc(1024 * 1024); // 1 MiB → 16-slice span
+    let p = malloc(l); // one slice past a medium page -> a large span
     assert!(!p.is_null());
-    // SAFETY: live 1 MiB block.
+    // SAFETY: live `l`-byte block.
     unsafe {
-        assert!(usable_size(p) >= 1024 * 1024);
+        assert!(usable_size(p) >= l);
         p.write(7);
-        p.add(1024 * 1024 - 1).write(8);
+        p.add(l - 1).write(8);
     }
     let s1 = stats();
     assert_eq!(s1.large_allocs - s0.large_allocs, 1, "large path not taken");
@@ -29,7 +47,9 @@ fn span_lifecycle_and_realloc() {
         1,
         "large span not retired"
     );
-    let q = malloc(900 * 1024);
+    // "Similar size": slightly smaller than `l`, so it must reuse the span
+    // just retired rather than take a fresh segment.
+    let q = malloc(l * 7 / 8);
     assert!(!q.is_null());
     let s3 = stats();
     assert_eq!(
@@ -40,17 +60,17 @@ fn span_lifecycle_and_realloc() {
     unsafe { free(q) };
 
     // --- zalloc over a RECYCLED span must be re-zeroed ----------------------
-    let d = malloc(2 * 1024 * 1024);
+    let d = malloc(l2);
     // SAFETY: live block, dirtied then freed.
     unsafe {
-        core::ptr::write_bytes(d, 0xAB, 2 * 1024 * 1024);
+        core::ptr::write_bytes(d, 0xAB, l2);
         free(d);
     }
-    let z = zalloc(2 * 1024 * 1024);
+    let z = zalloc(l2);
     assert!(!z.is_null());
     // SAFETY: live zeroed block.
     unsafe {
-        for i in (0..2 * 1024 * 1024).step_by(4096) {
+        for i in (0..l2).step_by(4096) {
             assert_eq!(
                 z.add(i).read(),
                 0,
@@ -82,12 +102,12 @@ fn span_lifecycle_and_realloc() {
 
     // --- Coalescing observable: after retiring everything, a full-segment
     // large alloc must fit in the SAME segment count -------------------------
-    let big = malloc(12 * 1024 * 1024);
+    let big = malloc(big_span);
     assert!(!big.is_null());
     let s7 = stats();
     assert_eq!(
         s7.segments, s6.segments,
-        "coalescing failed — 12 MiB span needed a new segment"
+        "coalescing failed — the large span needed a new segment"
     );
     // SAFETY: live block.
     unsafe { free(big) };
@@ -132,7 +152,23 @@ fn span_lifecycle_and_realloc() {
     let m = malloc(64);
     assert!(rusty_alloc::alloc::is_in_heap_region(m));
     let stack_local = 0u8;
-    assert!(!rusty_alloc::alloc::is_in_heap_region(&stack_local));
+    // The NEGATIVE direction needs an exact map. The small profile's range
+    // table (P2, `docs/plans/small-metal.md`) is chip-sized — 64 entries, 1 KiB
+    // of BSS against the bitmap's 1 MiB — and this battery manages orders of
+    // magnitude more segments than any chip, so it overflows and `contains`
+    // degrades PERMISSIVELY on purpose: over-reporting costs a diagnostic,
+    // under-reporting would abort legitimate frees through the `debug_checks`
+    // guard. Assert the property only while the map can still decide, and
+    // check the degradation is exactly what happened rather than skipping
+    // blind.
+    if rusty_alloc::segment_map::range_table_overflowed() {
+        assert!(
+            rusty_alloc::alloc::is_in_heap_region(&stack_local),
+            "an overflowed range table must answer permissively, not wrongly"
+        );
+    } else {
+        assert!(!rusty_alloc::alloc::is_in_heap_region(&stack_local));
+    }
     // SAFETY: live block.
     unsafe { free(m) };
 

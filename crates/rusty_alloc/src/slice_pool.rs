@@ -25,21 +25,29 @@
 //! of `prim/wasm.rs`); the atomics are for `static` soundness, not for
 //! concurrency, and are `Relaxed` throughout.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::types::SEGMENT_SLICE_SIZE;
 
-const SLICE_SHIFT: usize = 16;
+/// Derived, not written down: this was a hardcoded `16` with a const assert
+/// pinning it to a 64 KiB slice, which made the slice size unchangeable
+/// (P2 of `docs/plans/small-metal.md` — it was one of exactly two lines in the
+/// crate that refused a different geometry).
+const SLICE_SHIFT: usize = SEGMENT_SLICE_SIZE.trailing_zeros() as usize;
 const _: () = assert!(1 << SLICE_SHIFT == SEGMENT_SLICE_SIZE);
-/// 4 GiB of address space in 64 KiB slices.
+/// 4 GiB of address space in slice-sized steps.
 const SLOTS: usize = 1 << (32 - SLICE_SHIFT);
-const WORDS: usize = SLOTS / 64;
+/// Bits per pool word. `u32`, not `u64`: a bitmap's width is a free choice
+/// and 32-bit RISC-V / Xtensa have no 64-bit atomic (P3 of
+/// `docs/plans/small-metal.md`).
+const WORD_BITS: usize = u32::BITS as usize;
+const WORDS: usize = SLOTS / WORD_BITS;
 
-static FREE: [AtomicU64; WORDS] = [const { AtomicU64::new(0) }; WORDS];
+static FREE: [AtomicU32; WORDS] = [const { AtomicU32::new(0) }; WORDS];
 
 #[inline]
-fn bit(idx: usize) -> (usize, u64) {
-    (idx / 64, 1u64 << (idx % 64))
+fn bit(idx: usize) -> (usize, u32) {
+    (idx / WORD_BITS, 1u32 << (idx % WORD_BITS))
 }
 
 /// Return `[base, base + size)` to the pool. `false` (and no state change)
@@ -84,14 +92,14 @@ pub fn alloc_run(slices: usize) -> Option<usize> {
     while idx < SLOTS {
         let (w, _) = bit(idx);
         let word = FREE[w].load(Ordering::Relaxed);
-        if word == 0 && idx.is_multiple_of(64) {
+        if word == 0 && idx.is_multiple_of(WORD_BITS) {
             // Whole word empty: skip it. Resetting the run is correct, not
             // merely convenient — a run cannot cross a zero word.
             run = 0;
-            idx += 64;
+            idx += WORD_BITS;
             continue;
         }
-        if word & (1 << (idx % 64)) != 0 {
+        if word & (1 << (idx % WORD_BITS)) != 0 {
             run += 1;
             if run == slices {
                 let start = idx + 1 - slices;
@@ -124,36 +132,45 @@ mod tests {
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    const MIB: usize = 1024 * 1024;
+    /// Bytes for `n` slices. These tests are about the POOL's arithmetic —
+    /// runs, first fit, coalescing, word boundaries — all of which is counted
+    /// in slices, so they are written in slices. They used to be written in
+    /// MiB, which silently assumed a 64 KiB slice and inverted the moment
+    /// `SEGMENT_SLICE_SIZE` moved (P2, `docs/plans/small-metal.md`: at an
+    /// 8 KiB slice "1 MiB = 16 slices" became 128, and three tests failed on
+    /// arithmetic that had nothing to do with what they test).
+    const fn sl(n: usize) -> usize {
+        n * SEGMENT_SLICE_SIZE
+    }
 
     #[test]
     fn round_trips_and_coalesces() {
         let _g = lock();
-        let base = 256 * MIB;
-        assert!(free_range(base, 2 * MIB));
-        assert!(free_range(base + 2 * MIB, MIB)); // adjacent: coalesces by construction
-        // 3 MiB = 48 slices, spanning the two freed ranges as one run.
+        let base = sl(4096);
+        assert!(free_range(base, sl(32)));
+        assert!(free_range(base + sl(32), sl(16))); // adjacent: coalesces by construction
+        // 48 slices, spanning the two freed ranges as one run.
         assert_eq!(alloc_run(48), Some(base), "coalesced run");
         // Pool drained: the same run is not served twice.
         assert!(alloc_run(1).is_none());
-        assert!(free_range(base, 3 * MIB));
+        assert!(free_range(base, sl(48)));
         assert_eq!(alloc_run(48), Some(base));
     }
 
     #[test]
     fn first_fit_skips_too_small_holes() {
         let _g = lock();
-        let base = 512 * MIB;
-        assert!(free_range(base, MIB)); // 16 slices
-        assert!(free_range(base + 8 * MIB, 4 * MIB)); // 64 slices, disjoint
+        let base = sl(8192);
+        assert!(free_range(base, sl(16)));
+        assert!(free_range(base + sl(128), sl(64))); // disjoint
         assert_eq!(
             alloc_run(32),
-            Some(base + 8 * MIB),
+            Some(base + sl(128)),
             "a 32-slice run must skip the 16-slice hole"
         );
         // The small hole is intact; drain everything on the way out.
         assert_eq!(alloc_run(16), Some(base));
-        assert_eq!(alloc_run(32), Some(base + 10 * MIB));
+        assert_eq!(alloc_run(32), Some(base + sl(160)));
         assert!(alloc_run(1).is_none());
     }
 
@@ -161,21 +178,37 @@ mod tests {
     fn runs_cross_word_boundaries() {
         let _g = lock();
         // Slice index 1000..1100 straddles the u64 word boundary at 1024.
-        let base = 1000 * 64 * 1024;
-        assert!(free_range(base, 100 * 64 * 1024));
+        let base = sl(1000);
+        assert!(free_range(base, sl(100)));
         assert_eq!(alloc_run(100), Some(base));
         assert!(alloc_run(1).is_none());
     }
 
+    /// Every rejection, written in SLICES.
+    ///
+    /// This test was the last byte-denominated one in the module, and it failed
+    /// exactly the way P2's did: `MIB + 4096` was "misaligned" only while a
+    /// slice was 8 KiB, and became slice-ALIGNED the moment the small profile
+    /// went to 4 KiB. It then quietly *succeeded* in freeing two ranges it is
+    /// supposed to refuse, left their bits set in a pool the module doc calls
+    /// GLOBAL first-fit, and took down the other three tests instead of itself.
+    /// Offsets of `+1` and `SLOTS`-relative bases are misaligned and out of
+    /// range at every slice size there will ever be.
     #[test]
     fn rejects_what_it_cannot_track() {
         let _g = lock();
-        assert!(!free_range(0, MIB), "slice 0 must be refused");
-        assert!(!free_range(64 * 1024, 0), "empty range");
-        assert!(!free_range(MIB + 4096, MIB), "misaligned base");
-        assert!(!free_range(MIB, MIB + 4096), "ragged size");
-        assert!(!free_range(usize::MAX - MIB, 2 * MIB), "unaddressable");
+        assert!(!free_range(0, sl(16)), "slice 0 must be refused");
+        assert!(!free_range(sl(16), 0), "empty range");
+        assert!(!free_range(sl(256) + 1, sl(16)), "misaligned base");
+        assert!(!free_range(sl(256), sl(16) + 1), "ragged size");
+        assert!(
+            !free_range(sl(SLOTS - 1), sl(2)),
+            "a run ending past SLOTS is unaddressable"
+        );
         assert!(alloc_run(0).is_none());
         assert!(alloc_run(SLOTS + 1).is_none());
+        // The pool must be untouched: every call above was a refusal, and a
+        // refusal that set a bit would strand it for whichever test runs next.
+        assert!(alloc_run(1).is_none(), "a refusal leaves the pool empty");
     }
 }

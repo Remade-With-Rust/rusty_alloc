@@ -11,8 +11,31 @@ keywords.workspace = true
 categories.workspace = true
 readme = "README.md"
 
+# The crate has NO dependencies on any target it currently ships to — this
+# entry is compiled ONLY for targets that lack a 64-bit atomic (32-bit RISC-V
+# and Xtensa: the Janus ESP32-C3/C6/S3 parts), so the x86-64, aarch64, wasm32
+# and Windows builds remain dependency-free.
+#
+# Why a shim here and NARROWING everywhere else (P3 of docs/plans/small-metal.md):
+# the crate's other 64-bit atomics are BITMAPS, whose word width is a free
+# choice, and those were narrowed to `u32` — no dependency, still lock-free.
+# These two are different: `options::{get,set}` are `i64` in an API frozen at
+# v2.0.0, and `DeferredFreeFun`'s heartbeat is a `u64` in the C ABI shared with
+# mimalloc's `mi_deferred_free_fun`. Narrowing either breaks a contract, and
+# hand-rolling a 64-bit atomic out of two 32-bit halves inside an allocator is
+# exactly the kind of thing that produces a subtle bug.
+[target.'cfg(not(target_has_atomic = "64"))'.dependencies]
+portable-atomic = { version = "1", default-features = false, features = ["fallback"] }
+
 [features]
-default = []
+# `std` is DEFAULT and additive — unlike the geometry `--cfg` (P2), which is
+# deliberately not a feature. A feature is right here precisely because it IS
+# additive: if any consumer in a graph needs `std`, enabling it for all of them
+# is harmless. Turning it OFF is what a firmware does, and it selects the
+# single-heap profile: no `thread_local!`, no environment, no `process::abort`
+# (see `lib.rs`). P3 of docs/plans/small-metal.md.
+default = ["std"]
+std = []
 # Full invariant checking: list walks, canaries, double-free detection (our `dmi`).
 debug_checks = []
 # Feature-gated rdtsc path profiler (§7.5 of the plan). OFF = byte-identical build.

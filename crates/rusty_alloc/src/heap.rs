@@ -167,6 +167,11 @@ pub struct Heap {
     pub tag: i32,
     /// Per-heap CSPRNG: free-list keys, guarded sampling (M8).
     pub rng: crate::random::Random,
+    /// Trips of the generic path left before the next automatic collect.
+    ///
+    /// `mi_option_generic_collect`. Counts DOWN so the hot check is a compare
+    /// against zero rather than a modulo by a runtime value.
+    pub generic_countdown: usize,
     /// Guarded-object sampling: 1-in-N (0 = off), and the size window.
     pub guarded_rate: usize,
     /// Countdown to the next guarded object.
@@ -221,6 +226,7 @@ impl Heap {
             arena_id: -1,
             tag: 0,
             rng: crate::random::Random::new(),
+            generic_countdown: 0,
             guarded_rate: 0,
             guarded_count: 0,
             guarded_min: 0,
@@ -397,7 +403,34 @@ impl Heap {
     // compare every generic call pays, including the small ones that never had
     // a bin to pass. The const-generic form that would fold the check away
     // duplicates this whole function; not worth it for 0.35% of one benchmark.
+    /// The generic (slow) path, with ONE reclaim-and-retry before it gives up.
+    ///
+    /// A page allocator keeps a page per size class as a reuse cache, so a heap
+    /// can be simultaneously "full" and holding many empty pages that belong to
+    /// classes the caller is not asking for. Returning null in that state
+    /// reports OOM while still hoarding reclaimable memory.
+    ///
+    /// P4d measured exactly that on a XIAO ESP32-S3: 22,533 of 50,000 churn
+    /// allocations returned null from a heap that a single `collect` restored
+    /// from 8 to 240 blocks of capacity (docs/plans/small-metal.md §2.14). The
+    /// periodic `generic_collect` sweep does not cover it — that battery makes
+    /// only ~649 generic trips in total, far under the 10,000 default, so the
+    /// timer never fires. This trigger is failure, not a clock.
+    ///
+    /// **Costs nothing on the happy path**: it runs only when the allocation
+    /// was about to fail. `collect_inner(true, true)` is `mi_collect(true)` —
+    /// reclaim orphans too, since this is the last resort before null.
     pub(crate) fn malloc_generic(&mut self, size: usize) -> (*mut u8, bool) {
+        let r = self.malloc_generic_once(size);
+        if !r.0.is_null() {
+            return r;
+        }
+        // SAFETY: owner thread; `collect_inner` allocates nothing.
+        unsafe { self.collect_inner(true, true) };
+        self.malloc_generic_once(size)
+    }
+
+    fn malloc_generic_once(&mut self, size: usize) -> (*mut u8, bool) {
         self.stats.generic += 1;
         // Guarded objects (secure/guarded builds): sampled allocations get a
         // dedicated segment whose trailing page is PROT_NONE, so an overflow
@@ -413,6 +446,27 @@ impl Heap {
         // SAFETY: we are the owner thread.
         unsafe { self.process_delayed() };
         crate::options::deferred_free(false);
+        // Periodic collect (`mi_option_generic_collect`, default 10,000).
+        //
+        // Upstream runs an UNFORCED collect every N trips of this path. Ours
+        // declared the option and read it nowhere, so nothing ever collected on
+        // its own: a heap that had touched many size classes kept a page per
+        // class forever and could not give the slices back, even though a
+        // manual `collect` would have. P4d measured that on hardware — 512 B
+        // capacity decaying 168 -> 8 blocks and 22,533 of 50,000 churn
+        // allocations returning null with 61,440 bytes of the region free
+        // (docs/plans/small-metal.md §2.14).
+        //
+        // `reclaim = false`: this is a routine sweep of our own pages, not the
+        // orphan adoption a forced `mi_collect(true)` performs.
+        if self.generic_countdown == 0 {
+            self.generic_countdown =
+                crate::options::get_clamp(crate::options::GENERIC_COLLECT, 1, 1_000_000) as usize;
+            // SAFETY: owner thread, and `collect_inner` allocates nothing.
+            unsafe { self.collect_inner(false, false) };
+        } else {
+            self.generic_countdown -= 1;
+        }
         if size > MEDIUM_OBJ_SIZE_MAX {
             return if size <= LARGE_OBJ_SIZE_MAX {
                 self.large_alloc(size)
@@ -826,7 +880,7 @@ impl Heap {
     }
 
     fn huge_alloc(&mut self, size: usize, align: usize, offset: usize) -> (*mut u8, bool) {
-        match segment::huge_alloc(size, align, offset) {
+        match segment::huge_alloc(size, align, offset, self.arena_id) {
             Ok((seg, block)) => {
                 // SAFETY: fresh segment we own; page slot 1 is its block's
                 // metadata. DELAYED + xheap route remote frees through our
@@ -844,6 +898,14 @@ impl Heap {
                 }
                 self.stat_alloc();
                 self.stats.huge_allocs += 1;
+                // A Huge segment IS a segment, and the release path already
+                // counts it as one (`segments_freed` next to `huge_free`,
+                // heap.rs:1243). Without this the pair is asymmetric and a
+                // workload that cycles huge blocks ends with more segments
+                // freed than allocated — an impossible reading from the
+                // counters this project uses as its work-parity instrument.
+                // Found by P2 of docs/plans/small-metal.md.
+                self.stats.segments += 1;
                 // SAFETY: seg live; recycled arena chunks are NOT zero.
                 (block, unsafe { (*seg).mem_is_zero })
             }
@@ -1144,7 +1206,7 @@ impl Heap {
 
     /// # Safety
     /// Owner thread; `reclaim` only when this heap will REMAIN live.
-    unsafe fn collect_inner(&mut self, force: bool, reclaim: bool) {
+    unsafe fn collect_inner(&mut self, _force: bool, reclaim: bool) {
         // SAFETY: owner thread per contract.
         unsafe {
             // `force` RECLAIMS ABANDONED SEGMENTS. It used to be ignored
@@ -1177,7 +1239,6 @@ impl Heap {
                     let _ = self.adopt_segment(aseg); // nosemgrep: discarded-lifecycle-result -- terminal, see comment above
                 }
             }
-            let _ = force;
             self.process_delayed();
             let mut bin = 1;
             // Running queue pointer: `self.pages[bin]` re-indexed the array
@@ -1190,7 +1251,23 @@ impl Heap {
                 while !p.is_null() {
                     let next = (*p).next;
                     page_collect(p);
-                    if page_all_free(p) && !((*q).first == p && (*q).last == p) {
+                    // An all-free page is freed HERE regardless of whether it
+                    // is its bin's only one. That is upstream:
+                    // `mi_heap_page_collect` calls `_mi_page_free` whenever
+                    // `mi_page_all_free(page)`, at every collect level, with the
+                    // comment "this will free retired pages as well". The
+                    // keep-one-page-per-bin reuse cache is `mi_page_retire`'s
+                    // policy, on the FREE path — not collect's.
+                    //
+                    // Ours borrowed that exemption into collect, so no collect
+                    // at any level could return a size class's slice to a
+                    // different class. Invisible at the shipped 32 MiB geometry
+                    // (512 slices per segment absorb a cached page per class);
+                    // fatal at the small profile's 16, where P4d watched 512 B
+                    // capacity decay 168 -> 8 blocks and 22,533 of 50,000 churn
+                    // allocations return null with 61,440 bytes of the region
+                    // still free. docs/plans/small-metal.md §2.14.
+                    if page_all_free(p) {
                         queue_remove(q, p);
                         self.update_direct(bin);
                         let seg = segment_of(p.cast::<u8>());

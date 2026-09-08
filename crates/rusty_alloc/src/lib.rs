@@ -11,7 +11,117 @@
 //! R1 spike measured it at atomic-load parity). A no_std profile returns
 //! post-v1 with the nightly `#[thread_local]` or a platform TLS shim.
 
+#![cfg_attr(not(feature = "std"), no_std)]
 #![deny(missing_docs)]
+
+// ---------------------------------------------------------------------------
+// P3 of `docs/plans/small-metal.md`: the three things the crate used `std` FOR.
+//
+// These live here, above the `mod` lines, because `macro_rules!` is TEXTUALLY
+// scoped — a macro defined after a module is invisible inside it.
+// ---------------------------------------------------------------------------
+
+/// End the process immediately, without unwinding.
+///
+/// A double free, a corrupted free list and a failed TLS slot all reach this:
+/// the allocator's contract is that it aborts rather than continues, and
+/// unwinding out of `free` into a C caller is not an option (which is why the
+/// release profile is `panic = "abort"`).
+///
+/// Without `std` there is no `process::abort`, so this panics and relies on the
+/// deliverable's panic strategy. **A `no_std` consumer MUST build with
+/// `panic = "abort"`** — every Janus firmware profile already does — or an
+/// abort becomes an unwind and the guarantee is gone.
+#[cold]
+#[inline(never)]
+pub(crate) fn abort() -> ! {
+    #[cfg(feature = "std")]
+    {
+        std::process::abort()
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        panic!("rusty_alloc: abort (build a no_std consumer with panic = \"abort\")")
+    }
+}
+
+/// A `thread_local!` that survives `no_std` — the single-heap profile.
+///
+/// With `std` this expands to `std::thread_local!` unchanged, so the shipped
+/// build keeps the const-init, `!Drop`, initial-exec fast path M10c measured.
+///
+/// Without it there is no thread-local storage and, on the targets this crate
+/// serves without `std`, no second thread either: `prim::fixed::thread_id`
+/// returns a constant and its TLS is a fixed table whose destructors never run,
+/// because there is no thread exit. So a "thread-local" becomes a plain
+/// `static` — which is not a compromise but the point of the profile: one heap,
+/// no TLS lookup at all, a SHORTER fast path than the threaded one.
+macro_rules! ra_thread_local {
+    ($($(#[$m:meta])* static $N:ident: $T:ty = const $init:block;)*) => {
+        #[cfg(feature = "std")]
+        std::thread_local! {
+            $($(#[$m])* static $N: $T = const $init;)*
+        }
+        $(
+            #[cfg(not(feature = "std"))]
+            $(#[$m])*
+            static $N: $crate::SingleThreadCell<$T> =
+                $crate::SingleThreadCell::new($init);
+        )*
+    };
+}
+
+/// The `no_std` build asserts single-threadedness, so it must be OPTED INTO.
+///
+/// Three things in a `no_std` build are sound only because there is exactly one
+/// thread: [`SingleThreadCell`]'s `unsafe impl Sync`, `prim::fixed`'s constant
+/// thread id and never-contended spin lock, and `options`' 64-bit atomics split
+/// into `AtomicU32` halves. None of them is checkable at compile time, and none
+/// of them fails loudly if the assumption breaks — they corrupt quietly.
+///
+/// A doc comment is not a guard. `no_std` here therefore requires
+/// `--cfg ra_single_threaded`, so that using this allocator on a bare-metal
+/// target is a decision somebody wrote down rather than a default they
+/// inherited. There is no cost to it and no way around it:
+///
+/// ```text
+/// RUSTFLAGS="--cfg ra_single_threaded" cargo build --no-default-features
+/// ```
+///
+/// If your target has more than one thread touching the allocator, do not set
+/// it — enable the `std` feature instead, or the port is not done.
+#[cfg(all(not(feature = "std"), not(ra_single_threaded), not(doc)))]
+compile_error!(
+    "rusty_alloc's no_std build assumes a SINGLE THREAD (SingleThreadCell's \
+     `unsafe impl Sync`, prim::fixed's constant thread id and spin lock, and \
+     options' split 64-bit atomics all depend on it). Confirm that is true of \
+     your target and opt in with `--cfg ra_single_threaded`, or enable the \
+     `std` feature. See the crate docs on SingleThreadCell."
+);
+
+/// The `no_std` half of [`ra_thread_local!`]: a `static` with a `.with()`.
+#[cfg(not(feature = "std"))]
+pub(crate) struct SingleThreadCell<T>(T);
+
+// SAFETY: only ever constructed by `ra_thread_local!` in a `no_std` build,
+// which this crate serves only on single-threaded targets — the same standing
+// assumption as `prim::fixed` (constant thread id, TLS destructors that never
+// fire, a spin lock that never contends). With one thread there is no other
+// referent, so shared access cannot race. A `no_std` build on a target that
+// grows threads must revisit this type FIRST.
+#[cfg(not(feature = "std"))]
+unsafe impl<T> Sync for SingleThreadCell<T> {}
+
+#[cfg(not(feature = "std"))]
+impl<T> SingleThreadCell<T> {
+    pub(crate) const fn new(v: T) -> Self {
+        Self(v)
+    }
+    /// Mirrors `LocalKey::with`, which is the only accessor the crate uses.
+    pub(crate) fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        f(&self.0)
+    }
+}
 
 pub mod alloc;
 pub mod arena;

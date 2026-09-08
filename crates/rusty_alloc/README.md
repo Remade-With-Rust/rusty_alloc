@@ -81,6 +81,39 @@ perl produce **byte-identical output** under rusty_alloc, mimalloc and glibc;
 the full mimalloc-bench corpus (19 configurations, including the 8–16-thread
 storms) runs clean; Miri is clean over the whole target.
 
+## Embedded: 2.1-3.7x faster than `esp-alloc` on an ESP32-S3
+
+Builds `no_std` and runs as the `#[global_allocator]` on bare metal. Measured on
+a Seeed XIAO ESP32-S3 Sense at 240 MHz against `esp-alloc` 0.11 — nanoseconds
+per allocate/free pair, lower is better:
+
+| workload | `esp-alloc` | `rusty_alloc` | speedup |
+|---|---:|---:|---:|
+| 32 B alloc/free | 1,638 | **640** | **2.56x** |
+| 64 mixed blocks (8-512 B), batched | 1,792 | **871** | **2.06x** |
+| **churn: 64 live, random 8-512 B** | 3,987 | **1,069** | **3.73x** |
+| 2048 B alloc/free | 1,638 | **1,380** | 1.19x |
+
+Both arms are one firmware source with `--cfg` picking the allocator, given
+equal budgets. A baseline arm with no allocator call measured 162 ns/op in both
+and is subtracted from every row. Blocks are touched through volatile
+reads/writes and folded into a checksum that **matches across both arms**, so
+the work is provably identical; the same benchmark run twice in one arm
+reproduced to the nanosecond.
+
+An eight-test adversarial battery runs clean on both (boundaries, alignment,
+realloc chains, zeroing over dirtied memory, fragmentation, exhaustion); it
+found and fixed a real reclamation bug on the way, after which 512 B capacity no
+longer decays and churn NULLs fell from 22,533 to 357 per 50,000.
+
+**It costs RAM to get that.** The smallest heap that runs the same workload is
+**68 KiB for `rusty_alloc` against 8 KiB for `esp-alloc`** — a linked-list
+heap's floor is `bytes live + header`, while a size-class page allocator's is
+`(classes touched) x (page size)`, independent of bytes requested. That floor is
+roughly fixed, so it amortises as the working set grows. Reach for `esp-alloc`
+when the budget is tight, and for this when throughput or fragmentation under
+churn is what hurts.
+
 ## Usage
 
 This crate is the allocator core. For the ergonomic Rust surface

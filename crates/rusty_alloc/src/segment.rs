@@ -776,6 +776,7 @@ pub fn huge_alloc(
     size: usize,
     align: usize,
     offset: usize,
+    arena_id: i32,
 ) -> Result<(*mut Segment, *mut u8), PrimError> {
     debug_assert!(align.is_power_of_two() && align <= SEGMENT_SIZE / 2);
     let header = SEGMENT_SLICE_SIZE;
@@ -795,10 +796,21 @@ pub fn huge_alloc(
     // Huge blocks recycle through arenas too (contiguous chunks) — without
     // this, every huge alloc/free cycle is an OS round-trip (the Tier-A
     // malloc-large gate measured 3–4× slower before this path).
+    //
+    // `arena_id` is the OWNING HEAP's, exactly as `segment_alloc` above uses
+    // it. It used to be a hardcoded `-1`, which meant an exclusive-arena heap
+    // — the whole point of which is that its memory comes from ONE region —
+    // silently took its huge blocks from the default arena or straight from
+    // the OS. Upstream passes `heap->arena_id` here
+    // (`mi_segment_huge_page_alloc`, oracle segment.c:1671/1683); we did not.
+    // See `tests/heaps.rs::exclusive_arena_confines_huge_allocations`.
     let chunks = want.div_ceil(SEGMENT_SIZE);
-    let (bptr, total, mem_zero) = match crate::arena::chunk_alloc_n(-1, chunks) {
+    let (bptr, total, mem_zero) = match crate::arena::chunk_alloc_n(arena_id, chunks) {
         Some((p, zero)) => (p, chunks * SEGMENT_SIZE, zero),
         None => {
+            if arena_id >= 0 {
+                return Err(0); // exclusive-arena heap and its arena is full
+            }
             let (p, sz, zero) = reserve_backing(want)?;
             (p, sz, zero)
         }

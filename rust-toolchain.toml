@@ -3,4 +3,16 @@
 # apart — build different compilers. Bump deliberately, with the gate battery.
 channel = "1.97.1"
 components = ["rustfmt", "clippy"]
-targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]
+targets = [
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+    # P0 of docs/plans/small-metal.md: the bare-metal RISC-V target the Janus
+    # C6/C61/H2 firmwares use. Added to collect the error list, not because the
+    # crate builds for it.
+    "riscv32imac-unknown-none-elf",
+    # The crate has shipped a wasm backend and a wasm gate since 2026-08-06, but
+    # the target was never listed here — so `wasm-gate` needed a manual
+    # `rustup target add` on every fresh machine. P1 needed it to prove its new
+    # backend arm had not captured wasm; listing it makes that check repeatable.
+    "wasm32-unknown-unknown",
+]

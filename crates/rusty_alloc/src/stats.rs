@@ -4,6 +4,7 @@
 //! metrics (`mi_process_info`).
 
 use crate::heap::Stats;
+#[cfg(feature = "std")]
 use crate::options::out_fmt;
 
 /// Sum the counters of every registered heap (`mi_stats_merge` semantics —
@@ -30,8 +31,11 @@ pub fn merged() -> Stats {
     total
 }
 
+/// std-only: the line is built as an owned string. See `options::out_fmt` for
+/// the seam a `no_std` consumer uses instead.
+#[cfg(feature = "std")]
 fn print_one(label: &str, s: &Stats) {
-    out_fmt(&format!(
+    out_fmt(&std::format!(
         "{label}: allocs {} frees {} (generic {}), pages fresh {} retired {}, \
          segments {} freed {}, large {} huge {}, realloc {}/{} (in-place/moved), \
          delayed {} reclaims {}\n",
@@ -52,11 +56,12 @@ fn print_one(label: &str, s: &Stats) {
 }
 
 /// `mi_stats_print` / `mi_stats_print_out`: process-wide (merged) stats.
+#[cfg(feature = "std")]
 pub fn print_process() {
     let m = merged();
     print_one("heap stats (process)", &m);
     let (elapsed, user, sys, rss, peak_rss, commit, peak_commit, faults) = process_info();
-    out_fmt(&format!(
+    out_fmt(&std::format!(
         "process: elapsed {elapsed} ms, user {user} ms, sys {sys} ms, rss {} KiB (peak {}), \
          commit {} KiB (peak {}), faults {faults}\n",
         rss / 1024,
@@ -67,6 +72,7 @@ pub fn print_process() {
 }
 
 /// `mi_thread_stats_print_out`: the calling thread's heap only.
+#[cfg(feature = "std")]
 pub fn print_thread() {
     let s = crate::alloc::stats();
     print_one("heap stats (thread)", &s);
@@ -93,9 +99,19 @@ pub fn process_info() -> (usize, usize, usize, usize, usize, usize, usize, usize
     {
         unix_process_info()
     }
-    // Miri and wasm: no process accounting to report. Wasm has no RSS concept
-    // distinct from the size of linear memory, and no host time.
-    #[cfg(any(miri, all(target_arch = "wasm32", not(miri))))]
+    // Miri, wasm, and bare metal: no process accounting to report. Wasm has no
+    // RSS concept distinct from the size of linear memory, and no host time; a
+    // firmware has no process at all — there is no `/proc`, no `GetProcessMemoryInfo`
+    // and nothing the numbers would mean. The doc above already promises
+    // "unknown fields read 0", so this is the contract, not a stub.
+    //
+    // The bare-metal arm is the fifth this four-way selection was missing, the
+    // same shape P0 found in `prim/mod.rs` and P3 found in `random.rs`.
+    #[cfg(any(
+        miri,
+        all(target_arch = "wasm32", not(miri)),
+        all(not(miri), not(windows), not(unix), not(target_arch = "wasm32"))
+    ))]
     {
         (0, 0, 0, 0, 0, 0, 0, 0)
     }

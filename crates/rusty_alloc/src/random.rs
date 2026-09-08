@@ -6,7 +6,7 @@
 //! clock, addresses and thread id; the seed path is documented per platform
 //! so `secure` builds can state what they rest on.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// A ChaCha8 stream. Not `Sync`: each heap owns one (no sharing, no locks).
 pub struct Random {
@@ -58,12 +58,17 @@ impl Random {
         if !os_entropy(&mut key) {
             // Fallback mixing: clock, a stack address, a heap-ish address,
             // thread id, and a global counter (documented weaker path).
-            static COUNTER: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
-            let stack = std::ptr::from_ref(&key) as usize as u64;
+            // `AtomicUsize`, not `AtomicU64`: this is a seed-mixing counter,
+            // not a value with a width contract, and 32-bit RISC-V / Xtensa
+            // have no 64-bit atomic (P3 of `docs/plans/small-metal.md`). The
+            // constant is the golden ratio truncated to the target's word.
+            const GOLDEN: usize = 0x9E37_79B9_usize;
+            static COUNTER: AtomicUsize = AtomicUsize::new(GOLDEN);
+            let stack = core::ptr::from_ref(&key) as usize as u64;
             let mut acc = crate::prim::clock_now()
                 ^ stack.rotate_left(17)
                 ^ (crate::prim::thread_id() as u64).rotate_left(33)
-                ^ COUNTER.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
+                ^ COUNTER.fetch_add(GOLDEN, Ordering::Relaxed) as u64;
             for k in key.iter_mut() {
                 // splitmix64 step
                 acc = acc.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -206,6 +211,18 @@ fn os_entropy(_key: &mut [u32; 8]) -> bool {
 /// counter as the only varying inputs. Free-list encoding under `secure`
 /// therefore has MUCH less entropy on wasm than on a native target — treat it
 /// as corruption detection, not as an exploit-mitigation claim.
+/// No OS, so no OS entropy — the fifth arm this four-way selection was
+/// missing, exactly as `prim/mod.rs` was missing one (P0 bucket A). The
+/// caller's documented fallback mixing (clock, stack address, thread id, a
+/// global counter) is what a bare-metal build gets, and the same caveat the
+/// wasm arm carries applies with more force: free-list encoding under `secure`
+/// is corruption DETECTION here, not an exploit-mitigation claim. A part with
+/// a hardware RNG should wire it through `prim` rather than weaken this.
+#[cfg(all(not(miri), not(windows), not(unix), not(target_arch = "wasm32")))]
+fn os_entropy(_key: &mut [u32; 8]) -> bool {
+    false
+}
+
 #[cfg(all(target_arch = "wasm32", not(miri)))]
 fn os_entropy(_key: &mut [u32; 8]) -> bool {
     false
