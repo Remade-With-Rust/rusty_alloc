@@ -240,9 +240,33 @@ ungated win because the check no longer runs on calls that cannot use it.
 narrows the gap, it does not close it, and it is kept on the strength of costing
 nothing measurable elsewhere rather than on winning that row.
 
-**Unverified on native.** The band is the same routing on every target, so the
-win should carry, but instruction counts cannot be taken from a Windows box --
-the scheduled `icount` job is what confirms or refutes it before a release.
+**It carries to native, and is slightly larger there.** "The routing is the same
+on every target so it should carry" is a prediction, not a result, so it was
+measured: a temporary runtime `RETRY_ON` toggle in `malloc_generic_once` lets one
+process time the retry on and off **interleaved**, which removes the
+cross-process drift that made the wasm A/B disagree in sign. Windows x86-64,
+four runs, best-of-15 per arm:
+
+| workload | retry OFF | retry ON | |
+|---|---:|---:|---|
+| 2048 B tight loop | 11.4-12.9 ns | 9.6-11.2 ns | **1.15-1.19x** |
+| 4096 B tight loop | 10.4-13.4 ns | 8.9-11.5 ns | **1.14-1.19x** |
+| 32 B tight loop | 3.5-4.5 ns | 3.4-4.5 ns | 0.97-1.05x, no effect |
+| churn 8-512 B | 9.5-9.8 ns | 9.2-9.5 ns | 1.00-1.04x, no effect |
+
+Same shape as wasm, slightly bigger. The toggle and its harness were removed
+after measuring -- a runtime branch in `malloc_generic` to support an A/B is not
+something to ship -- so reproducing this means re-adding them; the method is
+here, which is the part worth keeping.
+
+**Two things this still does NOT establish.** It is wall-clock on one machine,
+where the repo's own `bench/icount-arms.sh` header records that the clock cannot
+resolve a 5-10 % effect -- 15-19 % is comfortably outside that, but the published
+figures are INSTRUCTION COUNTS under callgrind and those remain unmeasured. And
+it is single-threaded: `page_collect` does an `Acquire` load on `xthread_free`,
+a line other threads push to, and neither wasm nor this benchmark can show
+contention there. The scheduled `icount` job and a threaded workload are what
+close those two.
 
 **Getting to that answer needed a better instrument, and that is the durable
 part.** The first two A/B attempts produced orderings that disagreed in SIGN,
