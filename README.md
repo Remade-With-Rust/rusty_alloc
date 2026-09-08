@@ -29,7 +29,9 @@ does not offer.
   cross-thread path and abort.
 - **~150 of mimalloc's ~157 `mi_*` entry points**, gated against the C
   implementation as a differential oracle on every change.
-- **Runs on WebAssembly** with no C toolchain and no emscripten.
+- **Runs on WebAssembly** with no C toolchain and no emscripten, and **2.0.0
+  halves what it adds to a gzipped bundle** (+7,760 -> +3,829 bytes on a minimal
+  module) — see [Shipping it to a browser](#shipping-it-to-a-browser).
 - **Runs on a microcontroller, and is 2.1-3.7x faster than `esp-alloc` there** —
   measured on a XIAO ESP32-S3 at 240 MHz, both allocators built from one source.
   It costs more RAM to get that (68 KiB vs 8 KiB); both numbers are below.
@@ -272,6 +274,48 @@ request needs a whole free 64 KiB segment, and 21-of-24 classes is exactly what
 under churn matters and you have RAM to spare. **Use `esp-alloc` when** the
 budget is tight — which on many parts it is. We would rather say that than sell
 you the wrong one.
+
+## Shipping it to a browser
+
+An integrator reported `rusty_alloc` adding ~12 % to their gzipped wasm bundle.
+It was measured, and most of it is gone in 2.0.0.
+
+| | raw | gzip | overhead vs the Rust default |
+|---|---:|---:|---:|
+| dlmalloc (Rust default for wasm32) | 15,536 | 6,706 | — |
+| rusty_alloc 1.1.x | 34,285 | 14,466 | +7,760 |
+| **rusty_alloc 2.0.0** | **25,734** | **10,535** | **+3,829** |
+
+Measured on a minimal consumer built the way you would ship it (`opt-level="z"`,
+`lto="fat"`, `panic="abort"`, `strip`), attributed by a set difference against
+the same module without the allocator. The cause was an option-environment pass
+that ran on `wasm32-unknown-unknown`, where `std::env::var` is a stub that always
+fails: 38 iterations formatting 76 strings every startup, to read an environment
+that target does not have. `tools/wasm-size.sh` is now a CI gate so it cannot
+come back. The method and what was ruled out are in
+[`docs/plans/wasm-size.md`](docs/plans/wasm-size.md).
+
+**To ship it small:**
+
+```toml
+[profile.release]
+opt-level = "z"      # "s" if you would rather have the speed
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+```
+
+```sh
+# Another ~16% off the RAW size (parse time and memory; gzip already
+# captures most of what this does, so the download barely moves).
+wasm-opt -Oz --enable-bulk-memory --strip-debug --strip-producers in.wasm -o out.wasm
+```
+
+**And check your own artifact for build paths.** Rust embeds panic locations as
+absolute paths, so a published `.wasm` can carry your home directory and
+username. `RUSTFLAGS="--remap-path-prefix=$PWD=."` fixes it on stable; Cargo's
+`trim-paths` is still nightly.
 
 ## Correctness evidence
 

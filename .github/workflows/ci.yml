@@ -296,6 +296,12 @@ jobs:
         run: cargo build -p rusty_alloc-wasm --target wasm32-unknown-unknown --release
       - name: run self-test inside a WebAssembly VM
         run: node bench/wasm-selftest.mjs target/wasm32-unknown-unknown/release/rusty_alloc_wasm.wasm
+      # SIZE is a shipped property of a wasm allocator: every byte is downloaded
+      # by every visitor to every page using it. Nothing measured it, so a
+      # 3,700-byte-gzipped regression sat in the crate for its whole life until
+      # an integrator reported it. See docs/plans/wasm-size.md.
+      - name: wasm size ratchet
+        run: bash tools/wasm-size.sh
 
   oracle:
     runs-on: ubuntu-latest

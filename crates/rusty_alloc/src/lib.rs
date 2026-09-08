@@ -56,14 +56,24 @@ pub(crate) fn abort() -> ! {
 /// because there is no thread exit. So a "thread-local" becomes a plain
 /// `static` — which is not a compromise but the point of the profile: one heap,
 /// no TLS lookup at all, a SHORTER fast path than the threaded one.
+/// **`wasm32-unknown-unknown` takes the single-`static` arm too, not just
+/// `no_std`.** That target has exactly one thread unless the atomics+threads
+/// proposal is on, which `prim/wasm.rs` has assumed since it was written. A
+/// `std::thread_local!` there still links lazy initialisation, destructor
+/// registration and the "accessed during or after destruction" panic — none of
+/// which can ever run — and the strings for it ship in every module.
+///
+/// `target_feature = "atomics"` is the precise switch: it is what
+/// `-C target-feature=+atomics` sets to build wasm WITH threads, and such a
+/// build keeps real TLS.
 macro_rules! ra_thread_local {
     ($($(#[$m:meta])* static $N:ident: $T:ty = const $init:block;)*) => {
-        #[cfg(feature = "std")]
+        #[cfg(all(feature = "std", not(all(target_arch = "wasm32", target_os = "unknown", not(target_feature = "atomics")))))]
         std::thread_local! {
             $($(#[$m])* static $N: $T = const $init;)*
         }
         $(
-            #[cfg(not(feature = "std"))]
+            #[cfg(any(not(feature = "std"), all(target_arch = "wasm32", target_os = "unknown", not(target_feature = "atomics"))))]
             $(#[$m])*
             static $N: $crate::SingleThreadCell<$T> =
                 $crate::SingleThreadCell::new($init);
@@ -99,20 +109,44 @@ compile_error!(
      `std` feature. See the crate docs on SingleThreadCell."
 );
 
-/// The `no_std` half of [`ra_thread_local!`]: a `static` with a `.with()`.
-#[cfg(not(feature = "std"))]
+/// The single-thread half of [`ra_thread_local!`]: a `static` with a `.with()`.
+#[cfg(any(
+    not(feature = "std"),
+    all(
+        target_arch = "wasm32",
+        target_os = "unknown",
+        not(target_feature = "atomics")
+    )
+))]
 pub(crate) struct SingleThreadCell<T>(T);
 
-// SAFETY: only ever constructed by `ra_thread_local!` in a `no_std` build,
-// which this crate serves only on single-threaded targets — the same standing
-// assumption as `prim::fixed` (constant thread id, TLS destructors that never
-// fire, a spin lock that never contends). With one thread there is no other
-// referent, so shared access cannot race. A `no_std` build on a target that
-// grows threads must revisit this type FIRST.
-#[cfg(not(feature = "std"))]
+#[cfg(any(
+    not(feature = "std"),
+    all(
+        target_arch = "wasm32",
+        target_os = "unknown",
+        not(target_feature = "atomics")
+    )
+))]
+// SAFETY: only ever constructed by `ra_thread_local!`, and only on a target
+// this crate serves single-threaded: a `no_std` build (which must opt in with
+// `--cfg ra_single_threaded`), or `wasm32-unknown-unknown` without the atomics
+// proposal, where `prim/wasm.rs` has assumed one thread since it was written.
+// The same standing assumption as `prim::fixed` (constant thread id, TLS
+// destructors that never fire, a spin lock that never contends). With one
+// thread there is no other referent, so shared access cannot race. A build on a
+// target that grows threads must revisit this type FIRST — which is what the
+// `target_feature = "atomics"` half of the condition above is there to catch.
 unsafe impl<T> Sync for SingleThreadCell<T> {}
 
-#[cfg(not(feature = "std"))]
+#[cfg(any(
+    not(feature = "std"),
+    all(
+        target_arch = "wasm32",
+        target_os = "unknown",
+        not(target_feature = "atomics")
+    )
+))]
 impl<T> SingleThreadCell<T> {
     pub(crate) const fn new(v: T) -> Self {
         Self(v)

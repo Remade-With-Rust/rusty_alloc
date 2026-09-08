@@ -72,6 +72,16 @@ features, which is the overwhelming majority.
 
 ### Performance
 
+- **wasm modules are 8,551 bytes smaller (3,931 gzipped)** — the allocator's
+  gzipped overhead on a minimal consumer falls from +7,760 to +3,829 bytes,
+  roughly halving what it adds to a bundle. Two causes, both measured
+  (`docs/plans/wasm-size.md`), plus a `tools/wasm-size.sh` CI ratchet so it
+  cannot regress unnoticed.
+- `ra_thread_local!` takes the single-`static` arm on `wasm32-unknown-unknown`
+  without the atomics proposal, which `prim/wasm.rs` has assumed single-threaded
+  since it was written. A `std::thread_local!` there linked lazy init,
+  destructor registration and an "accessed during or after destruction" panic
+  that can never run.
 - **wasm modules are 8,180 bytes smaller (3,700 gzipped).** The option
   environment pass ran on `wasm32-unknown-unknown`, where `std::env::var` is a
   stub that always fails: 38 iterations formatting 76 strings and allocating 76
