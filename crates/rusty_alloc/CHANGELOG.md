@@ -72,6 +72,10 @@ features, which is the overwhelming majority.
 
 ### Performance
 
+- **On wasm, 4.9-7.3x faster than the Rust default allocator on a churn workload**
+  (64 live blocks, random 8-512 B), measured in node with a subtracted harness
+  floor and checksums proving work parity. A tight 2 KiB same-size loop is
+  ~0.7x, for a reason `alloc.rs` already documents as measured-and-refuted.
 - **wasm modules are 8,551 bytes smaller (3,931 gzipped)** — the allocator's
   gzipped overhead on a minimal consumer falls from +7,760 to +3,829 bytes,
   roughly halving what it adds to a bundle. Two causes, both measured

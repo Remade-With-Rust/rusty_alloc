@@ -295,6 +295,25 @@ that target does not have. `tools/wasm-size.sh` is now a CI gate so it cannot
 come back. The method and what was ruled out are in
 [`docs/plans/wasm-size.md`](docs/plans/wasm-size.md).
 
+### What the bytes buy
+
+Same module, run in node — nanoseconds per allocate/free pair, net of a measured
+harness floor, with checksums proving both allocators did identical work:
+
+| workload | dlmalloc | rusty_alloc | |
+|---|---:|---:|---|
+| **churn: 64 live blocks, random 8-512 B** | ~71-78 ns | ~10-15 ns | **4.9-7.3x faster** |
+| 2048 B tight alloc/free | ~9-14 ns | ~16-22 ns | 0.55-0.83x |
+| 32 B tight alloc/free, and 64 mixed batched | — | — | within noise |
+
+Churn is the shape real code has, and the one that fragments a free list. The
+2048 B row is a tight same-size loop, where a boundary-tag allocator's
+free-then-alloc is a single list push and pop; `alloc.rs` carries a dated,
+measured note explaining why the obvious fix for it is a regression elsewhere.
+Only the two outer rows are claims — the middle two straddle 1.0 across repeats
+and are reported as such. Ranges are five runs; reproduce with
+[`bench/wasm-speed/`](bench/wasm-speed/).
+
 **To ship it small:**
 
 ```toml

@@ -1,10 +1,10 @@
-# wasm-size — what rusty_alloc costs a browser, and why it cost twice that
+# wasm-size — what rusty_alloc costs a browser, what it cost twice, and what it buys
 
 **Source:** a GitHub message from someone integrating the crate, reporting
 **+12 % on their gzipped wasm bundle**. Written 2026-09-08 against `main` at
 2.0.0.
 
-**Status: MEASURED and HALVED.** The allocator's gzipped overhead on a minimal
+**Status: MEASURED, HALVED, and the other half of the question answered (§8).** The allocator's gzipped overhead on a minimal
 consumer went **+7,760 → +3,829 bytes**. A CI ratchet (`tools/wasm-size.sh`)
 now fails the build if it grows again.
 
@@ -127,6 +127,65 @@ a developer's username and directory layout to everyone who downloads the page.
   (~200 gzipped) is not worth a leak.
 - **Recommend to integrators**, in the README: `wasm-opt -Oz`,
   `--remap-path-prefix`, and `opt-level = "z"` with `lto = "fat"`.
+
+
+## 8. And what the bytes buy — speed, in a real VM
+
+Size was measured for two rounds before anyone asked the other half of the
+question. **Is rusty_alloc faster than the allocator it replaces on wasm?** If
+not, +3,829 gzipped bytes is indefensible at any size.
+
+Same discipline as the ESP32 harness: one source, `--cfg` picks the allocator,
+a FLOOR arm that allocates nothing, volatile touches folded into a checksum the
+optimiser cannot elide past, seeded size sequences, best-of-7, run under node, and `bench/wasm-speed/` so it is re-derivable.
+Nanoseconds per allocate/free pair, net of the floor:
+
+| workload | dlmalloc | rusty_alloc | |
+|---|---:|---:|---|
+| **churn: 64 live, random 8-512 B** | ~71-78 | ~10-15 | **4.9-7.3x faster** |
+| 2048 B tight alloc/free | ~9-14 | ~16-22 | 0.55-0.83x |
+| 32 B tight alloc/free | 5.3-9.8 | 5.1-8.5 | within noise |
+| 64 mixed, batched | 7.5-12.4 | 7.3-11.7 | within noise |
+
+**Only two of those four rows are claims.** Five repeats put churn at 4.92,
+5.26, 6.57, 5.22 and 7.30, and 2048 B at 0.70, 0.65, 0.65, 0.83 and 0.55 — wide,
+but never near 1.0 from either side, which is what makes them claims at all.
+"~5x" is the bottom of the churn range, not its middle. The other two straddle 1.0 run to run and are reported as ranges
+rather than ratios, because a harness with +/-25 % between-process variance
+cannot resolve a 10 % effect and should not pretend to.
+
+**The floor caught a broken first measurement.** It reported 5.2 ns/op for
+dlmalloc and 0.6 ns/op for rusty_alloc — for *identical* code that allocates
+nothing. V8 tiers wasm up per code path, and only one branch had been warmed.
+The harness now warms every branch and prints a warning if the two floors differ
+by more than 25 %, because a floor that differs is a harness measuring itself.
+
+### Why 2048 B loses, and why that is not a bug to fix
+
+Instrumented rather than guessed: exported `alloc::stats().generic` and counted
+slow-path trips per operation.
+
+```
+32 B      0.008 per op
+churn     0.060 per op
+64 mixed  0.034 per op
+2048 B    1.000 per op     <- every single allocation
+```
+
+Every 2 KiB allocation takes the generic path. `Heap::malloc` has a medium fast
+path, but the `GlobalAlloc` entry reaches `malloc_slow`, which goes straight to
+`malloc_generic` — and `alloc.rs` says exactly why, dated and measured:
+
+> **REFUTED 2026-08-21** — peeking the MEDIUM bin's queue front here is a large
+> regression: `big` and `large` +25.00 Ir/op each [...] A tight alloc/free loop
+> frees into `local_free`, so the queue front's `free` list is ALWAYS dry when
+> the next allocation arrives — the peek can never hit.
+
+The benchmark row is precisely that shape: one live block, freed into
+`local_free`, so `free` is empty on every allocation. dlmalloc wins it because a
+boundary-tag allocator's free-then-alloc of one size is a list push and pop.
+**The repo had already tried the fix and measured it worse.** Recorded here so
+the third person to notice the row does not try it again.
 
 ## 7. The gate
 
