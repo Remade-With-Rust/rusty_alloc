@@ -864,7 +864,7 @@ pub unsafe fn page_set_flag(page: *mut Page, flag: usize) {
 ///
 /// # Safety
 /// `page` owned by the calling thread.
-pub unsafe fn page_collect(page: *mut Page) {
+pub unsafe fn page_collect(page: *mut Page) -> bool {
     // SAFETY: forwarded contract; PRESERVE the protocol flag.
     unsafe { page_collect_impl::<false>(page, 0) }
 }
@@ -884,7 +884,7 @@ pub unsafe fn page_collect(page: *mut Page) {
 /// As [`page_collect`].
 pub unsafe fn page_collect_and_set_flag(page: *mut Page, flag: usize) {
     // SAFETY: forwarded contract.
-    unsafe { page_collect_impl::<true>(page, flag) }
+    let _stole = unsafe { page_collect_impl::<true>(page, flag) };
 }
 
 /// The body of both. `SET_FLAG` is a const parameter so neither caller pays a
@@ -893,7 +893,7 @@ pub unsafe fn page_collect_and_set_flag(page: *mut Page, flag: usize) {
 /// # Safety
 /// As [`page_collect`].
 #[inline]
-unsafe fn page_collect_impl<const SET_FLAG: bool>(page: *mut Page, flag: usize) {
+unsafe fn page_collect_impl<const SET_FLAG: bool>(page: *mut Page, flag: usize) -> bool {
     // SAFETY: owner-only lists plus designed atomic steal.
     unsafe {
         if (*page).free.is_null() {
@@ -913,7 +913,7 @@ unsafe fn page_collect_impl<const SET_FLAG: bool>(page: *mut Page, flag: usize) 
         // Steal the cross-thread chain, preserving the protocol flag — or,
         // when SET_FLAG, replacing it in the same CAS.
         if !SET_FLAG && ((*page).xthread_free.load(Ordering::Acquire) & !XMASK) == 0 {
-            return;
+            return false;
         }
         loop {
             let x = (*page).xthread_free.load(Ordering::Acquire);
@@ -933,7 +933,7 @@ unsafe fn page_collect_impl<const SET_FLAG: bool>(page: *mut Page, flag: usize) 
                 {
                     continue;
                 }
-                break;
+                return false;
             }
             let want = if SET_FLAG { flag } else { x & XMASK };
             if (*page)
@@ -988,6 +988,9 @@ unsafe fn page_collect_impl<const SET_FLAG: bool>(page: *mut Page, flag: usize) 
             (*page).used -= n;
             break;
         }
+        // Reached only by breaking out of the steal arm above, i.e. a
+        // cross-thread chain was actually taken.
+        true
     }
 }
 

@@ -167,6 +167,13 @@ pub struct Heap {
     pub tag: i32,
     /// Per-heap CSPRNG: free-list keys, guarded sampling (M8).
     pub rng: crate::random::Random,
+    /// Has any page of this heap ever received a CROSS-THREAD free?
+    ///
+    /// Owner-thread only, so a plain `bool`. Sticky: once a remote free has
+    /// been seen the medium retry stays off for this heap's life, which is the
+    /// conservative direction (it falls back to the behaviour that has always
+    /// shipped).
+    pub saw_remote_free: bool,
     /// Trips of the generic path left before the next automatic collect.
     ///
     /// `mi_option_generic_collect`. Counts DOWN so the hot check is a compare
@@ -226,6 +233,7 @@ impl Heap {
             arena_id: -1,
             tag: 0,
             rng: crate::random::Random::new(),
+            saw_remote_free: false,
             generic_countdown: 0,
             guarded_rate: 0,
             guarded_count: 0,
@@ -440,6 +448,52 @@ impl Heap {
         {
             return r;
         }
+        // COLLECT-AND-RETRY for the medium band, and it TURNS ITSELF OFF.
+        //
+        // Through `GlobalAlloc` a medium allocation reaches this function on
+        // every call: `alloc::malloc` serves `size <= SMALL_SIZE_MAX` from the
+        // direct table and tail-calls `malloc_slow`, which comes straight here,
+        // while `Heap::malloc`'s medium branch is on a different entry point.
+        // Measured at 1.000 generic trips per op for 2 KiB against 0.008 for
+        // 32 B -- routing, not list state. Collecting the queue front and
+        // retrying before the heartbeat is worth +15 % on wasm and +15-19 % on
+        // native for a 2 KiB tight alloc/free loop.
+        //
+        // It is worth **-20 to -30 %** the moment another thread is freeing into
+        // these pages. `free`, `local_free` and `xthread_free` are adjacent
+        // fields of a `#[repr(C)]` `Page`, so touching the queue front at all
+        // pulls a line the remote thread is invalidating -- doing only the
+        // local half of the collect measured WORSE, not better, which is how
+        // that was established.
+        //
+        // So the predicate is not "how many threads exist" but "does THIS heap
+        // receive remote frees", and the retry answers it itself: `page_collect`
+        // reports whether it stole a cross-thread chain, and the first steal
+        // latches the retry off for this heap. A thread that owns its
+        // allocations keeps the win however many threads the process has; a
+        // producer whose pages a consumer frees pays one detection and then
+        // behaves exactly as before.
+        if !self.saw_remote_free && size > SMALL_SIZE_MAX && size <= MEDIUM_OBJ_SIZE_MAX {
+            let bin = bins::bin(size);
+            let p = self.pages[bin].first;
+            if !p.is_null() {
+                // SAFETY: queue members are live pages of this heap, we are the
+                // owner thread, and `page_collect` is the same operation the
+                // walk below performs on this page.
+                let (stole, b) = unsafe {
+                    let stole = crate::page::page_collect(p);
+                    (stole, page_pop(p))
+                };
+                if stole {
+                    self.saw_remote_free = true;
+                }
+                if !b.is_null() {
+                    self.stat_alloc();
+                    // SAFETY: p live per above.
+                    return (b, unsafe { (*p).free_is_zero });
+                }
+            }
+        }
         // Heartbeat: process cross-thread delayed frees at slow-path cadence
         // (this is what un-parks full pages whose blocks died remotely), and
         // fire the registered deferred-free hook (mi_register_deferred_free).
@@ -587,7 +641,15 @@ impl Heap {
             let mut p = (*q).first;
             while !p.is_null() {
                 if (*p).free.is_null() {
-                    page_collect(p);
+                    // A steal ANYWHERE in this heap's queue means this heap
+                    // receives cross-thread frees, which is what the medium
+                    // retry must not run into. Latching only when the retry
+                    // itself steals was not enough: the frees that hurt land on
+                    // OTHER pages of the same heap, so the retry's own page
+                    // never sees them and it never turned itself off.
+                    if page_collect(p) {
+                        self.saw_remote_free = true;
+                    }
                 }
                 if (*p).free.is_null() && (*p).capacity < (*p).reserved {
                     // `(*p).area` is the cached payload start (see `Page::area`);
@@ -1250,7 +1312,9 @@ impl Heap {
                 let mut p = (*q).first;
                 while !p.is_null() {
                     let next = (*p).next;
-                    page_collect(p);
+                    if page_collect(p) {
+                        self.saw_remote_free = true;
+                    }
                     // An all-free page is freed HERE regardless of whether it
                     // is its bin's only one. That is upstream:
                     // `mi_heap_page_collect` calls `_mi_page_free` whenever
