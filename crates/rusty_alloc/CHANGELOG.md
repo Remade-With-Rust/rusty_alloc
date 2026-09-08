@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `prim::fixed::MIN_REGION` and `prim::fixed::usable_bytes(base, len)` — a
+  firmware can now size its heap region at COMPILE time
+  (`const _: () = assert!(N >= MIN_REGION)`) instead of discovering the answer
+  on silicon, and can log how much of a region can actually back segments. The
+  `k * SEGMENT_SIZE + FIXED_PAGE` rule previously existed only in a design
+  document; a 220 KiB region strands 24,576 bytes and nothing said so.
+- Distinct `prim::fixed` error codes: `FERR_TOO_SMALL`, `FERR_GEOMETRY`,
+  `FERR_REGISTERED`. One sentinel covered three conditions with three different
+  fixes.
+
+### Fixed
+
+- **`init_region` accepted a region that could never yield a segment.** Setting
+  `--cfg ra_single_threaded` (which the crate demands loudly) without
+  `--cfg ra_small_profile` (which nothing demanded) left `SEGMENT_SIZE` at
+  32 MiB, so a kilobyte-scale region returned `Ok(())`, linked clean, and then
+  failed every allocation on the board with a backtrace pointing at whatever
+  allocated first. It now returns `FERR_GEOMETRY`, checked against the real base
+  address rather than the length alone — an unaligned base needs up to
+  `SEGMENT_SIZE - 1` more than a length test would demand.
+- **An allocating interrupt handler hung the firmware silently.**
+  `prim::fixed`'s lock is not reentrant, and on a single-context target a lock
+  observed held can only mean reentrancy. That is now a panic naming the ISR
+  instead of an unbounded spin that surfaces as a watchdog reset. Confirmed with
+  a load, because `compare_exchange_weak` may fail spuriously and a bare CAS
+  failure would misfire.
+- The README documents `--cfg ra_small_profile`, which it never mentioned, and
+  attaches it to the 68 KiB figure that is only true under it.
+
+  All four reported by the first outside firmware to adopt 2.0.0
+  (`docs/plans/embedded-adoption.md`).
+
 ## [2.0.0](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v1.1.6...rusty_alloc-v2.0.0) - 2026-09-07
 
 ### Breaking

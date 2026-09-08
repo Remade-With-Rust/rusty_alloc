@@ -50,6 +50,36 @@ use super::{Alloc, MemConfig, PrimError, TlsDtor, align_up};
 /// sentinel does; this one is distinct from wasm's `0xBEEF` and the mock's.
 const FERR: PrimError = 0xF13D;
 
+/// The region is smaller than one [`FIXED_PAGE`].
+pub const FERR_TOO_SMALL: PrimError = 0xF13E;
+
+/// The region cannot hold a single `SEGMENT_SIZE` segment at the ACTIVE
+/// geometry, so the allocator above this backend could never serve anything.
+///
+/// Almost always one missing flag: `--cfg ra_small_profile` keeps
+/// `SEGMENT_SIZE` at 32 MiB, and a kilobyte-scale region yields zero segments.
+pub const FERR_GEOMETRY: PrimError = 0xF13F;
+
+/// A region is already registered; this backend takes one, once.
+pub const FERR_REGISTERED: PrimError = 0xF140;
+
+/// The smallest region this backend will accept, for a `SEGMENT_SIZE`-ALIGNED
+/// base: one segment for the allocator plus one page for its heap descriptor.
+///
+/// Exposed so a firmware can settle its budget at COMPILE time rather than on
+/// silicon, which is what the first outside adopter asked for
+/// (`docs/plans/embedded-adoption.md`):
+///
+/// ```ignore
+/// const _: () = assert!(REGION_BYTES >= rusty_alloc::prim::fixed::MIN_REGION);
+/// ```
+///
+/// An UNALIGNED base needs up to `SEGMENT_SIZE - 1` more, because the first
+/// segment can only start on a segment boundary; [`init_region`] checks the
+/// real base and is therefore exact where this constant is optimistic. Align
+/// the region and the two agree.
+pub const MIN_REGION: usize = crate::types::SEGMENT_SIZE + FIXED_PAGE;
+
 /// Page granularity reported to the layers above. A chip has no paging
 /// hardware, so this is a bookkeeping unit rather than a hardware fact; 4 KiB
 /// matches the flash/RAM block size the ESP parts use and keeps `page_align_up`
@@ -91,16 +121,108 @@ impl Guard {
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
+            // Under `ra_single_threaded` a genuinely contended acquire is not a
+            // race, because there is no second thread to race with. It can only
+            // be REENTRANCY: an interrupt handler that allocated while the main
+            // context was inside the allocator. That wedges forever -- the
+            // preempted context can never run to release the lock -- and
+            // surfaces as a watchdog reset with a backtrace pointing into
+            // `spin_loop`, which names nothing.
+            //
+            // The LOAD is not redundant. `compare_exchange_weak` may fail
+            // SPURIOUSLY, so a failed CAS is not by itself proof of anything;
+            // only a lock actually observed held is. Getting this wrong would
+            // panic firmwares at random, which is worse than the hang it
+            // replaces.
+            #[cfg(ra_single_threaded)]
+            if lock.load(Ordering::Relaxed) {
+                reentered();
+            }
             core::hint::spin_loop();
         }
         Self(lock)
     }
 }
 
+/// The allocator was re-entered on a target that promised one context.
+///
+/// Separated and `#[cold]` so the happy path is unchanged: the CAS already
+/// happens, and only its failure arm gains a load and a call that never
+/// returns.
+///
+/// If the firmware's panic handler itself allocates it will re-enter here and
+/// panic again, which aborts. That is a defined ending and a diagnosable one;
+/// the behaviour being replaced is an unbounded spin with no message at all.
+#[cfg(ra_single_threaded)]
+#[cold]
+#[inline(never)]
+fn reentered() -> ! {
+    // A literal, not a format: `core::fmt` is not on this crate's `no_std`
+    // budget, and this message must survive a build that has no formatter.
+    panic!(
+        "rusty_alloc: the allocator was re-entered. On a target built with \
+         --cfg ra_single_threaded nothing else can hold this lock, so this is \
+         almost certainly an interrupt handler that allocated while the main \
+         context was inside the allocator. prim::fixed's lock is NOT \
+         reentrant: do not allocate in an ISR. Note that ra_single_threaded \
+         means single CONTEXT, and an interrupt handler is a second context on \
+         one core."
+    )
+}
+
 impl Drop for Guard {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
     }
+}
+
+/// How many bytes of `[base, base + len)` can ever back SEGMENTS.
+///
+/// The rule this answers used to live only in a design document
+/// (`docs/plans/small-metal.md`: *"size an embedded region as
+/// `k * 64 KiB + 4 KiB`, or the tail is dead to large allocations"*), which
+/// meant a firmware author picking a round number learned it by reading prose
+/// or not at all. A 220 KiB region at the small profile yields three segments
+/// and strands 24,576 bytes — 11 % of the budget, silently.
+///
+/// Segments are carved from the first `SEGMENT_SIZE`-aligned address upward and
+/// page-sized blocks from the top down, so the answer is
+/// `floor((end - first_aligned - FIXED_PAGE) / SEGMENT_SIZE) * SEGMENT_SIZE`:
+/// the leading bytes before alignment are unusable, and one page is reserved at
+/// the top for the heap descriptor without which the allocator cannot start.
+///
+/// **This is not the same question as [`region_stats`]'s `free`.** That reports
+/// bytes nobody has taken, and the stranded tail is genuinely available to
+/// page-sized allocations — so it is free, and it is also useless for segments.
+/// Reporting one number as if it answered both is how a clean number ends up
+/// measuring nothing; they are separate on purpose.
+///
+/// `const fn`, so a seam crate can size its region at compile time:
+///
+/// ```ignore
+/// const _: () = assert!(usable_bytes(0, REGION_BYTES) > 0);
+/// ```
+#[must_use]
+pub const fn usable_bytes(base: usize, len: usize) -> usize {
+    let seg = crate::types::SEGMENT_SIZE;
+    let Some(end) = base.checked_add(len) else {
+        return 0;
+    };
+    // First segment-aligned address at or above `base`, without overflowing.
+    let Some(run_up) = base.checked_add(seg - 1) else {
+        return 0;
+    };
+    let first = run_up & !(seg - 1);
+    if first >= end {
+        return 0;
+    }
+    let avail = end - first;
+    // One page at the top for the heap descriptor. Without it `create_heap`
+    // fails and no segment can be used even if one fits.
+    if avail <= FIXED_PAGE {
+        return 0;
+    }
+    ((avail - FIXED_PAGE) / seg) * seg
 }
 
 /// Hand the backend the region it will serve from, once.
@@ -114,24 +236,52 @@ impl Drop for Guard {
 /// to hold anything after alignment.
 ///
 /// # Errors
-/// [`FERR`] on a second call, or on a region below [`FIXED_PAGE`] bytes.
+/// - [`FERR_TOO_SMALL`] — below one [`FIXED_PAGE`].
+/// - [`FERR_GEOMETRY`] — cannot hold one `SEGMENT_SIZE` segment at this
+///   geometry, so the allocator above could never serve an allocation. This is
+///   the one that used to be accepted silently: `init_region` returned `Ok`,
+///   the build was clean, and the first `Vec` on the board returned null with a
+///   backtrace pointing at whatever happened to allocate first. Reported by the
+///   first outside firmware to adopt 2.0.0 (`docs/plans/embedded-adoption.md`).
+/// - [`FERR_REGISTERED`] — a region is already registered.
 pub fn init_region(region: &'static mut [u8]) -> Result<(), PrimError> {
     let len = region.len();
     if len < FIXED_PAGE {
-        return Err(FERR);
+        return Err(FERR_TOO_SMALL);
     }
     let base = region.as_mut_ptr().expose_provenance();
 
+    // EXACT, not conservative. `MIN_REGION` assumes a segment-aligned base; the
+    // real base is in hand here, so ask the question that actually matters --
+    // does an aligned segment plus a page fit inside this region? A check
+    // against `len` alone would accept a region whose base sits one byte past a
+    // segment boundary and still fail on the board.
+    if usable_bytes(base, len) == 0 {
+        return Err(FERR_GEOMETRY);
+    }
+
     let _g = Guard::acquire(&LOCK);
     if REGION_LEN.load(Ordering::Relaxed) != 0 {
-        return Err(FERR);
+        return Err(FERR_REGISTERED);
     }
+    install_region(base, len);
+    Ok(())
+}
+
+/// The install half of [`init_region`], with no geometry check.
+///
+/// Split out for the unit tests, which exercise this backend as a plain extent
+/// allocator -- first fit, coalescing, two-ended placement -- on a region far
+/// smaller than a 32 MiB segment. That is a legitimate thing to test and NOT a
+/// legitimate thing to ship: an allocator handed a region that cannot hold one
+/// segment is dead on arrival, which is exactly what [`init_region`] now
+/// refuses. Private, so the refusal has no public bypass.
+fn install_region(base: usize, len: usize) {
     REGION_BASE.store(base, Ordering::Relaxed);
     REGION_LEN.store(len, Ordering::Relaxed);
     EXT_BASE[0].store(base, Ordering::Relaxed);
     EXT_LEN[0].store(len, Ordering::Relaxed);
     EXT_COUNT.store(1, Ordering::Relaxed);
-    Ok(())
 }
 
 /// The region's occupancy: `(used, free, total)` bytes.
@@ -540,15 +690,42 @@ mod tests {
         // init_region which requires (and consumes) exactly that exclusivity.
         let region: &'static mut [u8] = unsafe { core::slice::from_raw_parts_mut(rp, N) };
 
-        init_region(region).expect("first registration succeeds");
+        // The negative cases FIRST: each must be refused without consuming the
+        // one registration this backend accepts.
+        let tiny: &'static mut [u8] = &mut [];
+        assert_eq!(
+            init_region(tiny),
+            Err(FERR_TOO_SMALL),
+            "a region below one page is refused, and says which"
+        );
+
+        // Branch on the ACTIVE geometry, because both arms are real. At the
+        // shipped 32 MiB segment this 512 KiB region cannot hold one, so
+        // `init_region` refuses it -- correctly, since an allocator handed it
+        // would be dead on arrival -- and the extent allocator beneath, which is
+        // what the rest of this test exercises, is installed directly. At the
+        // small profile a 64 KiB segment fits eight times over and the public
+        // entry point is used as a firmware would.
+        if usable_bytes(rp.expose_provenance(), N) == 0 {
+            assert_eq!(
+                init_region(region),
+                Err(FERR_GEOMETRY),
+                "a region that cannot hold one segment is refused BEFORE the board"
+            );
+            install_region(rp.expose_provenance(), N);
+        } else {
+            init_region(region).expect("this geometry's segment fits in N");
+        }
         assert_eq!(free_total(), N, "the whole region starts free");
         assert_eq!(extents().len(), 1, "as one extent");
 
-        // A second registration is refused: the region is handed over once.
+        // A second registration is refused, and says so distinctly.
         let op = &raw mut OTHER;
         // SAFETY: as above; the call is expected to fail before it stores it.
-        let other: &'static mut [u8] = unsafe { &mut *op };
-        assert!(init_region(other).is_err(), "no second region");
+        let other: &'static mut [u8] =
+            unsafe { core::slice::from_raw_parts_mut(op.cast::<u8>(), FIXED_PAGE) };
+        let second = init_region(other);
+        assert!(second.is_err(), "no second region");
 
         // Serve three page-aligned blocks.
         // SAFETY: the prim contract — sizes are page multiples, alignment a
@@ -721,6 +898,89 @@ mod tests {
             unsafe { free(p, SEGMENT_SIZE).expect("free a counted segment") };
         }
         n
+    }
+
+    /// `usable_bytes` is pure arithmetic, so it gets its own test with no
+    /// global state -- and the case that motivated it, from the first outside
+    /// adopter's report.
+    #[test]
+    fn usable_bytes_answers_the_question_a_firmware_asks() {
+        let seg = SEGMENT_SIZE;
+
+        // Aligned base: MIN_REGION is exactly enough for one segment, and one
+        // byte less is not.
+        assert_eq!(
+            usable_bytes(0, MIN_REGION),
+            seg,
+            "MIN_REGION buys a segment"
+        );
+        assert_eq!(
+            usable_bytes(0, MIN_REGION - 1),
+            0,
+            "one byte short buys none"
+        );
+
+        // The page at the top is not optional: a region of exactly one segment
+        // has nowhere to put the heap descriptor, so it can serve nothing.
+        assert_eq!(
+            usable_bytes(0, seg),
+            0,
+            "a segment with no page for the heap is unusable"
+        );
+
+        // An UNALIGNED base loses the run-up. This is why `init_region` checks
+        // the real base rather than comparing `len` against `MIN_REGION`: this
+        // region is >= MIN_REGION and still yields nothing.
+        assert_eq!(
+            usable_bytes(FIXED_PAGE, MIN_REGION),
+            0,
+            "unaligned base eats the segment"
+        );
+        assert_eq!(
+            usable_bytes(FIXED_PAGE, MIN_REGION + seg),
+            seg,
+            "one more segment of slack absorbs the misalignment"
+        );
+
+        // The stranded tail, which used to be recorded only in a design doc.
+        // Sized in segments so it says the same thing at either geometry; at
+        // the small profile this is the report's 220 KiB case exactly.
+        let three_and_a_bit = 3 * seg + FIXED_PAGE + seg / 2;
+        assert_eq!(
+            usable_bytes(0, three_and_a_bit),
+            3 * seg,
+            "a ragged region yields whole segments and strands the remainder"
+        );
+        let stranded = three_and_a_bit - usable_bytes(0, three_and_a_bit) - FIXED_PAGE;
+        assert_eq!(
+            stranded,
+            seg / 2,
+            "and the strand is exactly the ragged part"
+        );
+    }
+
+    /// The reentrancy detector, watched firing.
+    ///
+    /// "A failure mode nobody has watched fire is a claim, not a defence" is
+    /// this repo's own line, and it applies to the thing that replaced the
+    /// hang. Only compiled where the detector is: run it with
+    /// `RUSTFLAGS="--cfg ra_single_threaded" cargo test -p rusty_alloc --lib prim::fixed`,
+    /// which CI does.
+    ///
+    /// Deliberately NOT in `tools/gate-selftest.sh`: poisoning this gate
+    /// removes the detector, and the test then HANGS instead of failing --
+    /// which is the whole point of the defect, and useless in a CI job. The
+    /// evidence that it fires is this test passing where the detector exists
+    /// and the code not compiling it where it does not.
+    #[cfg(ra_single_threaded)]
+    #[test]
+    #[should_panic(expected = "re-entered")]
+    fn a_reentrant_acquire_is_diagnosed_not_hung() {
+        static LOCK2: AtomicBool = AtomicBool::new(false);
+        let _outer = Guard::acquire(&LOCK2);
+        // Exactly what an allocating ISR does: acquire while the outer context
+        // still holds it. Without the detector this line never returns.
+        let _inner = Guard::acquire(&LOCK2);
     }
 
     /// The no-MMU decisions, pinned so a future edit has to mean it.
