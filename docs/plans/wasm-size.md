@@ -209,73 +209,66 @@ It works, and it is still not worth it:
 paying the hottest path to narrow a microbenchmark that stays lost is the wrong
 trade.
 
-### Then GATED, which turned the trade into a win (2026-09-08)
+### Then GATED — and then reverted, on the contention it hid (2026-09-08)
 
-A change with a `+` and a `-` outcome is an invitation to look for the predicate
-that separates them, not a trade to accept. Here the predicate was already in
-the counters: `2 KiB` reaches `malloc_generic` on **1.000** of its calls and
-32 B on **0.008**.
+A change with a `+` and a `-` outcome is an invitation to find the predicate
+that separates them. The predicate was in the counters: 2 KiB reaches
+`malloc_generic` on **1.000** of its calls and 32 B on **0.008**.
 
-That ratio is not list state, which is what the first two explanations assumed.
-It is ROUTING. `alloc::malloc` serves `size <= SMALL_SIZE_MAX` from the direct
-table and tail-calls `malloc_slow`, which goes straight to `malloc_generic`;
-`Heap::malloc`'s medium branch is on a different entry point and is never
-reached through `GlobalAlloc`. So every medium allocation arrives at the slow
-path by construction, and small ones almost never do -- which is exactly why the
-ungated version helped one and taxed the other.
+That ratio is ROUTING, not list state — which is what both earlier explanations
+assumed, including the 2026-08-21 refutation's. `alloc::malloc` serves
+`size <= SMALL_SIZE_MAX` from the direct table and tail-calls `malloc_slow`,
+which goes straight to `malloc_generic`; `Heap::malloc`'s medium branch is on a
+different entry point and is never reached through `GlobalAlloc`. Gating the
+retry to `size > SMALL_SIZE_MAX && size <= MEDIUM_OBJ_SIZE_MAX` removed the
+payer and grew the win:
 
-Gated to `size > SMALL_SIZE_MAX && size <= MEDIUM_OBJ_SIZE_MAX`:
-
-| workload | ungated | **band-gated** |
+| workload | ungated | band-gated |
 |---|---|---|
-| 2048 B tight loop | +7 % | **+15 %** |
-| 32 B tight loop | **-3 to -4 %** | **no effect** |
+| 2048 B tight loop | +7 % | **+15 %** (wasm), **+15-19 %** (native) |
+| 32 B tight loop | -3 to -4 % | no effect |
 | churn, batched | noise | no effect |
 
-Three passes in each order, interleaved. The band also excludes the `big`/`large`
-sizes the 2026-08-21 experiment regressed by +25 Ir/op, and it is bigger than the
-ungated win because the check no longer runs on calls that cannot use it.
-
-**The row still loses**: 2 KiB against dlmalloc goes from ~0.65x to ~0.72x. This
-narrows the gap, it does not close it, and it is kept on the strength of costing
-nothing measurable elsewhere rather than on winning that row.
-
-**It carries to native, and is slightly larger there.** "The routing is the same
-on every target so it should carry" is a prediction, not a result, so it was
-measured: a temporary runtime `RETRY_ON` toggle in `malloc_generic_once` lets one
-process time the retry on and off **interleaved**, which removes the
-cross-process drift that made the wasm A/B disagree in sign. Windows x86-64,
-four runs, best-of-15 per arm:
+**And then it was reverted, because every one of those numbers is
+single-threaded.** `page_collect` loads `xthread_free` — the line a remote
+`free` pushes onto. wasm cannot show contention there (one thread by
+construction) and neither could the native benchmark. So it was built: a
+producer allocates a batch of 2 KiB blocks, a consumer thread frees THAT batch
+while the producer is timed allocating another, so remote frees land on the
+producer's own pages with no handshake anywhere in the timed loop.
 
 | workload | retry OFF | retry ON | |
 |---|---:|---:|---|
-| 2048 B tight loop | 11.4-12.9 ns | 9.6-11.2 ns | **1.15-1.19x** |
-| 4096 B tight loop | 10.4-13.4 ns | 8.9-11.5 ns | **1.14-1.19x** |
-| 32 B tight loop | 3.5-4.5 ns | 3.4-4.5 ns | 0.97-1.05x, no effect |
-| churn 8-512 B | 9.5-9.8 ns | 9.2-9.5 ns | 1.00-1.04x, no effect |
+| **producer alloc, consumer freeing its pages** | ~51-75 ns | ~71-77 ns | **0.67-1.00x** |
+| same, single-threaded control | ~21-32 ns | ~24-32 ns | no effect |
 
-Same shape as wasm, slightly bigger. The toggle and its harness were removed
-after measuring -- a runtime branch in `malloc_generic` to support an A/B is not
-something to ship -- so reproducing this means re-adding them; the method is
-here, which is the part worth keeping.
+Never better, usually 15-33 % worse, across two harnesses and eight runs.
+**Reverted.** Cross-thread frees are the producer/consumer shape — thread
+pools, channels, async runtimes — and mimalloc's architecture exists to serve
+them. A 15-19 % gain on a single-threaded tight loop does not buy a 20-30 %
+loss there.
 
-**Two things this still does NOT establish.** It is wall-clock on one machine,
-where the repo's own `bench/icount-arms.sh` header records that the clock cannot
-resolve a 5-10 % effect -- 15-19 % is comfortably outside that, but the published
-figures are INSTRUCTION COUNTS under callgrind and those remain unmeasured. And
-it is single-threaded: `page_collect` does an `Acquire` load on `xthread_free`,
-a line other threads push to, and neither wasm nor this benchmark can show
-contention there. The scheduled `icount` job and a threaded workload are what
-close those two.
+**The obvious fix does not work, and that is the finding worth keeping.** The
+first instinct was to do only the LOCAL half of the collect — swap `local_free`
+into `free`, touch no atomic. It measured **worse** (0.67-0.77x): `free`,
+`local_free` and `xthread_free` are adjacent fields of a `#[repr(C)]` `Page`,
+so they share a cache line. Reading *any* of them pulls the line the remote
+thread is invalidating. There is no version of "peek the queue front" that is
+cheap while another core is freeing into that page — which is the mechanism the
+2026-08-21 note observed the effect of without naming.
 
-**Getting to that answer needed a better instrument, and that is the durable
-part.** The first two A/B attempts produced orderings that disagreed in SIGN,
-because the harness measured one module to completion and then the other, so any
-drift — another process waking, a thermal step, the scheduler — landed entirely
-on one arm. `bench/wasm-speed/run.mjs` now **interleaves** the arms within each
-repeat and takes the per-arm minimum, which cancels drift slower than one repeat
-and is what made a 7 % effect resolvable at all. Both orders then agreed on both
-sign and magnitude.
+**Not tried, and the shape a next attempt should take:** a sticky per-heap
+"this heap has received a cross-thread free" flag, set when a collect steals a
+non-empty chain, with the retry gated on it being clear. A heap that never
+receives remote frees keeps the win; one that does never pays. It costs a
+`bool` load on the retry path and needs `page_collect` to report whether it
+stole — worth building only with the contended harness in hand from the start.
+
+**Two harnesses, one lesson.** The first version of the contention benchmark
+handed blocks over an SPSC ring and timed the producer loop; at ~113 ns/op it
+was timing the ring's spin, not the allocator, and its numbers wandered (a
+1.37x outlier beside two 0.95x). Removing the handshake from the timed path is
+what made the effect readable.
 
 ## 7. The gate
 
