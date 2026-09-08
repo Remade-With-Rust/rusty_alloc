@@ -72,6 +72,18 @@ features, which is the overwhelming majority.
 
 ### Performance
 
+- **wasm modules are 8,180 bytes smaller (3,700 gzipped).** The option
+  environment pass ran on `wasm32-unknown-unknown`, where `std::env::var` is a
+  stub that always fails: 38 iterations formatting 76 strings and allocating 76
+  `String`s at startup, to read an environment that cannot exist. It also made
+  `options::get` the largest function in a wasm build at 3,708 bytes and dragged
+  `str::to_uppercase`, `alloc::fmt::format` and the `OPTION_NAMES` table in with
+  it. Measured against the Rust default allocator on a minimal consumer, the
+  allocator's gzipped overhead falls from +7,760 to +4,060 bytes.
+- `options::error` renders its code into a stack buffer instead of `format!`,
+  and `out_fmt` writes bytes instead of `eprint!`. Worth ~0 on wasm (measured),
+  but it removes an allocation from an error path and gives `no_std` back the
+  message it used to lose.
 - **On an ESP32-S3, 2.06-3.73x faster than `esp-alloc`** across four
   allocate/free workloads, measured with a subtracted harness floor and
   checksums proving work parity (`docs/plans/small-metal.md` §2.15).

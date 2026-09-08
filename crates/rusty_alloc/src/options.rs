@@ -302,7 +302,21 @@ fn ensure_init() {
     for i in 0..OPTION_COUNT {
         VALUES[i].store(DEFAULTS[i], Ordering::Release);
     }
-    #[cfg(feature = "std")]
+    // ...and neither has `wasm32-unknown-unknown`. `std::env::var` there is a
+    // stub that always fails, so this loop formatted 76 strings, allocated 76
+    // `String`s and read an environment that cannot exist — on every startup,
+    // to find nothing. It also dragged `core::fmt`, `alloc::fmt::format` and
+    // `str::to_uppercase` into a module that otherwise needs none of them:
+    // `options::get` was the LARGEST function in a wasm build at 3,708 bytes,
+    // ahead of anything in the allocator proper. Same deletion as the `no_std`
+    // arm above, for the same reason — there is nothing to read.
+    //
+    // `target_os = "unknown"` and not `target_arch` alone: wasm32-wasip1 does
+    // have an environment and keeps the pass.
+    #[cfg(all(
+        feature = "std",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     for i in 0..OPTION_COUNT {
         let name = OPTION_NAMES[i].to_uppercase();
         let val = std::env::var(std::format!("RUSTY_ALLOC_{name}"))
@@ -461,8 +475,15 @@ pub fn register_deferred_free(f: Option<DeferredFreeFun>, arg: *mut c_void) {
 pub fn out_fmt(msg: &str) {
     let (f, a) = OUTPUT_FUN.load();
     if f.is_null() {
+        // `write_all`, not `eprint!`. The macro formats, and formatting is not
+        // free: `core::fmt`, `Display for str` and `Display for u64` are ~2.5 KiB
+        // of wasm that this one interpolation of an ALREADY-`&str` argument
+        // pulled into every build. Bytes to a writer need none of it.
         #[cfg(feature = "std")]
-        std::eprint!("{msg}");
+        {
+            use std::io::Write;
+            let _ = std::io::stderr().write_all(msg.as_bytes());
+        }
         return;
     }
     // NUL-terminate on the stack for the C hook (bounded copy).
@@ -478,21 +499,47 @@ pub fn out_fmt(msg: &str) {
     }
 }
 
-/// Report an error code through the hook (else stderr when show_errors).
-pub fn error(err: i32) {
-    let (f, a) = ERROR_FUN.load();
-    if !f.is_null() {
-        // SAFETY: registered with the documented signature.
-        unsafe {
-            let fun: ErrorFun = core::mem::transmute::<*mut c_void, ErrorFun>(f);
-            fun(err, a);
-        }
-    } else if is_enabled(0) {
-        // The error CODE still reaches a registered hook above; only the
-        // human-readable fallback needs a formatter (P3, §2.5).
-        #[cfg(feature = "std")]
-        out_fmt(&std::format!("rusty_alloc: error {err}\n"));
+/// `"rusty_alloc: error <n>\n"` into `buf`, without a formatter.
+///
+/// Hand-rendered because `format!` on a single integer is what dragged
+/// `core::fmt` into every build; see [`error`]. The buffer is sized for the
+/// prefix plus the longest `i32` (`-2147483648`) plus the newline.
+fn render_error(buf: &mut [u8; 32], err: i32) -> &str {
+    const PREFIX: &[u8] = b"rusty_alloc: error ";
+    buf[..PREFIX.len()].copy_from_slice(PREFIX);
+    let mut n = PREFIX.len();
+    if err < 0 {
+        buf[n] = b'-';
+        n += 1;
     }
+    // `unsigned_abs`: negating `i32::MIN` overflows, and this path must not
+    // panic -- it is what runs when something has already gone wrong.
+    let mut v = err.unsigned_abs();
+    let mut digits = [0u8; 10];
+    let mut d = 0;
+    loop {
+        digits[d] = b'0' + (v % 10) as u8;
+        d += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    while d > 0 {
+        d -= 1;
+        buf[n] = digits[d];
+        n += 1;
+    }
+    buf[n] = b'\n';
+    n += 1;
+    // `from_utf8`, not `from_utf8_unchecked`: every byte above is ASCII by
+    // construction, so this cannot fail -- but validating 30 bytes on a path
+    // that only runs when something has already gone wrong is cheaper than
+    // adding an `unsafe` to the census for it.
+    core::str::from_utf8(&buf[..n]).unwrap_or(
+        "rusty_alloc: error
+",
+    )
 }
 
 /// Fire the deferred-free hook (called from the allocation heartbeat).
@@ -525,5 +572,48 @@ fn fire_deferred(force: bool) {
             let fun: DeferredFreeFun = core::mem::transmute::<*mut c_void, DeferredFreeFun>(f);
             fun(force, hb, a);
         }
+    }
+}
+
+/// Report an error code through the hook (else stderr when show_errors).
+pub fn error(err: i32) {
+    let (f, a) = ERROR_FUN.load();
+    if !f.is_null() {
+        // SAFETY: registered with the documented signature.
+        unsafe {
+            let fun: ErrorFun = core::mem::transmute::<*mut c_void, ErrorFun>(f);
+            fun(err, a);
+        }
+    } else if is_enabled(0) {
+        // Rendered into a stack buffer rather than `format!`. The error code is
+        // one integer; paying `core::fmt` plus an allocation for it linked the
+        // whole formatting machinery into a wasm module that never reports an
+        // error. It also means this fallback no longer needs `std`, so a
+        // firmware gets back the message P3 had to delete.
+        let mut buf = [0u8; 32];
+        out_fmt(render_error(&mut buf, err));
+    }
+}
+
+#[cfg(test)]
+mod render_error_tests {
+    use super::render_error;
+
+    /// Including the value that makes a naive `-err` overflow.
+    #[test]
+    fn renders_every_shape_without_a_formatter() {
+        let mut b = [0u8; 32];
+        assert_eq!(render_error(&mut b, 0), "rusty_alloc: error 0\n");
+        assert_eq!(render_error(&mut b, 7), "rusty_alloc: error 7\n");
+        assert_eq!(render_error(&mut b, 12345), "rusty_alloc: error 12345\n");
+        assert_eq!(render_error(&mut b, -1), "rusty_alloc: error -1\n");
+        assert_eq!(
+            render_error(&mut b, i32::MAX),
+            "rusty_alloc: error 2147483647\n"
+        );
+        assert_eq!(
+            render_error(&mut b, i32::MIN),
+            "rusty_alloc: error -2147483648\n"
+        );
     }
 }
