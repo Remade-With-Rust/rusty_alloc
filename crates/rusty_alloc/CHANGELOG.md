@@ -72,6 +72,12 @@ features, which is the overwhelming majority.
 
 ### Performance
 
+- Medium allocations (above `SMALL_SIZE_MAX`, up to `MEDIUM_OBJ_SIZE_MAX`)
+  collect-and-retry the bin queue front before the slow-path heartbeat.
+  Through `GlobalAlloc` those sizes reach `malloc_generic` on **1.000** of
+  their calls -- routing, not list state -- so the saving lands on every one
+  of them: **+15 % on a 2 KiB tight alloc/free loop**, with no measurable
+  effect on 32 B, churn or batched. Host instruction counts pending.
 - **On wasm, 4.9-7.3x faster than the Rust default allocator on a churn workload**
   (64 live blocks, random 8-512 B), measured in node with a subtracted harness
   floor and checksums proving work parity. A tight 2 KiB same-size loop is

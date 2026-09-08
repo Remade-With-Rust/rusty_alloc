@@ -118,6 +118,19 @@ pub extern "C" fn bench(kind: u32, iters: u32) -> u32 {
 pub extern "C" fn generic_trips() -> u32 {
     rusty_alloc::alloc::stats().generic as u32
 }
+
+/// Page carves, so "why does this size re-enter the slow path" can be answered
+/// with the counter rather than a story about it.
+#[cfg(feature = "ra")]
+#[no_mangle]
+pub extern "C" fn extends() -> u32 {
+    rusty_alloc::alloc::stats().extends as u32
+}
+#[cfg(feature = "ra")]
+#[no_mangle]
+pub extern "C" fn pages_fresh() -> u32 {
+    rusty_alloc::alloc::stats().pages_fresh as u32
+}
 #[cfg(not(feature = "ra"))]
 #[no_mangle]
 pub extern "C" fn generic_trips() -> u32 {

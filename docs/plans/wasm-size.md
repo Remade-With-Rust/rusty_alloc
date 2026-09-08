@@ -205,10 +205,44 @@ It works, and it is still not worth it:
 | **32 B tight loop** | **~3-4 % SLOWER** |
 | churn, batched | orders disagree — noise |
 
-**Reverted.** 32 B is the commonest allocation there is, and 7 % does not flip
-the row it helps: 2 KiB still loses to dlmalloc. Paying the hottest path to
-narrow a microbenchmark that stays lost is the wrong trade, and the native
-instruction-count cost cannot be measured from a Windows box anyway.
+**Reverted in that form** -- 32 B is the commonest allocation there is, and
+paying the hottest path to narrow a microbenchmark that stays lost is the wrong
+trade.
+
+### Then GATED, which turned the trade into a win (2026-09-08)
+
+A change with a `+` and a `-` outcome is an invitation to look for the predicate
+that separates them, not a trade to accept. Here the predicate was already in
+the counters: `2 KiB` reaches `malloc_generic` on **1.000** of its calls and
+32 B on **0.008**.
+
+That ratio is not list state, which is what the first two explanations assumed.
+It is ROUTING. `alloc::malloc` serves `size <= SMALL_SIZE_MAX` from the direct
+table and tail-calls `malloc_slow`, which goes straight to `malloc_generic`;
+`Heap::malloc`'s medium branch is on a different entry point and is never
+reached through `GlobalAlloc`. So every medium allocation arrives at the slow
+path by construction, and small ones almost never do -- which is exactly why the
+ungated version helped one and taxed the other.
+
+Gated to `size > SMALL_SIZE_MAX && size <= MEDIUM_OBJ_SIZE_MAX`:
+
+| workload | ungated | **band-gated** |
+|---|---|---|
+| 2048 B tight loop | +7 % | **+15 %** |
+| 32 B tight loop | **-3 to -4 %** | **no effect** |
+| churn, batched | noise | no effect |
+
+Three passes in each order, interleaved. The band also excludes the `big`/`large`
+sizes the 2026-08-21 experiment regressed by +25 Ir/op, and it is bigger than the
+ungated win because the check no longer runs on calls that cannot use it.
+
+**The row still loses**: 2 KiB against dlmalloc goes from ~0.65x to ~0.72x. This
+narrows the gap, it does not close it, and it is kept on the strength of costing
+nothing measurable elsewhere rather than on winning that row.
+
+**Unverified on native.** The band is the same routing on every target, so the
+win should carry, but instruction counts cannot be taken from a Windows box --
+the scheduled `icount` job is what confirms or refutes it before a release.
 
 **Getting to that answer needed a better instrument, and that is the durable
 part.** The first two A/B attempts produced orderings that disagreed in SIGN,

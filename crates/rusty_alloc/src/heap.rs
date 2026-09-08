@@ -440,6 +440,50 @@ impl Heap {
         {
             return r;
         }
+        // COLLECT-AND-RETRY, for the MEDIUM BAND ONLY, ahead of the heartbeat.
+        //
+        // `alloc::malloc` serves `size <= SMALL_SIZE_MAX` from the direct table
+        // and tail-calls `malloc_slow` for everything else, which goes straight
+        // here. `Heap::malloc`'s medium branch is on a different entry point, so
+        // through `GlobalAlloc` a medium allocation reaches this function on
+        // EVERY call -- measured at 1.000 generic trips per op for 2 KiB against
+        // 0.008 for 32 B. That is routing, not list state.
+        //
+        // Distinct from the peek `malloc_in_bin` documents as refuted: that read
+        // the queue front's `free` list and gave up, and a tight alloc/free loop
+        // frees onto `local_free`, so `free` is permanently dry and the peek
+        // could never hit. The collect is what makes it hit -- the same
+        // `local_free` -> `free` swap `malloc_generic_walk` performs a few lines
+        // later, done before the preamble instead of after it, and cheap
+        // (`page_collect` is a local list swap plus one acquire load, and peeks
+        // before entering its exchange loop).
+        //
+        // **The band is the point.** Applied to every binned size this was
+        // +7 % on a 2 KiB tight loop and -3 to -4 % on 32 B, in both interleaved
+        // orders -- a bad trade, because 32 B is the commonest allocation there
+        // is and it reaches this function on 8 calls in a thousand, so it pays
+        // the check and almost never collects. Restricting it to the band that
+        // arrives here unconditionally keeps the win and removes the payer.
+        // `> SMALL_SIZE_MAX` also excludes the `big`/`large` sizes the refuted
+        // experiment regressed by +25 Ir/op.
+        if size > SMALL_SIZE_MAX && size <= MEDIUM_OBJ_SIZE_MAX {
+            let bin = bins::bin(size);
+            let p = self.pages[bin].first;
+            if !p.is_null() {
+                // SAFETY: queue members are live pages of this heap, we are the
+                // owner thread, and `page_collect` is the same operation the
+                // walk below performs on this page.
+                let b = unsafe {
+                    crate::page::page_collect(p);
+                    page_pop(p)
+                };
+                if !b.is_null() {
+                    self.stat_alloc();
+                    // SAFETY: p live per above.
+                    return (b, unsafe { (*p).free_is_zero });
+                }
+            }
+        }
         // Heartbeat: process cross-thread delayed frees at slow-path cadence
         // (this is what un-parks full pages whose blocks died remotely), and
         // fire the registered deferred-free hook (mi_register_deferred_free).
