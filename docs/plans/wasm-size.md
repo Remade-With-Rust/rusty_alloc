@@ -288,8 +288,42 @@ left the retry off for every case after it, so the win read as 1.00x until the
 latch was reset between timed runs. An instrument sometimes has to know about
 the mechanism it is measuring.
 
-**Still unmeasured:** host instruction counts under callgrind, and any workload
-with more than one consumer thread. The scheduled `icount` job covers the first.
+### Validated on every platform that can run it (2026-09-08)
+
+The retry was measured on native Windows and reasoned about everywhere else, so
+it was run everywhere else. **The same one workload shape moves on all three
+targets, and nothing else moves anywhere.**
+
+| target | 2 KiB tight alloc/free | every other row |
+|---|---|---|
+| native x86-64 (Windows) | **+14-16 %** (1.08-1.23, 7 runs) | no effect |
+| wasm32 in V8 (node) | **+1-16 %** (1.01-1.16, 4 runs, both orders) | no effect |
+| Xtensa ESP32-S3, `no_std`, small profile | **+15 %** (1,380 -> 1,200 ns/op) | within 1-2 % |
+
+The board is the cleanest of the three: its harness reports 0-1 % spread, and on
+the small profile `SMALL_SIZE_MAX` is 512 B, so the other three rows (32 B, a
+mixed batch of 8-512 B, and churn over 8-511 B) are all BELOW the band and the
+retry provably cannot touch them. Their 1-2 % movement is layout, not effect.
+
+**"A win across the board" is the wrong phrase for it.** It is a win on one
+workload shape -- medium sizes cycled through a tight alloc/free loop -- that
+happens to hold on every target. Everything else is unchanged, and the contended
+case is neutral rather than better.
+
+**Correctness, all green on the same build:** 109 tests / 33 suites default,
+90 / 19 at the small profile, clippy `-D warnings` on default / small profile /
+`no_std`, `riscv32imac` and `riscv32imafc` at both geometries, `rusty_alloc-api`
+`no_std`, the wasm self-test's waste gate inside a real VM, and on hardware both
+the 68 KiB footprint kill test (`used` 69,632, `PEAK` 4,914 -- unchanged) and
+the eight-test stress battery (capacity flat at 240, same passes, churn nulls
+458 against a 334-575 range already seen). Plus the three ratchets: unsafe
+census, gate selftest 5/5, wasm size.
+
+**Still not covered, and worth saying plainly:** host INSTRUCTION counts under
+callgrind, which is the instrument the README's figures use and which no
+Windows box can run -- the scheduled `icount` job is the gate for that -- and
+contention with more than one consumer thread.
+
 
 
 **Two harnesses, one lesson.** The first version of the contention benchmark

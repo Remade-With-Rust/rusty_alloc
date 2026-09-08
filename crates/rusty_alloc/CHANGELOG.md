@@ -80,8 +80,10 @@ features, which is the overwhelming majority.
   their own blocks). The retry **turns itself off per heap** once that heap is
   seen receiving cross-thread frees: `free`, `local_free` and `xthread_free` are
   adjacent in a `#[repr(C)]` `Page`, so peeking a page another core is freeing
-  into costs 20-30 %, and no variant of the peek avoids it. Host instruction
-  counts still pending.
+  into costs 20-30 %, and no variant of the peek avoids it. Measured on all
+  three targets that can run it: **+14-16 % native x86-64, +1-16 % wasm32 in
+  V8, +15 % on an ESP32-S3** (`no_std`, small profile), with every other
+  workload unchanged. Host INSTRUCTION counts under callgrind still pending.
 - **On wasm, 4.9-7.3x faster than the Rust default allocator on a churn workload**
   (64 live blocks, random 8-512 B), measured in node with a subtracted harness
   floor and checksums proving work parity. A tight 2 KiB same-size loop is
