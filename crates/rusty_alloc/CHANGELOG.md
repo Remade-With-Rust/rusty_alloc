@@ -19,7 +19,11 @@ features, which is the overwhelming majority.
   default and got the full crate. It now selects the single-heap `no_std`
   profile, which additionally refuses to compile without
   `--cfg ra_single_threaded`. If you set `default-features = false` and want
-  what you had, set `features = ["std"]`.
+  what you had, set `features = ["std"]`. **Verified against the downstream
+  corpus** (`tools/corpus/`): `spacedb-sdk` (plain and `secure`),
+  `rusty_alloc_default` and `rusty_zstd` compile unchanged; `rusty_maplibre` is
+  broken by this and is fixed by adding `features = ["std"]` to both of its
+  `rusty_alloc` dependencies -- tested by applying it, not assumed.
 - **`heap::Heap` gained a field** (`generic_countdown`). Every field on it is
   `pub` and it is not `#[non_exhaustive]`, so a struct literal naming all
   fields no longer compiles. Nothing constructs a `Heap` that way in practice —
