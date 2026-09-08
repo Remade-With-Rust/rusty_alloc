@@ -95,7 +95,9 @@ pub fn process_info() -> (usize, usize, usize, usize, usize, usize, usize, usize
     {
         win_process_info()
     }
-    #[cfg(all(unix, not(miri)))]
+    // `feature = "std"`: `unix_process_info` reads `/proc/self/statm` through
+    // `std::fs`, so a `no_std` build on a unix host cannot take this arm.
+    #[cfg(all(unix, feature = "std", not(miri)))]
     {
         unix_process_info()
     }
@@ -110,7 +112,13 @@ pub fn process_info() -> (usize, usize, usize, usize, usize, usize, usize, usize
     #[cfg(any(
         miri,
         all(target_arch = "wasm32", not(miri)),
-        all(not(miri), not(windows), not(unix), not(target_arch = "wasm32"))
+        // Bare metal AND unix-without-`std`: no `/proc` reachable either way.
+        all(
+            not(miri),
+            not(windows),
+            not(target_arch = "wasm32"),
+            not(all(unix, feature = "std"))
+        )
     ))]
     {
         (0, 0, 0, 0, 0, 0, 0, 0)
@@ -152,7 +160,7 @@ fn win_process_info() -> (usize, usize, usize, usize, usize, usize, usize, usize
     }
 }
 
-#[cfg(all(unix, not(miri)))]
+#[cfg(all(unix, feature = "std", not(miri)))]
 fn unix_process_info() -> (usize, usize, usize, usize, usize, usize, usize, usize) {
     // SAFETY: out-param is a valid local.
     unsafe {

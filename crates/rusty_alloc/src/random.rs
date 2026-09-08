@@ -186,7 +186,12 @@ fn os_entropy(key: &mut [u32; 8]) -> bool {
     status == 0
 }
 
-#[cfg(all(unix, not(miri)))]
+// `feature = "std"`, not just `unix`: `/dev/urandom` is reached through
+// `std::fs`, so a `no_std` build on a unix HOST — which is what CI's `no_std`
+// clippy step is — matched this arm and failed to resolve `std`. The fifth case
+// again (P0 in `prim/mod.rs`, P3 here, P5 in `stats.rs`): a platform selection
+// written when `std` was unconditional.
+#[cfg(all(unix, feature = "std", not(miri)))]
 fn os_entropy(key: &mut [u32; 8]) -> bool {
     // /dev/urandom: universally available and needs no libc feature probing.
     use std::io::Read;
@@ -218,7 +223,14 @@ fn os_entropy(_key: &mut [u32; 8]) -> bool {
 /// wasm arm carries applies with more force: free-list encoding under `secure`
 /// is corruption DETECTION here, not an exploit-mitigation claim. A part with
 /// a hardware RNG should wire it through `prim` rather than weaken this.
-#[cfg(all(not(miri), not(windows), not(unix), not(target_arch = "wasm32")))]
+#[cfg(all(
+    not(miri),
+    not(windows),
+    not(target_arch = "wasm32"),
+    // Bare metal, AND unix-without-`std`: both reach here because neither can
+    // open `/dev/urandom`.
+    not(all(unix, feature = "std"))
+))]
 fn os_entropy(_key: &mut [u32; 8]) -> bool {
     false
 }

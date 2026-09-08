@@ -10,6 +10,10 @@ targets = [
     # C6/C61/H2 firmwares use. Added to collect the error list, not because the
     # crate builds for it.
     "riscv32imac-unknown-none-elf",
+    # The `imafc` variant the ESP32-P4 and the C6's HP core use. CI's `embedded`
+    # job builds both, and a target listed for the action but not here is one
+    # `rustup` will not have on a fresh machine.
+    "riscv32imafc-unknown-none-elf",
     # The crate has shipped a wasm backend and a wasm gate since 2026-08-06, but
     # the target was never listed here — so `wasm-gate` needed a manual
     # `rustup target add` on every fresh machine. P1 needed it to prove its new
