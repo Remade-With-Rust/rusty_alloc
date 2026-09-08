@@ -24,8 +24,17 @@ readme = "README.md"
 # mimalloc's `mi_deferred_free_fun`. Narrowing either breaks a contract, and
 # hand-rolling a 64-bit atomic out of two 32-bit halves inside an allocator is
 # exactly the kind of thing that produces a subtle bug.
+#
+# `optional`, and enabled by `std` rather than by the target alone. The use site
+# is gated `all(not(target_has_atomic = "64"), feature = "std")` -- a `no_std`
+# build uses `options::split64` instead -- so a firmware was fetching and
+# compiling a crate it then discarded at link time. Zero bytes on the device
+# either way (verified: after `split64` landed, `portable_atomic` symbols in a
+# shipped ESP32 image went to zero and its 4,288-byte `LOCKS` table left the
+# symbol map), but an unused crate still shows up in an SBOM, a `cargo audit`
+# and every dependency count a firmware reviewer looks at.
 [target.'cfg(not(target_has_atomic = "64"))'.dependencies]
-portable-atomic = { version = "1", default-features = false, features = ["fallback"] }
+portable-atomic = { version = "1", default-features = false, features = ["fallback"], optional = true }
 
 [features]
 # `std` is DEFAULT and additive — unlike the geometry `--cfg` (P2), which is
@@ -35,7 +44,12 @@ portable-atomic = { version = "1", default-features = false, features = ["fallba
 # single-heap profile: no `thread_local!`, no environment, no `process::abort`
 # (see `lib.rs`). P3 of docs/plans/small-metal.md.
 default = ["std"]
-std = []
+# Pulls `portable-atomic` ONLY where it is actually reachable: a target without
+# 64-bit atomics that also has `std`. On every other target the dependency is
+# not in the graph at all -- the `dep:` reference resolves against a
+# target-gated declaration, so it simply does not apply where the target section
+# does not match.
+std = ["dep:portable-atomic"]
 # Full invariant checking: list walks, canaries, double-free detection (our `dmi`).
 debug_checks = []
 # Feature-gated rdtsc path profiler (§7.5 of the plan). OFF = byte-identical build.
