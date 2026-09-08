@@ -242,11 +242,11 @@ producer's own pages with no handshake anywhere in the timed loop.
 | **producer alloc, consumer freeing its pages** | ~51-75 ns | ~71-77 ns | **0.67-1.00x** |
 | same, single-threaded control | ~21-32 ns | ~24-32 ns | no effect |
 
-Never better, usually 15-33 % worse, across two harnesses and eight runs.
-**Reverted.** Cross-thread frees are the producer/consumer shape — thread
-pools, channels, async runtimes — and mimalloc's architecture exists to serve
-them. A 15-19 % gain on a single-threaded tight loop does not buy a 20-30 %
-loss there.
+Never better, usually 15-33 % worse, across two harnesses and eight runs. That
+killed the UNCONDITIONAL form: cross-thread frees are the producer/consumer
+shape (thread pools, channels, async runtimes) and mimalloc exists to serve
+them. A gain on a single-threaded tight loop does not buy a 20-30 % loss
+there. What survived is the gated form below.
 
 **The obvious fix does not work, and that is the finding worth keeping.** The
 first instinct was to do only the LOCAL half of the collect — swap `local_free`
@@ -257,12 +257,40 @@ thread is invalidating. There is no version of "peek the queue front" that is
 cheap while another core is freeing into that page — which is the mechanism the
 2026-08-21 note observed the effect of without naming.
 
-**Not tried, and the shape a next attempt should take:** a sticky per-heap
-"this heap has received a cross-thread free" flag, set when a collect steals a
-non-empty chain, with the retry gated on it being clear. A heap that never
-receives remote frees keeps the win; one that does never pays. It costs a
-`bool` load on the retry path and needs `page_collect` to report whether it
-stole — worth building only with the contended harness in hand from the start.
+### The predicate that works: ask the HEAP, not the thread count
+
+Built, because the contended harness was already in hand. `page_collect` now
+reports whether it stole a cross-thread chain, and any steal this heap observes
+latches a sticky `saw_remote_free`; the retry runs only while it is clear.
+
+**The predicate is not "is this program single-threaded".** It is "does THIS
+heap receive remote frees", which is finer and more useful: a worker that owns
+its allocations keeps the win however many threads the process has.
+
+| workload | before the latch | with the latch |
+|---|---|---|
+| tight 2 KiB loop, 1 thread | +15-19 % | **+14-16 %** (1.08-1.23, seven runs) |
+| tight 2 KiB loop, 2 threads, each freeing its own | not measured | **+12-26 %** |
+| producer alloc / consumer freeing its pages | **-20 to -33 %** | **neutral** (0.84-1.15) |
+
+The contended row straddles 1.0 with wide variance, so the claim is that the
+regression is gone, not that contention got faster.
+
+**Latching on the retry's own steal was not enough**, and a second measurement
+is what found it: the frees that hurt land on OTHER pages of the same heap, so
+the page being retried never sees them and the retry never switched itself off.
+The latch is set from `malloc_generic_walk`'s collects as well, which is where
+those pages are actually reached.
+
+**And the harness had to be told about the latch.** Sticky is correct in
+production and useless in an A/B: the contended case ran first in warmup and
+left the retry off for every case after it, so the win read as 1.00x until the
+latch was reset between timed runs. An instrument sometimes has to know about
+the mechanism it is measuring.
+
+**Still unmeasured:** host instruction counts under callgrind, and any workload
+with more than one consumer thread. The scheduled `icount` job covers the first.
+
 
 **Two harnesses, one lesson.** The first version of the contention benchmark
 handed blocks over an SPSC ring and timed the producer loop; at ~113 ns/op it

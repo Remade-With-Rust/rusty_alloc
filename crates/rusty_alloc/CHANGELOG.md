@@ -72,6 +72,16 @@ features, which is the overwhelming majority.
 
 ### Performance
 
+- Medium allocations (above `SMALL_SIZE_MAX`, up to `MEDIUM_OBJ_SIZE_MAX`)
+  collect-and-retry the bin queue front before the slow-path heartbeat. Through
+  `GlobalAlloc` those sizes reach `malloc_generic` on **1.000** of their calls,
+  so the saving lands on every one: **+14-16 % on a 2 KiB tight alloc/free
+  loop**, and it survives multithreading (+12-26 % with two threads each freeing
+  their own blocks). The retry **turns itself off per heap** once that heap is
+  seen receiving cross-thread frees: `free`, `local_free` and `xthread_free` are
+  adjacent in a `#[repr(C)]` `Page`, so peeking a page another core is freeing
+  into costs 20-30 %, and no variant of the peek avoids it. Host instruction
+  counts still pending.
 - **On wasm, 4.9-7.3x faster than the Rust default allocator on a churn workload**
   (64 live blocks, random 8-512 B), measured in node with a subtracted harness
   floor and checksums proving work parity. A tight 2 KiB same-size loop is
