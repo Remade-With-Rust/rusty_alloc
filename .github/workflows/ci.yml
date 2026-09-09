@@ -44,6 +44,19 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: check (no features)
         run: cargo check --workspace --all-targets
+      # Each optional feature ALONE. `--all-features` and the default are the
+      # only two points the steps above build, and a feature that only
+      # compiles beside another rots unseen: `linkcheck` without `secure` had
+      # a call with one argument too many for months (2026-09-09).
+      - name: clippy (each feature alone)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in secure linkcheck blockmap debug_checks; do
+            echo "::group::--features $f"
+            cargo clippy -p rusty_alloc --all-targets --features "$f" -- -D warnings
+            echo "::endgroup::"
+          done
       - name: test (all features)
         run: cargo test --workspace --all-features
 

@@ -242,12 +242,16 @@ pub unsafe fn block_next(page: *const Page, b: *const Block) -> *mut Block {
                 // would abort on every list tail. The `secure` arm gets this
                 // for free from its `enc == 0` early return; this arm has no
                 // such return and must say so.
-                // One u16 load and a shift: SEGMENT_SLICE_SIZE is 2^16, so LLVM
-                // turns this constant multiply into `shl 16`. The obvious
-                // `capacity * block_size` is two loads and a real multiply, and
-                // measured +5 Ir/op worse on small/batch.
-                let extent = (*page).slice_count as usize * crate::types::SEGMENT_SLICE_SIZE;
-                if !n.is_null() && !link_is_plausible(n.addr(), b.addr(), extent) {
+                //
+                // This arm DID NOT COMPILE from the day the page-extent
+                // narrowing was dropped (it still passed the extent as a third
+                // argument) until 2026-09-09: CI builds only the default and
+                // `--all-features`, and `linkcheck` without `secure` is
+                // neither. Found by a feature bisection of the `stress_mt`
+                // flake — 40/40 "failures" that were one rustc error. There
+                // is now a per-feature clippy step so a combination nobody
+                // runs cannot rot again.
+                if !n.is_null() && !link_is_plausible(n.addr(), b.addr()) {
                     corrupt_free_list_abort();
                 }
             }
@@ -744,6 +748,12 @@ pub(crate) fn corrupt_free_list_abort() -> ! {
 // workload where this function matters is one where every free reaches it, so
 // the call is paid every time AND the callee grows a frame of its own.
 pub unsafe fn remote_free(page: *mut Page, block: *mut Block) {
+    // Unreachable on a single-context build (`alloc::free` folds every free
+    // to local there); if it runs anyway, the single-thread assertion the
+    // target made was false.
+    if crate::ONE_THREAD {
+        unreachable!("a cross-thread free on a build that asserted a single thread");
+    }
     loop {
         // SAFETY: xthread_free/xheap are the designed cross-thread fields.
         let x = unsafe { (*page).xthread_free.load(Ordering::Acquire) };

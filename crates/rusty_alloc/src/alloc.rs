@@ -846,8 +846,12 @@ pub unsafe fn free_inline(p: *mut u8) {
         // compare can take `fs:0` as its memory operand and be one. Rust
         // cannot express that — an `asm!` read must produce a register — so
         // the FUSED form is written where the branch is.
+        // `ONE_THREAD` first: on a single-context build the owner can only be
+        // this thread, the compare folds to `true`, and the remote arm below
+        // -- `remote_free` and everything it reaches -- is dropped by the
+        // linker. On every other target this is the compare it always was.
         #[cfg(not(all(target_arch = "x86_64", target_os = "linux", not(miri))))]
-        let local = owner_tid == init::thread_id();
+        let local = crate::ONE_THREAD || owner_tid == init::thread_id();
         // ONE page resolution, then ONE flags byte answers every question the
         // free path used to ask with separate loads (M9 brick #3): huge-vs-
         // normal segment, single-block span, interior (aligned-at) pointer.
@@ -1152,7 +1156,7 @@ unsafe fn free_general(p: *mut u8, seg: *mut Segment, pg: *mut Page, owner_tid: 
             (*owner_heap(pg)).free_local_at(seg, pg, block);
         }
         #[cfg(not(all(target_arch = "x86_64", target_os = "linux", not(miri))))]
-        if owner_tid == init::thread_id() {
+        if crate::ONE_THREAD || owner_tid == init::thread_id() {
             // Hand the already-resolved segment through (M9 brick #2).
             (*owner_heap(pg)).free_local_at(seg, pg, block);
         } else {

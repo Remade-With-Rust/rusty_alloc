@@ -121,6 +121,17 @@ roughly fixed, so it amortises as the working set grows. Reach for `esp-alloc`
 when the budget is tight, and for this when throughput or fragmentation under
 churn is what hurts.
 
+**It also costs flash and static RAM, measured on the linked ELF of one
+firmware built both ways:** about **+7.9 KB of flash** (halved in this release
+— `ra_single_threaded` now prunes the cross-thread machinery a single context
+can never reach, and guarded sampling no longer ships on a chip with no MMU)
+and **+3.1 KB of static RAM**, which the linker takes **straight out of the
+stack**: `.stack` shrank by exactly `Δ.bss + Δ.data`. A firmware near its stack
+limit gets an overflow, not a bigger binary, and nothing in the build says so.
+Flash is a fixed cost that stops mattering as the firmware grows; the heap
+floor scales with the size classes touched and does not. Decomposition and
+levers: `docs/plans/finished/firmware-code-size.md` in the repository.
+
 ## Usage
 
 This crate is the allocator core. For the ergonomic Rust surface

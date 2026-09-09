@@ -546,13 +546,21 @@ pub fn create_heap(tag: i32, allow_destroy: bool, arena_id: i32) -> *mut HeapBox
         (*(*hb).heap.get()).delayed = &raw const (*hb).delayed;
         (*(*hb).heap.get()).arena_id = arena_id;
         (*(*hb).heap.get()).tag = tag;
-        // Per-heap CSPRNG stream (free-list keys, guarded sampling).
-        (*(*hb).heap.get()).rng.reseed();
-        // Guarded objects follow the option table (MI_GUARDED-equivalent).
+        // Per-heap CSPRNG stream (free-list keys, guarded sampling) -- seeded
+        // only where something draws from it. A build with neither `secure`
+        // nor guard pages has no consumer, and seeding still cost the ChaCha
+        // block function plus the splitmix fallback in flash.
+        if crate::RNG_USED {
+            (*(*hb).heap.get()).rng.reseed();
+        }
+        // Guarded objects follow the option table (MI_GUARDED-equivalent) --
+        // where a guard page can exist at all. `GUARD_PAGES` first, so that on
+        // a target without one the option reads fold away with the sampler
+        // (`docs/plans/finished/firmware-code-size.md`, lever 3).
         let rate = crate::options::get(33).max(0) as usize; // guarded_sample_rate
         let gmin = crate::options::get(30).max(0) as usize; // guarded_min
         let gmax = crate::options::get(31).max(0) as usize; // guarded_max
-        if gmax > 0 {
+        if crate::GUARD_PAGES && gmax > 0 {
             (*(*hb).heap.get()).guarded_set_size_bound(gmin, gmax);
             (*(*hb).heap.get())
                 .guarded_set_sample_rate(rate, crate::options::get(34).max(0) as usize);
@@ -572,7 +580,14 @@ fn init_thread_heap() -> *mut HeapBox {
     }
     heap_tls::set(hb);
     BACKING_PTR.with(|c| c.set(hb));
-    done_slot().set(hb.cast::<c_void>());
+    // The exit hook exists to abandon this heap when its thread ENDS. On a
+    // single-context build no thread ends, the backend's TLS never runs a
+    // destructor anyway (`prim::fixed::tls_new` discards it), and creating
+    // the slot was a compare-and-swap, a spin and a table entry paid once for
+    // nothing (`docs/plans/finished/firmware-code-size.md`, lever 2).
+    if !crate::ONE_THREAD {
+        done_slot().set(hb.cast::<c_void>());
+    }
     hb
 }
 
@@ -1020,6 +1035,13 @@ fn abandoned_unlock() {
 /// the teardown path, where the `SUBPROC` thread-local may already be gone (see
 /// `HeapBox::subproc`). The owning heap box carries the tag instead.
 fn abandoned_push(seg: *mut Segment, sp: usize) {
+    // The correctness argument behind `abandoned_pop`'s early return: if this
+    // ever runs on a single-context build, a thread ended, and the target's
+    // single-thread assertion was false all along. Worth knowing for its own
+    // sake -- `SingleThreadCell` and `prim::fixed` rest on the same claim.
+    if crate::ONE_THREAD {
+        unreachable!("a segment was abandoned on a build that asserted a single thread");
+    }
     debug_assert!(sp < MAX_SUBPROCS);
     // PURGE BEFORE ORPHANING (`abandoned_page_purge`, on by default). Until
     // some other thread adopts this segment it has no owner, so every page it
@@ -1044,6 +1066,18 @@ fn abandoned_push(seg: *mut Segment, sp: usize) {
 /// Pop one abandoned segment from the CALLER's subprocess and take ownership.
 /// Returns null when none are available.
 pub fn abandoned_pop() -> *mut Segment {
+    // A single-context build has nothing to pop, by construction: a segment is
+    // only ever abandoned by a thread that ENDS (`thread_done`), and the
+    // target has asserted there is exactly one thread for the life of the
+    // program. Folding this to null is what makes `adopt_segment` unreachable
+    // from the allocation path, so the linker drops it -- 1,154 bytes on an
+    // ESP32-S3 that could never have run (`docs/plans/finished/firmware-code-size.md`,
+    // lever 1). `heap_delete` still calls it directly, and a firmware that
+    // deletes first-class heaps keeps it; that is a real path, not a
+    // cross-thread one.
+    if crate::ONE_THREAD {
+        return ptr::null_mut();
+    }
     let sp = my_subproc();
     if ABANDONED_HEADS[sp].load(Ordering::Acquire).is_null() {
         return ptr::null_mut(); // fast no-lock exit for the common case

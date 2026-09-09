@@ -214,6 +214,12 @@ what you want to set**, because refusing early is a diagnosis, not a fix.
 non-additive. Two crates in one graph cannot disagree about `SEGMENT_SIZE` the
 way they can harmlessly disagree about `std`.
 
+`ra_single_threaded` is more than a build permit. On a bare-metal target it is
+also what lets the linker drop everything that only a second thread could ever
+reach — abandon, adopt, the delayed-free list, the thread-exit hook — and on
+`wasm32-unknown-unknown` without the atomics feature the same pruning happens
+without any flag at all, because that target has one thread by construction.
+
 ### Throughput — 2.0x to 3.7x faster
 
 Nanoseconds per allocate/free pair, lower is better:
@@ -262,7 +268,35 @@ in a medium page.
 |---|---:|---:|
 | smallest heap that runs the same workload | **8 KiB** | 68 KiB *(needs `--cfg ra_small_profile`)* |
 | peak live bytes (identical, the parity check) | 4,914 | 4,914 |
-| app image | 116,032 B | 127,088 B (+9.5%) |
+| flash (`.text` + `.rodata` + `.data`), one firmware, two arms | — | **+7,860 B** |
+| static RAM (`.bss` + `.data`) | — | **+3,052 B** |
+
+**Flash and static RAM are two more budgets, and the second one is a
+hazard.** The rows above are from `size -A` on the linked ELF of one
+`esp-hal` firmware built twice, allocator selected by a feature and nothing
+else different. `+7,860 B` of flash is what is left after this release removed
+half of it: `ra_single_threaded` used to prune nothing, so the cross-thread
+machinery — abandoning a segment when a thread ends, adopting one back, the
+delayed list a remote free lands on — was linked into a target that had
+asserted a single context, and guarded-object sampling shipped on a chip with
+no MMU to protect a page. Both now fold away on any single-context target,
+which also took **10.7 %** off the gzipped wasm bundle.
+
+The static RAM comes **straight out of the stack**: the linker hands `.stack`
+whatever RAM is left, and in the measured firmware `.stack` shrank by exactly
+`Δ.bss + Δ.data`, to the byte. A firmware sitting near its stack limit does
+not get a bigger binary when it adopts `rusty_alloc` — it gets a stack
+overflow, and nothing in the build says so. Check `size -A` before and after.
+
+The two costs have different shapes, and a reader choosing an allocator wants
+both curves. **Flash is roughly fixed** — about 8 KB whether the firmware is
+240 KB (3.3 %) or 900 KB with a TLS stack in it (under 1 %), so it stops
+mattering as the firmware grows. **The 68 KiB heap floor does not** — it
+scales with the size classes a program touches, not with the program, so it
+matters exactly as much on a big firmware as on a small one. The full
+decomposition, the three levers taken and the one residue deliberately left
+(a 1.75 KB heap sentinel in `.data`) are in
+[`docs/plans/finished/firmware-code-size.md`](docs/plans/finished/firmware-code-size.md).
 
 **`esp-alloc` wins this by 8.5x, and the reason is structural rather than a
 missing optimisation.** A linked-list heap's floor is `bytes live + per-block

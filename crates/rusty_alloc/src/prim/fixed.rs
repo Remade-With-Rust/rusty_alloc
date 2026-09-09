@@ -811,13 +811,41 @@ mod tests {
                 "a refused request leaves the list untouched"
             );
 
-            // Nor can the ALIGNMENT be met — the half no larger region fixes.
+            // The ALIGNMENT half is decided by the region's ADDRESS, not its
+            // size: a region smaller than SEGMENT_SIZE still holds one
+            // SEGMENT_SIZE-aligned page whenever it straddles a boundary, and
+            // where BACKING lands is the loader's choice. The one-sided form
+            // of this check ("unsatisfiable in a region smaller than it")
+            // passed for days and then went red on CI on 2026-09-08 when ASLR
+            // put the window across a 32 MiB line -- a 1-in-64 chance per run
+            // at this N. So decide from the address, and demand the answer
+            // that follows from it either way.
+            let base = REGION_BASE.load(Ordering::Relaxed);
+            let boundary = align_up(base, SEGMENT_SIZE);
+            let straddles = boundary + FIXED_PAGE <= base + N;
             // SAFETY: prim contract, as above.
             let al = unsafe { alloc(FIXED_PAGE, SEGMENT_SIZE, true, false) };
-            assert!(
-                al.is_err(),
-                "SEGMENT_SIZE alignment is unsatisfiable in a region smaller than it"
-            );
+            if straddles {
+                let al = al.expect("the boundary is inside the region, so a page at it fits");
+                assert_eq!(
+                    al.ptr.expose_provenance(),
+                    boundary,
+                    "served AT the one SEGMENT_SIZE-aligned address the region has"
+                );
+                // SAFETY: `al` is live and unfreed.
+                unsafe { free(al.ptr, FIXED_PAGE).expect("free the aligned page") };
+                assert_eq!(free_total(), N, "and the list is whole again");
+            } else {
+                assert!(
+                    al.is_err(),
+                    "no SEGMENT_SIZE-aligned address lies inside this region"
+                );
+                assert_eq!(
+                    free_total(),
+                    N,
+                    "a refused request leaves the list untouched"
+                );
+            }
         } else {
             // The small profile: this is what P2 bought. A whole segment, at
             // segment alignment, served from a chip-sized region.

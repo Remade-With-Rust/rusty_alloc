@@ -95,6 +95,9 @@ blockmap = []
 # `guarded_set_*` calls and the heap keeps `guarded_rate: 0`. Enabling `secure`
 # alone therefore does NOT give you guard pages — set the `guarded_max` option
 # > 0, or call `guarded_set_sample_rate` / `mi_heap_guarded_set_sample_rate`.
+# And only where a page CAN be protected: `prim::fixed` (bare metal) and
+# `prim::wasm` have no MMU, so there the sampler is compiled out and the
+# setters leave it off rather than hand out unprotected "guarded" segments.
 #
 # Measured cost (2026-08-20, callgrind Ir, same binary both arms): a FLAT ~15
 # instructions per allocation — 8-25% per-op depending only on how cheap the op
