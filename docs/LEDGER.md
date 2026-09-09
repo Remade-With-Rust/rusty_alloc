@@ -4,6 +4,62 @@ One entry per milestone/brick: what landed, the numbers with their method lines,
 what was reverted and **which kind** of revert (measured-worse vs within-noise).
 Newest first.
 
+## FIRMWARE CODE SIZE — three levers, flash cost halved, wasm −10.7 % (2026-09-09)
+
+`docs/plans/finished/firmware-code-size.md` decomposed what the allocator adds
+to an `esp-hal` firmware (+16,584 B flash, +3,092 B static RAM) and ranked
+three levers. All three taken, each its own brick, each measured on the linked
+ELF before the next was written.
+
+**Rig.** `xiao-s3-probe` (Janus `rusty_esp_dsp/firmware/`) copied to a scratch
+directory with `[patch.crates-io]` pointing `rusty_alloc` and `rusty_alloc-api`
+at the working tree and the git seam patched to its local checkout, so the two
+arms of every A/B differ only in this branch. Method line:
+`board=xiao-esp32s3 target=xtensa-esp32s3-none-elf toolchain=esp opt-level=3
+lto=fat cgu=1 panic=abort cfg=ra_single_threaded+ra_small_profile
+metric=size-A+nm-S-on-linked-ELF arms=one-source-two-features`. The baseline
+reproduced the plan to the byte on `.text/.data/.bss/.stack` and the
+16,256 B / 57-symbol attribution; `.rodata` read 312 B lower because a path
+checkout's panic-location strings are ~45 B shorter than the registry's, seven
+files' worth.
+
+| brick | `.text` | flash | attributed | what left |
+|---|---:|---:|---:|---|
+| 1 `ONE_THREAD` (lever 1) | −3,208 | −3,328 | −3,152 | `adopt_segment` 1,154, `drain_delayed` 995 — the plan's 2,149 exactly — plus 325 off `malloc_generic_once`; four free-path fns inlined into `collect_inner`, net −649 |
+| 2 `GUARD_PAGES`/`RNG_USED` (lever 3) | −4,828 | −4,924 | −4,683 | `try_guarded` 1,641 + `Random::refill` 725 — the plan's 2,366 exactly — and `init_thread_heap` 2,740 → 1,119: the seeding was 1,621 of it |
+| 3 no exit hook on one context (lever 2) | −160 | −160 | −159 | `done_slot`: a TLS slot, its CAS and spin |
+| **total** | **−8,196** | **−8,412** | **−7,994** | 16,256 → 8,262 |
+
+Arm to arm now: flash **+7,860** (was +16,584), static RAM **+3,052** and
+`.stack` **−3,052** — the identity held on every brick. wasm ratchet 22,574 →
+**20,169** gzipped, banked.
+
+**Lever 2 answered by subtraction, not projection:** of `init_thread_heap`'s
+2,740 bytes, 1,621 was seeding a CSPRNG nothing on the target reads, 153 was the
+thread-exit hook, 966 is creating a heap. The plan's suspicion (per-thread
+generality) was 6 % of it.
+
+**Two residues named.** `__ra_empty_heap_box` is 1,752 B of `.data` — flash
+and RAM both — and is the plan's "unattributed 1,371" that the `rusty_alloc`
+substring census could not see; left in place because removing it is a
+fast-path branch decision that wants churn numbers, not a size table. And the
+`esp-alloc` arm carries ~2.4 KB of `Debug` formatting to print its own stats,
+so the arm-to-arm `.text` delta (+3,884) understates the allocator's code
+(8,262) by that much; both are reported.
+
+**Gates.** fmt; clippy host (default, small profile, all targets) and
+`riscv32imac` `no_std` at both geometries; full suite on default/`secure`/small
+profile; `rusty_alloc-api` `no_std`; wasm ratchet; `tools/gate-selftest.sh`
+with a sixth mutation (`ONE_THREAD` forced true on the host must turn the
+subproc test red — it does, through `abandoned_push`'s `unreachable!`).
+
+**A process note.** The first clippy run failed on `assertions_on_constants`:
+`debug_assert!(!ONE_THREAD)` is an assertion on a constant. Rewritten as
+`if ONE_THREAD { unreachable!() }`, which is also louder in release. And the
+first edit script normalised `init.rs` to LF — a 2,148-line diff for a
+20-line change; the CRLF rule from the corpus work applies to this repo's own
+files too.
+
 ## SMALL-METAL P5 — the six production blockers, closed (2026-09-07)
 
 "Is this commercial ready?" produced six blockers against the post-P4e state.

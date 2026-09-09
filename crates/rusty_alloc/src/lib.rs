@@ -157,6 +157,64 @@ impl<T> SingleThreadCell<T> {
     }
 }
 
+/// `true` exactly when this build has ONE thread for the life of the program,
+/// so that `prim::thread_id()` is a compile-time constant.
+///
+/// That is two targets: the bare-metal `prim::fixed` backend, which the crate
+/// refuses to build without `--cfg ra_single_threaded`, and
+/// `wasm32-unknown-unknown` without the atomics proposal, where
+/// `prim/wasm.rs` has returned one id since it was written. It is **not**
+/// `ra_single_threaded` alone: on a hosted target that cfg only unlocks the
+/// fixed backend's unit tests, the OS prim still hands out real thread ids,
+/// and the suite spawns threads.
+///
+/// What it buys: the cross-thread machinery — abandoning a segment when a
+/// thread ends, adopting one back, the delayed-free list a remote free lands
+/// on — is code that CANNOT execute here, and `ra_single_threaded` used to
+/// prune none of it. The linker kept `adopt_segment` (1,154 B) and
+/// `drain_delayed` (995 B) in an ESP32-S3 firmware that had asserted a single
+/// context. Each consumer of this constant folds one branch so that code
+/// becomes provably unreachable and the linker drops it; where a hosted build
+/// would have compared thread ids, it still does
+/// (`docs/plans/finished/firmware-code-size.md`, lever 1).
+///
+/// A `const`, not a `cfg`, so every site reads as `if ONE_THREAD` and a host
+/// build compiles both arms — the pruned code is type-checked and unit-tested
+/// everywhere, and only linked where it can run.
+pub(crate) const ONE_THREAD: bool = cfg!(any(
+    all(
+        ra_single_threaded,
+        not(miri),
+        not(windows),
+        not(unix),
+        not(target_arch = "wasm32")
+    ),
+    all(
+        target_arch = "wasm32",
+        target_os = "unknown",
+        not(target_feature = "atomics")
+    )
+));
+
+/// `true` where `prim::protect` can actually protect a page: the OS backends
+/// and the miri mock.
+///
+/// Guarded objects are a huge segment whose trailing page is `PROT_NONE`, so
+/// an overflow faults on the first byte past the object. `prim::fixed` and
+/// `prim::wasm` have no MMU and return `Err` from `protect`; there the
+/// sampler used to run anyway and hand out a dedicated segment with an
+/// UNPROTECTED trailing page — the whole cost of a guarded object and none of
+/// the protection — while `try_guarded` (1,641 B) and the ChaCha block it
+/// samples with (725 B) stayed in an ESP32-S3 image with `secure` off. The
+/// runtime gate (`guarded_rate`) could not remove them: it is a field, and a
+/// linker cannot prove a field is zero. Every consumer folds on this constant
+/// instead (`docs/plans/finished/firmware-code-size.md`, lever 3).
+pub(crate) const GUARD_PAGES: bool = cfg!(any(unix, windows, miri));
+
+/// Whether anything draws from a heap's CSPRNG: `secure` free-list keys, or
+/// guarded sampling. A build with neither never seeds it.
+pub(crate) const RNG_USED: bool = GUARD_PAGES || cfg!(feature = "secure");
+
 pub mod alloc;
 pub mod arena;
 pub mod bins;

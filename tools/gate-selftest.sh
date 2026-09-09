@@ -102,6 +102,14 @@ run_case "split64 normalises orderings" \
   's/self\.lo\.load\(Ordering::Acquire\)/self.lo.load(_ord)/' \
   "--lib options::split64"
 
+# --- firmware-code-size lever 1: ONE_THREAD must be FALSE on a hosted target -
+# The single-context predicate folds every free to local and every adopt to
+# null. If it ever read true where threads exist, a dying thread's segment
+# would be abandoned into an `unreachable!` and cross-thread frees would land
+# on the wrong heap. The subproc half of this test exits a thread with a live
+# block, which is exactly the path the predicate prunes.
+run_case "ONE_THREAD is false where threads exist"   "crates/rusty_alloc/src/lib.rs"   's/pub\(crate\) const ONE_THREAD: bool = cfg!\(any\(/pub(crate) const ONE_THREAD: bool = true || cfg!(any(/'   "--test heaps heaps_arenas_subprocs_options"
+
 echo
 if ((fail > 0)); then
   echo "GATE SELFTEST FAILED: $fail of $((pass + fail)) gates did not fire."

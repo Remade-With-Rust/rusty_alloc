@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Firmware code size halved: `--cfg ra_single_threaded` now prunes what it
+  promises.** The cfg used to change only correctness assumptions; the code
+  that a single context can never reach — abandoning a segment when a thread
+  ends, adopting one back, the delayed list a cross-thread free lands on, the
+  thread-exit hook — was still linked. On an ESP32-S3 firmware built both ways
+  from one source, the allocator's flash cost fell from **+16,584 B to
+  +7,860 B** and its attributable code from 16,256 B to 8,262 B, measured with
+  `size -A` and `nm --size-sort` on the linked ELF, one brick at a time. One
+  internal predicate (`ONE_THREAD`: the fixed backend under
+  `ra_single_threaded`, or `wasm32-unknown-unknown` without atomics) folds the
+  branches so the linker can see it; hosted builds compare thread ids exactly
+  as before and are byte-for-byte unchanged.
+- The same predicate takes **10.7 % off the gzipped wasm bundle** (22,574 →
+  20,169 bytes); the ratchet baseline is updated in the same commit.
+- The README's embedded section now carries the flash and static-RAM cost
+  beside the heap floor, and the hazard the decomposition exposed: static RAM
+  comes straight out of `.stack`, to the byte, so a firmware near its stack
+  limit adopts this and gets an overflow rather than a bigger binary.
+
+### Fixed
+
+- **Guarded-object sampling ran on targets that cannot protect a page.**
+  `prim::fixed` and `prim::wasm` return `Err` from `protect`; the sampler used
+  to accept a rate anyway and hand out a dedicated segment with an unprotected
+  trailing page — the full cost of a guarded object and none of the protection
+  — while `try_guarded` and the ChaCha block function it samples with stayed in
+  a `secure`-off image. Guarded sampling is now compiled out where no guard
+  page can exist (`guarded_set_sample_rate` leaves it off there), and a heap's
+  CSPRNG is seeded only where something draws from it. On the ESP32-S3 that was
+  2,366 bytes of unreachable code plus 1,621 bytes of seeding for a generator
+  nothing read.
+
 ## [2.0.1](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.0.0...rusty_alloc-v2.0.1) - 2026-09-08
 
 ### Added

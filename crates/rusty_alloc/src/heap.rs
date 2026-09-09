@@ -247,6 +247,15 @@ impl Heap {
     /// (0 disables; 1 guards every one). A nonzero seed makes the sequence
     /// reproducible for debugging.
     pub fn guarded_set_sample_rate(&mut self, rate: usize, seed: usize) {
+        // Where no guard page can exist this is a no-op that leaves sampling
+        // OFF. It used to accept the rate, and every sampled object then took
+        // a dedicated segment with an unprotected trailing page: the cost of a
+        // guarded object with none of the protection, silently.
+        if !crate::GUARD_PAGES {
+            self.guarded_rate = 0;
+            self.guarded_count = 0;
+            return;
+        }
         self.guarded_rate = rate;
         if seed != 0 {
             let s = seed as u32;
@@ -443,7 +452,12 @@ impl Heap {
         // Guarded objects (secure/guarded builds): sampled allocations get a
         // dedicated segment whose trailing page is PROT_NONE, so an overflow
         // faults immediately instead of corrupting a neighbour.
-        if self.guarded_rate != 0
+        // `GUARD_PAGES` first: on a target that cannot protect a page the
+        // whole arm folds away, and `try_guarded` (1,641 B on an ESP32-S3)
+        // with it. The runtime rate alone could not do that -- it is a field,
+        // and the linker cannot prove a field is zero.
+        if crate::GUARD_PAGES
+            && self.guarded_rate != 0
             && let Some(r) = self.try_guarded(size)
         {
             return r;
@@ -1179,6 +1193,19 @@ impl Heap {
         // SAFETY: delayed points into our own live HeapBox; blocks on it are
         // dead blocks of pages we own.
         unsafe {
+            // A single-context build can never receive one. The list is fed
+            // only by `remote_free`, which only a DIFFERENT thread reaches, so
+            // on such a target the peek below is a load that always reads
+            // zero and `drain_delayed` is 995 bytes the linker kept for it
+            // (`docs/plans/finished/firmware-code-size.md`, lever 1).
+            if crate::ONE_THREAD {
+                debug_assert_eq!(
+                    (*self.delayed).head.load(Ordering::Acquire),
+                    0,
+                    "a cross-thread free landed on a build that asserted a single thread"
+                );
+                return;
+            }
             // Peek with a plain LOAD before the swap. This runs on every
             // slow-path allocation (the heartbeat's first duty), and on any
             // thread that never receives a cross-thread free — the common

@@ -744,6 +744,12 @@ pub(crate) fn corrupt_free_list_abort() -> ! {
 // workload where this function matters is one where every free reaches it, so
 // the call is paid every time AND the callee grows a frame of its own.
 pub unsafe fn remote_free(page: *mut Page, block: *mut Block) {
+    // Unreachable on a single-context build (`alloc::free` folds every free
+    // to local there); if it runs anyway, the single-thread assertion the
+    // target made was false.
+    if crate::ONE_THREAD {
+        unreachable!("a cross-thread free on a build that asserted a single thread");
+    }
     loop {
         // SAFETY: xthread_free/xheap are the designed cross-thread fields.
         let x = unsafe { (*page).xthread_free.load(Ordering::Acquire) };
