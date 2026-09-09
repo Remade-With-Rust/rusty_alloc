@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.4](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.0.3...rusty_alloc-v2.0.4) - 2026-09-09
+
 ### Fixed
 
 - **A region sized by `good_region_size` at an unaligned base silently served
