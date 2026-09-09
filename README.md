@@ -37,10 +37,13 @@ does not offer.
   measured on a XIAO ESP32-S3 at 240 MHz, both allocators built from one source.
   It costs more RAM to get that (68 KiB vs 8 KiB); both numbers are below.
 
-> **Status: `2.0.2`.** The API is frozen and changes follow semver. 2.0.1 and
-> 2.0.2 are patch releases: no public API moved. 2.0.2 halves the allocator's
-> flash cost on a microcontroller and cuts its gzipped wasm overhead by a third
-> (see [Embedded](#embedded-bare-metal-measured-on-silicon) and
+> **Status: `2.0.3`.** The API is frozen and changes follow semver. 2.0.1
+> through 2.0.3 are patch releases: no public API moved. 2.0.2 halved the
+> allocator's flash cost on a microcontroller and cut its gzipped wasm overhead
+> by a third; 2.0.3 halves the flash cost again, takes the static RAM cost from
+> 3 KB to under 300 bytes, and hands the region granule back to the firmware
+> with `good_region_size` (see
+> [Embedded](#embedded-bare-metal-measured-on-silicon) and
 > [Shipping it to a browser](#shipping-it-to-a-browser)).
 >
 > **What breaks, and why it is a major.** Two things, neither of which touches a
