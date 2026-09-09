@@ -198,3 +198,60 @@ the firmware shape, which a segment-aligned type could not be on every host
 toolchain; the fixed-backend test carves its region 0x1f0 past a 64 KiB line
 on purpose. Gate-selftest 10/10 (new: `FIXED_REGION` forced true on a host
 refuses arenas). Full record: `docs/LEDGER.md`, "REGION ALIGNMENT DISSOLVED".
+
+---
+
+## Consumer validation of 2.0.5: the gap is gone and the RAM reconciles
+
+Taken, shipped, and verified on the board that reported it.
+
+RAM on this part is fixed, so the sections must sum to a constant. That sum is
+the instrument the whole finding rested on, and it now closes:
+
+| build | `.data` | `.bss` | `.stack` | sum | unaccounted |
+|---|---:|---:|---:|---:|---:|
+| esp-alloc @196,608 | 2,300 | 196,700 | 136,368 | 335,368 | 0 |
+| 2.0.4, segment-aligned | 2,228 | 198,752 | 110,240 | 311,220 | **24,148** |
+| **2.0.5** | 2,228 | 198,752 | **134,384** | **335,364** | **4** |
+
+**24,148 bytes down to 4, `.stack` +24,144, `.bss` byte-identical** — matching
+the changelog's figure exactly. Both halves of the 2.0.4 report are confirmed
+by the fix: the memory was real, and no `.bss` delta could ever have shown it.
+
+Also unchanged where it should be: `used=196608 free=0` at every stage,
+`good_region_size(220 * 1024)` still 196,608 with the consumer's `const`
+assert still building, 31 host tests passing. `.text` grew 72 bytes for the
+stride arithmetic.
+
+### The per-free cost is yours, and this consumer will not confirm it
+
+The changelog prices this at three instructions per `free` (39 against 36) and
+9-17 ns per alloc/free pair. **Not reproduced here, and it should not be
+quoted as though it were.** This firmware allocates five buffers once and
+never frees; it cannot observe a per-free cost, which is the same limitation
+that made it the wrong rig to price the hot path in the first place. The
+callgrind harness and your own board run are the evidence for that number.
+
+What this firmware can say is that the trade is right for its shape: RAM binds
+on an ESP32-S3 and cycles do not, `--cfg ra_aligned_region` is there for a
+firmware that disagrees, and hosted builds are untouched.
+
+### One last placement data point
+
+The region's base moved, so every buffer did. `rgb888_to_rgb565` gained 3.6 %
+and ran 16 repetitions instead of 15; `downscale2x_gray8` came back
+bit-identical; the rest sat within 0.01 %. Sixth instance of the same effect
+across five releases, and still no allocator call inside any measured kernel.
+
+### Where the swap now stands on this firmware
+
+| | esp-alloc | 2.0.1 | **2.0.5** |
+|---|---:|---:|---:|
+| flash delta | — | +16,584 | **+3,404** |
+| stack cost | — | 3,092 | **4** |
+| region stranded | — | 24,576 | **0** |
+
+The footprint argument against adopting this on a small firmware has
+essentially gone in five releases. What remains is ~3.4 KB of flash, and the
+reason to pay it is the double-free abort rather than speed on a workload of
+this shape — which is what the README already says.
