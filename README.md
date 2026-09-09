@@ -33,7 +33,7 @@ does not offer.
   releases have cut what it adds to a gzipped bundle by two thirds** (+7,760 ->
   +3,829 -> +2,435 bytes on a minimal module) — see
   [Shipping it to a browser](#shipping-it-to-a-browser).
-- **Runs on a microcontroller, and is 2.0-3.7x faster than `esp-alloc` there** —
+- **Runs on a microcontroller, and is 2.2-4.0x faster than `esp-alloc` there** —
   measured on a XIAO ESP32-S3 at 240 MHz, both allocators built from one source.
   It costs more RAM to get that (68 KiB vs 8 KiB); both numbers are below.
 
@@ -206,6 +206,12 @@ rusty_alloc::prim::fixed::init_region(unsafe { &mut (*(&raw mut REGION)).0 })
 | `--cfg ra_single_threaded` | **build fails**, with a message telling you to set it |
 | `--cfg ra_small_profile` | **builds and links clean, then nothing allocates** — `SEGMENT_SIZE` stays 32 MiB, a kilobyte-scale region yields zero segments, and the first `Vec` returns null |
 | `init_region` | every allocation fails; the backend has no memory |
+| *(optional)* `--cfg ra_max_extents="8"` | the free-extent table keeps its default 32 slots (256 B of `.bss`, i.e. stack); 8 is plenty for a region of a few segments and returns 192 B — the doc on `MAX_EXTENTS` states the bound |
+
+Size the region with the two `const fn`s in `prim::fixed`, not a round
+number: `good_region_size(220 * 1024)` is 200,704 — three segments plus the
+page, nothing stranded — where a literal 220 KiB strands 24,576 bytes that
+neither the allocator nor the firmware can use.
 
 That middle row is the trap, and it was reported by the first outside firmware
 to adopt 2.0.0 (`docs/plans/embedded-adoption.md`). `ra_single_threaded`
@@ -225,21 +231,25 @@ reach — abandon, adopt, the delayed-free list, the thread-exit hook — and on
 `wasm32-unknown-unknown` without the atomics feature the same pruning happens
 without any flag at all, because that target has one thread by construction.
 
-### Throughput — 2.0x to 3.7x faster
+### Throughput — 2.2x to 4.0x faster
 
 Nanoseconds per allocate/free pair, lower is better:
 
 | workload | `esp-alloc` | `rusty_alloc` | speedup |
 |---|---:|---:|---:|
-| 32 B alloc/free, one size | 1,638 | **647** | **2.53x** |
-| 64 mixed blocks (8-512 B), batch out then back | 1,792 | **881** | **2.03x** |
-| **churn: 64 live, random sizes 8-512 B, random replacement** | 3,987 | **1,087** | **3.67x** |
-| 2048 B alloc/free | 1,638 | **1,200** | **1.37x** |
+| 32 B alloc/free, one size | 1,638 | **586** | **2.80x** |
+| 64 mixed blocks (8-512 B), batch out then back | 1,792 | **824** | **2.17x** |
+| **churn: 64 live, random sizes 8-512 B, random replacement** | 3,987 | **1,002** | **3.98x** |
+| 2048 B alloc/free | 1,638 | **1,133** | **1.45x** |
 
-Both arms measured in the same session, same floor (162 ns/op in each), with
-matching checksums. These include the reclamation fixes a stress battery forced
-(see below), and the 2 KiB row also carries the medium-band collect-and-retry
-that took it from 1.19x to 1.37x.
+Both arms measured in the same session (2026-09-09, `main` after 2.0.2),
+floors of 158 and 162 ns/op, with matching checksums. The rows moved twice
+since 2.0.0: the medium-band collect-and-retry took the 2 KiB row from 1.19x
+to 1.37x, and 2.0.2's single-context free fold — one compare off every free,
+the guarded probe off the generic path — took 7-9 % off every row. The
+one-region pruning that followed (arenas, segment map, option table) is
+neutral here to within 5 ns, as it should be: it runs on segment allocation,
+which a steady-state churn loop never reaches.
 
 The churn row is the one to read. It is the shape real code has, and the shape
 that fragments a first-fit free list — which is exactly what a size-class page
@@ -264,8 +274,15 @@ in a medium page.
   printed. **Every checksum matches across the two arms**, so both allocators
   provably did the same work.
 - **A null arm.** The same benchmark twice within one arm reproduced to the
-  nanosecond (625 and 625; 1,638 and 1,638), so the resolution floor is below
+  nanosecond (586 and 586; 1,638 and 1,638), so the resolution floor is below
   any gap claimed here. Best-of-5, spread <= 1% on every row.
+- **Addresses held constant.** Both arms allocate the same sequence into the
+  same-sized region, so buffer placement is the same in both. That matters:
+  an allocator change moved a *compute* kernel on this board by 8 % without
+  executing a single instruction inside it, purely by where the buffers
+  landed (`docs/plans/finished/firmware-code-size.md` §8). A kernel
+  comparison across allocators measures placement unless its addresses are
+  pinned or its floor is established across a reflash.
 
 ### Footprint — this is the cost, not a win
 
@@ -273,19 +290,27 @@ in a medium page.
 |---|---:|---:|
 | smallest heap that runs the same workload | **8 KiB** | 68 KiB *(needs `--cfg ra_small_profile`)* |
 | peak live bytes (identical, the parity check) | 4,914 | 4,914 |
-| flash (`.text` + `.rodata` + `.data`), one firmware, two arms | — | **+7,860 B** |
-| static RAM (`.bss` + `.data`) | — | **+3,052 B** |
+| flash (`.text` + `.rodata` + `.data`), one firmware, two arms | — | **+3,208 B** |
+| static RAM (`.bss` + `.data`) | — | **+284 B** |
+| heap region stranded by the 64 KiB granule | — | **0** with `good_region_size` (24,576 B for a round 220 KiB) |
 
 **Flash and static RAM are two more budgets, and the second one is a
 hazard.** The rows above are from `size -A` on the linked ELF of one
 `esp-hal` firmware built twice, allocator selected by a feature and nothing
-else different. `+7,860 B` of flash is what is left after this release removed
-half of it: `ra_single_threaded` used to prune nothing, so the cross-thread
-machinery — abandoning a segment when a thread ends, adopting one back, the
-delayed list a remote free lands on — was linked into a target that had
-asserted a single context, and guarded-object sampling shipped on a chip with
-no MMU to protect a page. Both now fold away on any single-context target,
-which also took **10.7 %** off the gzipped wasm bundle.
+else different. Two passes brought the flash cost from +16,584 B to +3,208 B
+and the static RAM from +3,092 B to +284 B. First, 2.0.2: `ra_single_threaded`
+used to prune nothing, so the cross-thread machinery — abandoning a segment
+when a thread ends, adopting one back, the delayed list a remote free lands
+on — was linked into a target that had asserted a single context, and
+guarded-object sampling shipped on a chip with no MMU to protect a page; both
+now fold away on any single-context target, which also took **10.7 %** off the
+gzipped wasm bundle. Then, on `main`: everything that exists to manage *many*
+OS ranges — arenas, the segment map, a runtime option table, a RAM-resident
+heap template — folds to what one linker-handed region needs, and the heap
+sentinel lives in flash instead of being copied into RAM at boot. The
+allocator's own code is now 4,313 bytes on this target, against
+`esp-alloc`'s 1,043, and that gap is the structure of a size-class page
+allocator rather than anything left to prune.
 
 The static RAM comes **straight out of the stack**: the linker hands `.stack`
 whatever RAM is left, and in the measured firmware `.stack` shrank by exactly
@@ -294,14 +319,19 @@ not get a bigger binary when it adopts `rusty_alloc` — it gets a stack
 overflow, and nothing in the build says so. Check `size -A` before and after.
 
 The two costs have different shapes, and a reader choosing an allocator wants
-both curves. **Flash is roughly fixed** — about 8 KB whether the firmware is
-240 KB (3.3 %) or 900 KB with a TLS stack in it (under 1 %), so it stops
+both curves. **Flash is roughly fixed** — about 3 KB whether the firmware is
+240 KB (1.3 %) or 900 KB with a TLS stack in it (under 0.4 %), so it stops
 mattering as the firmware grows. **The 68 KiB heap floor does not** — it
 scales with the size classes a program touches, not with the program, so it
-matters exactly as much on a big firmware as on a small one. The full
-decomposition, the three levers taken and the one residue deliberately left
-(a 1.75 KB heap sentinel in `.data`) are in
-[`docs/plans/finished/firmware-code-size.md`](docs/plans/finished/firmware-code-size.md).
+matters exactly as much on a big firmware as on a small one. And **the region
+granule is the consumer's to fix**: a region yields whole 64 KiB segments plus
+one 4 KiB page and strands the rest, so declare it with
+`prim::fixed::good_region_size(budget)` (the largest size that strands
+nothing) or `region_for(usable)` (the smallest that serves what you need)
+rather than a round number. The full decompositions are in
+[`docs/plans/finished/firmware-code-size.md`](docs/plans/finished/firmware-code-size.md)
+and
+[`docs/plans/finished/firmware-what-is-left.md`](docs/plans/finished/firmware-what-is-left.md).
 
 **`esp-alloc` wins this by 8.5x, and the reason is structural rather than a
 missing optimisation.** A linked-list heap's floor is `bytes live + per-block

@@ -90,6 +90,30 @@ unsafe impl Sync for EmptyHeapBox {}
 /// `export_name` (not mangled) because the x86-64 Linux TLS slot's `.tdata`
 /// initializer below names it in assembly; `.hidden` there keeps it out of
 /// the cdylib's export table.
+///
+/// **In flash on a one-region target.** The sentinel is read and never
+/// written — `heap_box_fast` documents that contract, the fast path only
+/// writes after a non-null pop and every `direct` slot here points at the
+/// empty page whose free list is null, and no page ever carries its address
+/// in `xheap`. Its type has interior mutability (a `DelayedList`, an
+/// `AtomicPtr`, the `UnsafeCell<Heap>`), which is why rustc places it in
+/// `.data` by default: 1,752 bytes paid once in flash for the image and once
+/// more in RAM for the loader's copy, the largest single item left on the
+/// ESP32-S3 after 2.0.2 and RAM the linker takes from the stack. Placing it
+/// in `.rodata.*` keeps the flash copy and drops the RAM one. Any write
+/// would fault loudly against the flash cache, which is the right way for
+/// the contract to fail. Bare metal only — a hosted target may need to
+/// relocate the pointers inside it at load, and has RAM to spare.
+#[cfg_attr(
+    all(
+        ra_single_threaded,
+        not(miri),
+        not(windows),
+        not(unix),
+        not(target_arch = "wasm32")
+    ),
+    unsafe(link_section = ".rodata.rusty_alloc_empty_heap_box")
+)]
 #[unsafe(export_name = "__ra_empty_heap_box")]
 pub static EMPTY_HEAP_BOX: EmptyHeapBox = EmptyHeapBox(HeapBox {
     delayed: DelayedList::new(),
@@ -540,7 +564,22 @@ pub fn create_heap(tag: i32, allow_destroy: bool, arena_id: i32) -> *mut HeapBox
                 subproc: AtomicUsize::new(my_subproc()),
                 tag,
                 allow_destroy,
-                heap: UnsafeCell::new(Heap::new()),
+                // A new heap starts as a copy of the empty one. On a
+                // one-region target that copy is taken from the sentinel
+                // itself, which already holds the whole template in flash;
+                // materialising `Heap::new()` here as well cost a second
+                // ~900-byte `.rodata` blob for the bin table. Hosted builds
+                // keep the constant, whose codegen was measured in Ir.
+                heap: UnsafeCell::new(if crate::ONE_REGION {
+                    // SAFETY (within the enclosing block): a raw,
+                    // non-overlapping read of the never-written sentinel's
+                    // heap — the only access `heap_box_fast`'s contract
+                    // permits, and `Heap` owns nothing that a bitwise copy
+                    // could double-free.
+                    ptr::read((*empty_heap_box_ptr()).heap.get())
+                } else {
+                    Heap::new()
+                }),
             },
         );
         (*(*hb).heap.get()).delayed = &raw const (*hb).delayed;

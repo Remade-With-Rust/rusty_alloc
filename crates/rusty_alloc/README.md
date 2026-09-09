@@ -81,7 +81,7 @@ perl produce **byte-identical output** under rusty_alloc, mimalloc and glibc;
 the full mimalloc-bench corpus (19 configurations, including the 8–16-thread
 storms) runs clean; Miri is clean over the whole target.
 
-## Embedded: 2.0-3.7x faster than `esp-alloc` on an ESP32-S3
+## Embedded: 2.2-4.0x faster than `esp-alloc` on an ESP32-S3
 
 Builds `no_std` and runs as the `#[global_allocator]` on bare metal. Measured on
 a Seeed XIAO ESP32-S3 Sense at 240 MHz against `esp-alloc` 0.11 — nanoseconds
@@ -89,10 +89,10 @@ per allocate/free pair, lower is better:
 
 | workload | `esp-alloc` | `rusty_alloc` | speedup |
 |---|---:|---:|---:|
-| 32 B alloc/free | 1,638 | **647** | **2.53x** |
-| 64 mixed blocks (8-512 B), batched | 1,792 | **881** | **2.03x** |
-| **churn: 64 live, random 8-512 B** | 3,987 | **1,087** | **3.67x** |
-| 2048 B alloc/free | 1,638 | **1,200** | **1.37x** |
+| 32 B alloc/free | 1,638 | **586** | **2.80x** |
+| 64 mixed blocks (8-512 B), batched | 1,792 | **824** | **2.17x** |
+| **churn: 64 live, random 8-512 B** | 3,987 | **1,002** | **3.98x** |
+| 2048 B alloc/free | 1,638 | **1,133** | **1.45x** |
 
 Both arms are one firmware source with `--cfg` picking the allocator, given
 equal budgets. A baseline arm with no allocator call measured 162 ns/op in both
@@ -122,15 +122,21 @@ when the budget is tight, and for this when throughput or fragmentation under
 churn is what hurts.
 
 **It also costs flash and static RAM, measured on the linked ELF of one
-firmware built both ways:** about **+7.9 KB of flash** (halved in this release
-— `ra_single_threaded` now prunes the cross-thread machinery a single context
-can never reach, and guarded sampling no longer ships on a chip with no MMU)
-and **+3.1 KB of static RAM**, which the linker takes **straight out of the
-stack**: `.stack` shrank by exactly `Δ.bss + Δ.data`. A firmware near its stack
-limit gets an overflow, not a bigger binary, and nothing in the build says so.
-Flash is a fixed cost that stops mattering as the firmware grows; the heap
-floor scales with the size classes touched and does not. Decomposition and
-levers: `docs/plans/finished/firmware-code-size.md` in the repository.
+firmware built both ways:** about **+3.2 KB of flash** and **+0.3 KB of
+static RAM**, down from +16.6 KB and +3.1 KB two releases earlier —
+`ra_single_threaded` now prunes the cross-thread machinery a single context
+can never reach, guarded sampling no longer ships on a chip with no MMU, and
+everything that only many OS ranges need (arenas, the segment map, a runtime
+option table, a RAM copy of the heap template) folds to what one region
+needs. Static RAM comes **straight out of the stack**: `.stack` shrank by
+exactly `Δ.bss + Δ.data`. A firmware near its stack limit gets an overflow,
+not a bigger binary, and nothing in the build says so. Flash is a fixed cost
+that stops mattering as the firmware grows; the heap floor scales with the
+size classes touched and does not; and the region's 64 KiB granule is yours
+to avoid — declare it with `prim::fixed::good_region_size(budget)` instead of
+a round number, or a 220 KiB region strands 24 KiB. Decompositions and
+levers: `docs/plans/finished/firmware-code-size.md` and
+`firmware-what-is-left.md` in the repository.
 
 ## Usage
 

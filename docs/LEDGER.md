@@ -4,6 +4,62 @@ One entry per milestone/brick: what landed, the numbers with their method lines,
 what was reverted and **which kind** of revert (measured-worse vs within-noise).
 Newest first.
 
+## FIRMWARE, WHAT IS LEFT — one region, four folds, flash +7,860 → +3,208 B (2026-09-09)
+
+The consumer's third report (`docs/plans/finished/firmware-what-is-left.md`)
+priced the region granule at 24,576 B, three static tables at ~688 B, asked
+whether `collect_inner` was reachable orphan code, and offered to build a
+churn benchmark because "nobody has timed this on a chip". All four answered;
+two more levers found reading the siblings of the three tables.
+
+**Rig.** As the previous entry (scratch copy of `xiao-s3-probe`,
+`[patch.crates-io]` to the working tree, `size -A` + `nm -S` on the linked
+ELF; baseline = 2.0.2 as published, reproduced to the byte). Board: the
+espino `blink-fs-p4` harness under `--cfg ra_bench`, both arms, before and
+after (`board=xiao-esp32s3 clock=240MHz region=192KiB-both floor=158/162ns
+best-of-5 checksums-matched null-arm=1ns`).
+
+| brick | `.text` | flash | RAM (`.bss`+`.data`) | what |
+|---|---:|---:|---:|---|
+| `good_region_size` / `region_for` | 0 | 0 | 0 (24,576 B of region, consumer's line) | `const fn`s; tested against `usable_bytes` at both geometries |
+| `ONE_REGION`: options + arenas + segment map | −2,808 | −3,500 | −960 | `VALUES` 304, `ARENAS` 128, `range_table` 512 gone; `malloc_generic_once` 1,950 → 542; `collect_inner` 1,988 → 1,381; `create_heap` 966 → 608 |
+| sentinels to flash, template copied from there | −248 | −1,152 | −1,808 | `.data` −1,808, `.rodata` +904 (the second template blob gone) |
+| `ra_max_extents` knob | 0 default; +24 at 8 | 0 / +24 | 0 / −192 | opt-in |
+| **total (default knob)** | **−3,056** | **−4,652** | **−2,768** | attributed 8,262 → 4,313 B, 36 → 27 symbols |
+
+Arm to arm now: flash **+3,208** (2.0.1: +16,584), static RAM **+284**
+(2.0.1: +3,092), `.data` 16 bytes LESS than esp-alloc's. `.stack` identity
+held on every brick.
+
+**`collect_inner` (§2): closed.** Orphans need `abandoned_push`, whose only
+caller is `thread_done`, which nothing on a bare-metal image calls;
+`heap_delete` migrates through `adopt_segment` directly and `heap_destroy`
+frees; since 2.0.2 `abandoned_pop` folds to null and no `abandoned_*` symbol
+is in the image. The 1,988 B was the page sweep with the four freeing fns
+inlined — the P4e reclamation mechanism, not a lever — and it still shrank to
+1,381 because its segment-map `unregister` and arena `chunk_free` probes
+folded.
+
+**§5's premise was wrong:** the README's 2.0-3.7x rows were measured on this
+board (espino harness, small profile, floor-subtracted, checksummed) — not on
+a host. What was true is that they were stale: 2.0.2 already read 587 / 828 /
+1,007 / 1,129 against the README's 647 / 881 / 1,087 / 1,200 (the free fold),
+and this branch reads 586 / 824 / 1,002 / 1,133 — neutral to within the 1 ns
+null arm, as it must be for pruning that runs on segment allocation only.
+README refreshed: 2.80x / 2.17x / 3.98x / 1.45x, with the placement caution.
+
+**Two things the self-test taught.** (1) A first `ONE_REGION` mutation
+targeted the exclusive-arena test and read VACUOUS: that test skips, honestly,
+when a reservation fails, so a predicate that makes reservations fail cannot
+turn it red. Repointed at the broad heaps test, which `expect`s its arena and
+asserts `options::set` round-trips. (2) The `good_region_size` test hardcoded
+small-profile answers twice; at the shipped 32 MiB segment a 220 KiB budget is
+below the floor and the right answer is 0. Now geometry-aware.
+
+**Gates.** fmt; clippy host all-targets and `riscv32imac` no_std (with and
+without the knob); full suite default + small profile; fixed tests at both
+geometries; wasm ratchet flat (20,169); gate-selftest 8/8.
+
 ## FIRMWARE CODE SIZE — three levers, flash cost halved, wasm −10.7 % (2026-09-09)
 
 `docs/plans/finished/firmware-code-size.md` decomposed what the allocator adds

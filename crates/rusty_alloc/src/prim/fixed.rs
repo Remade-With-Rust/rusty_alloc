@@ -92,7 +92,29 @@ const FIXED_PAGE: usize = 4096;
 /// 32 is far more than a chip needs — the layers above make a handful of large
 /// reservations, not many small ones — and exceeding it is reported, never
 /// papered over.
-const MAX_EXTENTS: usize = 32;
+/// Free-extent slots. `--cfg ra_max_extents="8"` (or `"16"`, `"64"`) resizes
+/// the two tables; the default is 32.
+///
+/// This is a real bound, not a hint: a [`free`] that would need a slot the
+/// table does not have is refused, and that range is lost to the allocator
+/// until a neighbouring free coalesces over it. A free extent is bounded on
+/// each side by a live block or the region's end, so the table can never need
+/// more slots than there are live blocks plus one. A 220 KiB firmware region
+/// holds three segments and one heap page, so it cannot need more than 5; a
+/// 4 MiB PSRAM region holds 63 segments and can need more than 64. Each slot
+/// is two words of `.bss`, and on a chip that is stack the linker did not
+/// get, which is why the number is a knob rather than a constant
+/// (`firmware-what-is-left.md` §3). Size it from the live-block bound, not
+/// from hope.
+const MAX_EXTENTS: usize = if cfg!(ra_max_extents = "8") {
+    8
+} else if cfg!(ra_max_extents = "16") {
+    16
+} else if cfg!(ra_max_extents = "64") {
+    64
+} else {
+    32
+};
 
 /// The region, published once by [`init_region`]. Zero length means "no region
 /// yet", which every entry point checks.
@@ -225,6 +247,64 @@ pub const fn usable_bytes(base: usize, len: usize) -> usize {
     ((avail - FIXED_PAGE) / seg) * seg
 }
 
+/// The largest region no bigger than `budget` that strands NOTHING, for a
+/// `SEGMENT_SIZE`-aligned base: `k * SEGMENT_SIZE + FIXED_PAGE`.
+///
+/// [`usable_bytes`] lets a firmware *observe* the granule's loss; this is
+/// what lets it *avoid* the loss, and it is pure arithmetic. A region is
+/// carved into whole segments from the bottom plus one page for the heap
+/// descriptor at the top, so any size that is not `k * SEGMENT_SIZE +
+/// FIXED_PAGE` leaves the remainder dead to segments. The Janus firmware that
+/// reported it handed over 220 KiB and got 196,608 usable with 24,576
+/// stranded — 11 % of its budget, and three times what the allocator's whole
+/// code costs on that chip after 2.0.2
+/// (`docs/plans/finished/firmware-what-is-left.md` §1).
+///
+/// `const fn`, so the answer is settled where the region is declared:
+///
+/// ```ignore
+/// static HEAP: Region<{ good_region_size(220 * 1024) }> = Region::new();
+/// // 200,704 bytes: three 64 KiB segments plus the page, nothing stranded,
+/// // and 24,576 bytes handed back to the firmware's own use.
+/// ```
+///
+/// Rounds DOWN, because a budget is a ceiling: asking for the largest
+/// zero-waste region that fits is the question a firmware with N bytes to
+/// spare is asking. [`region_for`] is the other direction. Returns 0 when no
+/// zero-waste region fits at all (`budget < MIN_REGION`), which the same
+/// `const` assertion that guards `MIN_REGION` turns into a build error.
+///
+/// Assumes the base is `SEGMENT_SIZE`-aligned, like [`MIN_REGION`]; an
+/// unaligned base loses up to `SEGMENT_SIZE - 1` bytes to the first boundary
+/// and `usable_bytes` on the real base is the exact check.
+#[must_use]
+pub const fn good_region_size(budget: usize) -> usize {
+    let seg = crate::types::SEGMENT_SIZE;
+    if budget < MIN_REGION {
+        return 0;
+    }
+    ((budget - FIXED_PAGE) / seg) * seg + FIXED_PAGE
+}
+
+/// The smallest region that serves at least `usable` bytes of segments, for a
+/// `SEGMENT_SIZE`-aligned base — [`good_region_size`] read from the other
+/// end: a firmware that knows what it needs rather than what it can spare.
+///
+/// ```ignore
+/// // "I need 192 KiB of heap": 196,608 + 4,096 = 200,704 bytes, and
+/// // usable_bytes(0, 200_704) == 196_608 exactly.
+/// static HEAP: Region<{ region_for(192 * 1024) }> = Region::new();
+/// ```
+///
+/// Rounds UP to whole segments; `usable == 0` still costs one segment,
+/// because a region that can serve nothing is refused by [`init_region`].
+#[must_use]
+pub const fn region_for(usable: usize) -> usize {
+    let seg = crate::types::SEGMENT_SIZE;
+    let segments = if usable == 0 { 1 } else { usable.div_ceil(seg) };
+    segments * seg + FIXED_PAGE
+}
+
 /// Hand the backend the region it will serve from, once.
 ///
 /// Takes `&'static mut [u8]` because that is exactly the claim being made: the
@@ -282,6 +362,21 @@ fn install_region(base: usize, len: usize) {
     EXT_BASE[0].store(base, Ordering::Relaxed);
     EXT_LEN[0].store(len, Ordering::Relaxed);
     EXT_COUNT.store(1, Ordering::Relaxed);
+}
+
+/// Whether `addr` lies inside the registered region.
+///
+/// On a one-region target this IS the segment map: the allocator's memory is
+/// exactly one range, whose bounds this backend already holds, so
+/// `segment_map::contains` answers with two compares here instead of a
+/// 64-entry range table (`firmware-what-is-left.md` §3). Same best-effort
+/// meaning as the map's: memory we own, not memory currently allocated.
+/// `false` before a region is registered.
+#[must_use]
+pub fn region_contains(addr: usize) -> bool {
+    let base = REGION_BASE.load(Ordering::Relaxed);
+    let len = REGION_LEN.load(Ordering::Relaxed);
+    len != 0 && addr >= base && addr - base < len
 }
 
 /// The region's occupancy: `(used, free, total)` bytes.
@@ -931,6 +1026,106 @@ mod tests {
     /// `usable_bytes` is pure arithmetic, so it gets its own test with no
     /// global state -- and the case that motivated it, from the first outside
     /// adopter's report.
+    /// §1 of `firmware-what-is-left.md`: a budget rounds DOWN to the largest
+    /// zero-waste region, a need rounds UP to the smallest sufficient one,
+    /// and both agree with `usable_bytes` to the byte.
+    #[test]
+    fn good_region_size_strands_nothing() {
+        use crate::types::SEGMENT_SIZE as SEG;
+        // The reported case: 220 KiB strands 24,576; the good size strands 0.
+        // Only meaningful at the small profile -- at the shipped 32 MiB
+        // segment a 220 KiB budget is below the floor and the answer is 0,
+        // which is the other thing this function must say.
+        let budget = 220 * 1024;
+        let good = good_region_size(budget);
+        assert!(good <= budget, "a budget is a ceiling");
+        if budget >= MIN_REGION {
+            assert_eq!(
+                good,
+                3 * SEG + FIXED_PAGE,
+                "three segments plus the page at this geometry"
+            );
+            assert_eq!(
+                usable_bytes(0, good),
+                good - FIXED_PAGE,
+                "every byte but the page is a segment"
+            );
+            assert_eq!(
+                usable_bytes(0, budget),
+                usable_bytes(0, good),
+                "the good size serves as much as the budget did"
+            );
+            assert_eq!(
+                budget - good,
+                24_576,
+                "and that is what the budget was stranding"
+            );
+        } else {
+            assert_eq!(
+                good, 0,
+                "no zero-waste region fits a budget below the floor"
+            );
+        }
+
+        // Below the floor there is no zero-waste region at all.
+        assert_eq!(good_region_size(0), 0);
+        assert_eq!(good_region_size(MIN_REGION - 1), 0);
+        assert_eq!(good_region_size(MIN_REGION), MIN_REGION);
+
+        // Every budget: the answer fits, strands nothing, and is the LARGEST
+        // such size — one more segment would not fit.
+        let mut b = MIN_REGION;
+        while b < 40 * SEG {
+            let g = good_region_size(b);
+            assert!(g <= b && g >= MIN_REGION);
+            assert_eq!((g - FIXED_PAGE) % SEG, 0, "k * SEGMENT_SIZE + FIXED_PAGE");
+            assert_eq!(usable_bytes(0, g), g - FIXED_PAGE);
+            assert!(g + SEG > b, "not the largest: {g} for budget {b}");
+            b += 4093; // a coprime stride so every residue gets visited
+        }
+
+        // The other direction: the smallest region that serves what is asked.
+        // "I need 192 KiB": three segments at the small profile, one at the
+        // shipped 32 MiB geometry -- the test asks the arithmetic, not a number.
+        let need: usize = 192 * 1024;
+        let k = need.div_ceil(SEG);
+        assert_eq!(region_for(need), k * SEG + FIXED_PAGE);
+        assert_eq!(usable_bytes(0, region_for(need)), k * SEG);
+        assert_eq!(
+            region_for(1),
+            SEG + FIXED_PAGE,
+            "one byte still costs a segment"
+        );
+        assert_eq!(
+            region_for(0),
+            MIN_REGION,
+            "and so does zero — a region must serve something"
+        );
+        assert_eq!(
+            region_for(SEG + 1),
+            2 * SEG + FIXED_PAGE,
+            "a byte over rounds up"
+        );
+        let mut u = 1;
+        while u < 40 * SEG {
+            let r = region_for(u);
+            assert!(
+                usable_bytes(0, r) >= u,
+                "region_for({u}) = {r} serves too little"
+            );
+            assert!(
+                usable_bytes(0, r - SEG) < u || r - SEG < MIN_REGION,
+                "region_for({u}) = {r} is not the smallest"
+            );
+            assert_eq!(
+                good_region_size(r),
+                r,
+                "a region_for answer is already a good size"
+            );
+            u += 4093;
+        }
+    }
+
     #[test]
     fn usable_bytes_answers_the_question_a_firmware_asks() {
         let seg = SEGMENT_SIZE;

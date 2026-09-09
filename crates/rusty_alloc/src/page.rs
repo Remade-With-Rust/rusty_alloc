@@ -574,6 +574,19 @@ pub struct EmptyPage(Page);
 unsafe impl Sync for EmptyPage {}
 
 /// The one shared empty page (see [`Page::empty_sentinel`]).
+/// In flash on a one-region target, for the same reason and under the same
+/// contract as `init::EMPTY_HEAP_BOX`: its free list is null, so the fast
+/// path never pops from it and nothing ever writes to it.
+#[cfg_attr(
+    all(
+        ra_single_threaded,
+        not(miri),
+        not(windows),
+        not(unix),
+        not(target_arch = "wasm32")
+    ),
+    unsafe(link_section = ".rodata.rusty_alloc_empty_page")
+)]
 pub static EMPTY_PAGE: EmptyPage = EmptyPage(Page::empty_sentinel());
 
 /// Pointer to the shared empty page, for `Heap::direct` slots with no page.

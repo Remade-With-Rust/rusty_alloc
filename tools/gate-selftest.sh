@@ -110,6 +110,20 @@ run_case "split64 normalises orderings" \
 # block, which is exactly the path the predicate prunes.
 run_case "ONE_THREAD is false where threads exist"   "crates/rusty_alloc/src/lib.rs"   's/pub\(crate\) const ONE_THREAD: bool = cfg!\(any\(/pub(crate) const ONE_THREAD: bool = true || cfg!(any(/'   "--test heaps heaps_arenas_subprocs_options"
 
+# --- firmware-what-is-left §1: good_region_size must do the arithmetic ------
+# A const fn that returned a plausible number for the reported case but got the
+# granule wrong would strand memory on every board that trusted it.
+run_case "good_region_size strands nothing"   "crates/rusty_alloc/src/prim/fixed.rs"   's/\(\(budget - FIXED_PAGE\) \/ seg\) \* seg \+ FIXED_PAGE/((budget - FIXED_PAGE) \/ seg) * seg/'   "--lib prim::fixed::tests::good_region_size"   "--cfg ra_single_threaded --cfg ra_small_profile"
+
+# --- firmware-what-is-left §3: ONE_REGION must be FALSE on a hosted target ----
+# It folds arenas, the segment map and the option table to what one region
+# needs. On a host with many OS ranges that is wrong. NOT the exclusive-arena
+# test: that one skips, honestly, when a reservation fails, so it stayed green
+# under this very mutation (found by this script on 2026-09-09). The broad
+# heaps test `expect`s its arena reservation and asserts that `options::set`
+# round-trips, and both go red.
+run_case "ONE_REGION is false where arenas exist"   "crates/rusty_alloc/src/lib.rs"   's/pub\(crate\) const ONE_REGION: bool = cfg!\(all\(/pub(crate) const ONE_REGION: bool = true || cfg!(all(/'   "--test heaps heaps_arenas_subprocs_options"
+
 echo
 if ((fail > 0)); then
   echo "GATE SELFTEST FAILED: $fail of $((pass + fail)) gates did not fire."
