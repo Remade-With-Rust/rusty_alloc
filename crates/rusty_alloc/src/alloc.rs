@@ -834,7 +834,18 @@ pub unsafe fn free_inline(p: *mut u8) {
     // of over the HeapBox's offset-0 delayed list) — correct even when the
     // thread has several first-class heaps. tid gates local vs remote.
     unsafe {
-        let owner_tid = (*seg).thread_id.load(core::sync::atomic::Ordering::Acquire);
+        // `ONE_THREAD` around the LOAD, not only the compare below: an
+        // `Acquire` load whose value is never used is still an acquire, and
+        // LLVM keeps it. On the ESP32-S3 that was an `l32i` and a `memw`
+        // barrier on every free, paid for a comparison that had folded to
+        // `true` — found reading the free path's disassembly for
+        // `docs/plans/finished/region-alignment-dissolve.md`. On every other
+        // target this is the load it always was.
+        let owner_tid = if crate::ONE_THREAD {
+            0
+        } else {
+            (*seg).thread_id.load(core::sync::atomic::Ordering::Acquire)
+        };
         // The thread id is read BEFORE the page resolution on purpose: read
         // after it, LLVM assigned the id to the register holding the just-
         // computed page pointer, and every later page access had to be

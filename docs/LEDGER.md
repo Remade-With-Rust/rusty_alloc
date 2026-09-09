@@ -4,6 +4,76 @@ One entry per milestone/brick: what landed, the numbers with their method lines,
 what was reverted and **which kind** of revert (measured-worse vs within-noise).
 Newest first.
 
+## REGION ALIGNMENT DISSOLVED — segments stride from the base; 24,144 B of stack back, +3 instructions per free, one knob (2026-09-09)
+
+`docs/plans/finished/region-alignment-dissolve.md`: the Janus firmware's
+proposal, after 2.0.4 — the 24,148-byte linker gap before the segment-aligned
+`Region` is the address mask's price, wasm already dissolved the same
+constraint with a slice table, and a fixed region has ONE base the backend
+already holds, so mask the offset from it instead.
+
+**What landed.** `crate::FIXED_REGION` (the prim is `prim::fixed`; the arena
+layer folds on it) and `crate::REGION_STRIDES` (`FIXED_REGION` unless
+`--cfg ra_aligned_region`). Under it `segment_of` is
+`p - ((p - base) & (SEGMENT_SIZE - 1))`, the fixed backend measures every
+alignment from the region's base (`place(.., origin)`, `install_region`
+aligns the base up to `REGION_ALIGN` = 16 and trims), `usable_bytes` runs up
+to 16 bytes instead of a segment, `Region<N>` is `repr(align(16))`,
+`link_is_plausible` and `huge_alloc`'s slack and `malloc_aligned`'s
+natural-fit bound follow the same predicate. Hosted builds: the x86-64 asm
+diff after all edits differs in debug records and one static's symbol name
+only — no instruction moved in any function a host links.
+
+**Measured, rig (probe firmware, `Region<196_608>`):** `.stack` 110,240 →
+**134,384 (+24,144)**, `.bss` and `.data` unchanged, `.data + .bss + .stack`
+311,220 → 335,364 (the 24,148 unaccounted bytes of 2.0.4 are 4 now);
+`xiao_s3_probe::HEAP` moved from `0x3fc90000` to `0x3fc8a1b0`. Flash +72 B
+against 2.0.4 (`prim::alloc` +114 for the origin arithmetic, `insert_at` /
+`remove_at` inlined away). Arm to arm against `esp-alloc` on the same rig:
+flash +3,228 B, stack **+26,688 B** for the same 220 KiB budget (was +2,544
+at 2.0.4: the 28,672 B `good_region_size` hands back is finally in
+`.stack`). Under the knob: `.stack` 110,240 (= 2.0.4), flash +3,092.
+
+**Measured, board (bench firmware, ns per alloc/free pair net of floor,
+pingpong / batch / churn / 2048 B):** 2.0.4 586 / 824 / 1,002 / 1,133;
+strides alone 603 / 845 / 1,023 / 1,142 (+17–21, 2–3 %); the knob reproduces
+2.0.4 to the nanosecond. Free path in the shipped `dealloc`: 37
+instructions at 2.0.4, 42 with strides — `l32r &REGION_BASE; l32i; sub;
+l32r 0xffff; and; sub` where the mask was `l32r 0xffff0000; and`.
+
+**The sibling finding, reading that disassembly.** Both arms carried
+`l32i a9, a11, 0x390` followed by a `memw`, with `a9` overwritten two
+instructions later: `(*seg).thread_id.load(Acquire)`, read BEFORE
+`crate::ONE_THREAD || owner_tid == thread_id()` folded the compare away.
+LLVM keeps an unused acquire load, so every free on every single-threaded
+firmware paid a load and a barrier for nothing. The load is inside the
+predicate now: 2.0.4-layout 578 / 820 / 997 / 1,125 (36 instructions),
+strides **595 / 833 / 1,011 / 1,134** (39). The shipped default is within
+9 ns of 2.0.4 on every row; the knob arm is 8 ns under it.
+
+**The plan's own gate, answered honestly.** It said: if the instruction
+count moves more than the wasm arm's table lookup did, keep the mask. wasm's
+lookup replaced an `and` with a shift, an add and a load (about +2);
+this is +3, one of them a data load — more, by one. That is why the trade
+is routed through a gate rather than decided once: RAM binds on this part
+(24 KiB of 512), so strides are the default; `--cfg ra_aligned_region` is
+the mask for a firmware whose alloc/free rate binds instead, tested on both
+geometries in CI. The two arms are the same tree, so the comparison is
+within-binary-config, immune to drift.
+
+**Gates.** clippy 0 on default / small / small+knob; `cargo test -p
+rusty_alloc` green on both geometries; the fixed-backend tests carve the
+region 0x1f0 past a 64 KiB line on purpose and assert a served segment is
+NOT absolutely aligned; `tests/region.rs` is a plain `static Region<N>` now
+(the firmware shape); gate-selftest 10/10 (new: `FIXED_REGION` forced true
+on a host refuses arenas and the arena test goes red); wasm 20,169 B
+unchanged; unsafe census re-baselined (test-only blocks for the knob arm;
+UNSAFE.md row updated).
+
+**Not taken, recorded:** the esp LLVM backend materialises `0xffff` through
+the literal pool instead of an `extui` — one instruction of the three, not
+worth a profile-specific cast in `segment_of`.
+
 ## REGION ALIGNMENT — the documented fix cost 60 KB of stack; whole segments, descriptor in a static (2026-09-09)
 
 `docs/plans/finished/region-alignment-bug.md`: the Janus firmware copied the

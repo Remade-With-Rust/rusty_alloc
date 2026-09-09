@@ -215,8 +215,47 @@ pub(crate) const GUARD_PAGES: bool = cfg!(any(unix, windows, miri));
 /// guarded sampling. A build with neither never seeds it.
 pub(crate) const RNG_USED: bool = GUARD_PAGES || cfg!(feature = "secure");
 
-/// `true` where memory is ONE region the linker handed over: the bare-metal
-/// `prim::fixed` backend, i.e. the first arm of [`ONE_THREAD`].
+/// `true` where the prim is `prim::fixed`: one region, handed over once, with
+/// no OS behind it. The arena layer folds on this constant — there is nothing
+/// to reserve from, and a range managed from outside would carve its chunks
+/// on absolute segment boundaries, which are not this target's strides
+/// ([`REGION_STRIDES`]).
+pub(crate) const FIXED_REGION: bool = cfg!(all(
+    not(miri),
+    not(windows),
+    not(unix),
+    not(target_arch = "wasm32")
+));
+
+/// `true` where segments are carved at `SEGMENT_SIZE` strides FROM THE
+/// REGION'S BASE rather than from address zero: [`FIXED_REGION`], unless
+/// `--cfg ra_aligned_region` asks for the hosted mask instead.
+///
+/// A hosted allocator recovers a block's segment by masking the pointer,
+/// which is why its segments — and any region holding them — must be
+/// `SEGMENT_SIZE`-aligned. On a fixed RAM map that alignment is paid as the
+/// gap the linker leaves before the aligned static: 24,148 bytes on the
+/// ESP32-S3 firmware that measured it, up to `SEGMENT_SIZE - 1` in general,
+/// and charged to no section (`docs/plans/finished/region-alignment-dissolve.md`).
+/// The backend already holds the region's base, so `segment_of` masks the
+/// OFFSET from it instead, every alignment the backend serves is measured
+/// from that base, and a region needs only `MAX_ALIGN_SIZE` alignment. wasm
+/// dissolved the same constraint with a slice table for the same reason —
+/// its scarce resource is space — and the hosted arms keep the mask, byte
+/// for byte.
+///
+/// The price is on `segment_of`, and it is recorded there: the free path
+/// grows from 36 to 39 instructions on the ESP32-S3 — a load of the base
+/// and two subtractions where the mask was a literal and an `and` — which
+/// the board prices at 9–17 ns per alloc/free pair (1.5–3 %) on its
+/// small-object benches. A firmware that would rather have those than the
+/// RAM sets `--cfg ra_aligned_region`: the mask is back,
+/// `prim::fixed::Region` is segment-aligned again, and so is the gap.
+pub(crate) const REGION_STRIDES: bool = FIXED_REGION && !cfg!(ra_aligned_region);
+
+/// `true` where memory is ONE region the linker handed over AND there is one
+/// thread to serve from it: [`FIXED_REGION`] under `--cfg ra_single_threaded`,
+/// i.e. the first arm of [`ONE_THREAD`].
 ///
 /// A hosted allocator manages many OS ranges, and four of its structures
 /// exist only for that: **arenas** (reserved OS ranges carved into segment
@@ -230,19 +269,14 @@ pub(crate) const RNG_USED: bool = GUARD_PAGES || cfg!(feature = "secure");
 /// check, the compiled-in defaults, a copy from flash — and the linker drops
 /// the rest (`docs/plans/finished/firmware-what-is-left.md` §3 and §7).
 ///
-/// What a firmware loses by it, stated rather than hidden: `arena::reserve_*`
-/// and `manage_os_memory_ex` return `Err`, and `options::set` is a no-op
-/// there. Neither had a working meaning on a chip before — an arena carved
-/// from the one region only added an indirection to the same bytes, and an
-/// option set at run time on a target with no environment was already the
-/// exception rather than the rule.
-pub(crate) const ONE_REGION: bool = cfg!(all(
-    ra_single_threaded,
-    not(miri),
-    not(windows),
-    not(unix),
-    not(target_arch = "wasm32")
-));
+/// What a firmware loses by it, stated rather than hidden: `options::set` is
+/// a no-op there, and — on [`FIXED_REGION`], which this implies —
+/// `arena::reserve_*` and `manage_os_memory_ex` return `Err`. Neither had a
+/// working meaning on a chip before — an arena carved from the one region
+/// only added an indirection to the same bytes, and an option set at run
+/// time on a target with no environment was already the exception rather
+/// than the rule.
+pub(crate) const ONE_REGION: bool = FIXED_REGION && cfg!(ra_single_threaded);
 
 pub mod alloc;
 pub mod arena;

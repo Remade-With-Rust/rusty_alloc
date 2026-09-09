@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **A firmware's region no longer needs to be segment-aligned, and the
+  linker's gap in front of it is gone.** On a fixed region segments are
+  carved at `SEGMENT_SIZE` strides from the region's base, and `segment_of`
+  masks the offset from that base instead of the address (`REGION_STRIDES`;
+  wasm made the same trade with a slice table in 2.0.0). `prim::fixed::Region`
+  is 16-byte aligned (`REGION_ALIGN`, new), `usable_bytes` / `MIN_REGION` /
+  `good_region_size` are exact from any 16-byte-aligned base, and the
+  firmware that reported the gap (`docs/plans/finished/region-alignment-dissolve.md`)
+  gets **24,144 bytes of stack back** with `.bss` unchanged — the 24,148 that
+  `size -A` could never show. The price is three instructions on every
+  `free` on the ESP32-S3 (39 against 36), 9–17 ns per alloc/free pair on the
+  board. **`--cfg ra_aligned_region`** (new) keeps the address mask and the
+  segment alignment — the 2.0.4 layout, gap included — for a firmware that
+  would rather have those; every sizing rule, the backend's placement and
+  `Region`'s alignment follow the flag. Hosted builds are unchanged to the
+  instruction. `FERR_MISALIGNED` still exists and still fires: a base off
+  the 16-byte grid with an exact length loses its last segment to the
+  run-up, exactly as before — `Region` cannot produce one. Strictly, a
+  type's alignment moving is observable; nothing a firmware does with
+  `Region` depends on it.
+- The arena layer folds on `FIXED_REGION` (any fixed-region target) rather
+  than on `ONE_REGION`: chunks carved on absolute segment boundaries are not
+  a strided region's segments.
+
+### Fixed
+
+- **Every `free` on a single-threaded target paid an acquire load and a
+  memory barrier for a comparison that had already folded to `true`.** The
+  segment's owner thread id was read with `Acquire` before `ONE_THREAD`
+  short-circuited the compare, and LLVM keeps an unused acquire; on the
+  ESP32-S3 that was an `l32i` and a `memw` on the hottest path in the
+  crate. The load is inside the predicate now: −8 ns per alloc/free pair on
+  the board, hosted builds unchanged. Found reading the free path's
+  disassembly for the change above.
+
 ## [2.0.4](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.0.3...rusty_alloc-v2.0.4) - 2026-09-09
 
 ### Fixed

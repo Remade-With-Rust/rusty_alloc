@@ -115,12 +115,15 @@ pub fn reserve_os_memory_ex(
     allow_large: bool,
     exclusive: bool,
 ) -> Result<i32, ()> {
-    // A one-region target has no OS to reserve from; an arena there could only
-    // be carved out of the one region and would serve the same bytes through
-    // one more table. Refused, so the arena layer -- its 32-slot registry, the
-    // chunk scan on every segment allocation, the reserve-on-miss path -- has
-    // no reachable entry and leaves the image (`firmware-what-is-left.md` §3).
-    if crate::ONE_REGION {
+    // A fixed-region target has no OS to reserve from; an arena there could
+    // only be carved out of the one region and would serve the same bytes
+    // through one more table -- and a range managed from outside would carve
+    // its chunks on absolute segment boundaries, where this target's segments
+    // stride from the region's base (`crate::FIXED_REGION`). Refused, so the
+    // arena layer -- its 32-slot registry, the chunk scan on every segment
+    // allocation, the reserve-on-miss path -- has no reachable entry and
+    // leaves the image (`firmware-what-is-left.md` §3).
+    if crate::FIXED_REGION {
         return Err(());
     }
     let total = size.div_ceil(SEGMENT_SIZE) * SEGMENT_SIZE;
@@ -148,7 +151,7 @@ pub fn manage_os_memory_ex(
     exclusive: bool,
 ) -> Result<i32, ()> {
     // As `reserve_os_memory_ex`: no arenas on a one-region target.
-    if crate::ONE_REGION {
+    if crate::FIXED_REGION {
         return Err(());
     }
     let lo_addr = (start.addr() + SEGMENT_SIZE - 1) & !(SEGMENT_SIZE - 1);
@@ -252,7 +255,7 @@ pub fn chunk_alloc(restrict_id: i32) -> Option<(*mut u8, bool)> {
     // No arenas on a one-region target: every segment comes straight from the
     // region. Folding this here is what removes the registry scan from the
     // segment-allocation path on a chip.
-    if crate::ONE_REGION {
+    if crate::FIXED_REGION {
         return None;
     }
     if restrict_id < 0 && crate::options::is_enabled(27) {
@@ -334,7 +337,7 @@ static MULTI_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 /// multi-bit search; the single-chunk path stays lock-free.
 #[allow(clippy::needless_range_loop)] // indexed scan over a fixed atomic table
 pub fn chunk_alloc_n(restrict_id: i32, n: usize) -> Option<(*mut u8, bool)> {
-    if crate::ONE_REGION {
+    if crate::FIXED_REGION {
         return None;
     }
     if n == 1 {
@@ -436,7 +439,7 @@ fn chunk_alloc_n_inner(restrict_id: i32, n: usize) -> Option<(*mut u8, bool)> {
 /// Free `n` contiguous chunks. True when the address belonged to an arena.
 #[allow(clippy::needless_range_loop)] // indexed scan over a fixed atomic table
 pub fn chunk_free_n(p: *mut u8, n: usize) -> bool {
-    if crate::ONE_REGION {
+    if crate::FIXED_REGION {
         return false; // nothing came from an arena, so nothing returns to one
     }
     let addr = p.addr();
@@ -465,7 +468,7 @@ pub fn chunk_free_n(p: *mut u8, n: usize) -> bool {
 /// Return a chunk to its arena. True when the address belonged to one.
 #[allow(clippy::needless_range_loop)] // indexed scan over a fixed atomic table
 pub fn chunk_free(p: *mut u8) -> bool {
-    if crate::ONE_REGION {
+    if crate::FIXED_REGION {
         return false;
     }
     let addr = p.addr();
@@ -586,7 +589,7 @@ pub(crate) fn adopt_os_block(ptr: *mut u8, size: usize) -> Option<i32> {
 
 /// `mi_arena_area`: the arena's base and size, or null.
 pub fn arena_area(id: i32) -> (*mut u8, usize) {
-    if crate::ONE_REGION || id < 0 || id as usize >= ARENA_COUNT.load(Ordering::Acquire) {
+    if crate::FIXED_REGION || id < 0 || id as usize >= ARENA_COUNT.load(Ordering::Acquire) {
         return (ptr::null_mut(), 0);
     }
     let a = ARENAS[id as usize].load(Ordering::Acquire);
