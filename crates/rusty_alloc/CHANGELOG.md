@@ -40,6 +40,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CSPRNG is seeded only where something draws from it. On the ESP32-S3 that was
   2,366 bytes of unreachable code plus 1,621 bytes of seeding for a generator
   nothing read.
+- **`--features linkcheck` without `secure` did not compile.** The non-secure
+  link check still passed the page extent that the dropped narrowing used to
+  take. CI built only the default and `--all-features`, so the combination
+  rotted unseen; it now builds, and CI clippies each optional feature alone.
+- A `prim::fixed` unit test asserted that a `SEGMENT_SIZE`-aligned page cannot
+  come out of a region smaller than a segment, which is only true when the
+  region does not straddle a boundary — the loader decides that, and on
+  2026-09-08 it put CI's 512 KiB window across a 32 MiB line. The allocator was
+  right; the test now decides from the address.
 
 ## [2.0.1](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.0.0...rusty_alloc-v2.0.1) - 2026-09-08
 

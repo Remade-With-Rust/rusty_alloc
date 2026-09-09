@@ -53,6 +53,28 @@ profile; `rusty_alloc-api` `no_std`; wasm ratchet; `tools/gate-selftest.sh`
 with a sixth mutation (`ONE_THREAD` forced true on the host must turn the
 subproc test red — it does, through `abandoned_push`'s `unreachable!`).
 
+**What CI on the PR turned up (2026-09-09).** Three things, none of them the
+size work. (1) `main`'s `embedded` job was red on a `prim::fixed` test that
+claimed a `SEGMENT_SIZE`-aligned page cannot come out of a 512 KiB region —
+true only when the region does not straddle a boundary, a 1-in-64 ASLR roll;
+made two-sided. (2) `stress_mt` has been flaky on `main` since 2026-08-24
+(the run history: mostly red, occasionally green, both OSes). It is NOT
+Windows-only and NOT "passes locally": with `--all-features`, the CI
+configuration, it failed 1 of 40 local runs on a 24-core box, and on the
+two-vCPU runner roughly two runs in three. Two failure modes seen: a silent
+`abort()` (the double-free or corrupt-link detector) and
+`abandoned block corrupted: left 118, right 119` — a live, abandoned block's
+first byte read 0x76 where its dead owner wrote 0x77. A bounded bisection
+(40 runs per single feature) found nothing at 0/40 for default, `secure`,
+`blockmap`, `debug_checks`, `secure,blockmap`, `secure,linkcheck`; the race
+needs the full combination or more runs, and is left as the standing open
+defect. (3) The same bisection read `linkcheck` alone as 40/40 failures,
+which was one rustc error: that feature without `secure` had not compiled
+since the page-extent narrowing was dropped. Fixed, with a per-feature clippy
+step in CI. `supply-chain` is red on `cargo vet` for `portable-atomic 1.15.0`
+(no imported audit covers it) and is left for the owner: a 30k-line audit, a
+publisher-trust entry, or dropping the dependency are all decisions.
+
 **A process note.** The first clippy run failed on `assertions_on_constants`:
 `debug_assert!(!ONE_THREAD)` is an assertion on a constant. Rewritten as
 `if ONE_THREAD { unreachable!() }`, which is also louder in release. And the
