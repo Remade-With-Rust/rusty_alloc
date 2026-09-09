@@ -356,3 +356,81 @@ before.
   largest symbols and both are the allocator working. **The allocator is at
   its floor on this target for code**; what remains to a firmware is the
   granule, and §7.1 hands that back.
+
+---
+
+## 9. Consumer verification of 2.0.3, and one finding against `good_region_size`
+
+Re-measured on the board, same firmware source, same five buffers.
+
+### The numbers hold, two of them exactly
+
+| | 2.0.1 | 2.0.2 | 2.0.3 | upstream claim |
+|---|---:|---:|---:|---:|
+| flash delta | +16,584 | +8,084 | **+3,392** | +3,208 |
+| static RAM delta | +3,092 | +3,052 | **+284** | +284 |
+| attributable code | 16,256 | 8,297 | **4,313** | 4,313 |
+| symbols | 57 | 37 | **27** | — |
+
+**Static RAM and attributable code match to the byte.** The 184-byte flash gap
+is the consumer seam's own `Error` variants, the same residue as the previous
+two releases, and not a disagreement. Against 2.0.1 this is -79.5 % flash and
+-90.8 % static RAM, and since the `.stack` identity still holds exactly, the
+stack hazard is now 284 bytes rather than 3,092.
+
+### `good_region_size` is correct only for an aligned base, and nothing says so
+
+`good_region_size(220 * 1024)` returns 200,704. Sizing a heap to exactly that
+**killed the firmware** at startup:
+
+```
+MEM stage=boot used=0 free=200704 total=200704
+handle_alloc_error / __rdl_alloc_error_handler / main
+```
+
+Segments must be `SEGMENT_SIZE`-aligned, and the natural way to hand this
+crate a region on bare metal -- a `static` wrapping `[u8; N]` -- has
+**alignment 1**. An unaligned base discards up to 65,535 bytes before the
+first boundary, and a region sized to exactly `k * SEGMENT_SIZE + FIXED_PAGE`
+has no slack to absorb it: two segments fitted where three were needed. The
+220 KiB region it replaced survived only because its stranded 24,576 bytes
+happened to cover the misalignment.
+
+Aligning the region to 64 KiB fixes it, and the result is the strongest form
+of the evidence:
+
+| region, 200,704 bytes | stage=buffers |
+|---|---|
+| unaligned base | **panic in `handle_alloc_error`** |
+| `#[repr(align(65536))]` | **`used=200704 free=0`** |
+
+Set to the predicted floor, passing with nothing left over.
+
+**Correction, same day.** An earlier draft of this section said the API does
+not warn about alignment. That was wrong: `good_region_size`'s own doc states
+the assumption plainly and points at `usable_bytes` as the exact check. The
+defect is narrower and is written up separately in
+`docs/plans/region-alignment-bug.md`: the **code example directly above that
+paragraph** demonstrates the pattern that violates it, and `init_region`
+computes the exact loss and then discards it, comparing only against zero.
+Three options, cheapest first:
+
+1. Say it in `good_region_size`'s own doc, next to the returned value.
+2. Have `init_region` return `FERR_GEOMETRY` when the base is unaligned *and*
+   the region is too tight to absorb it -- it already has both numbers, and it
+   is the one place that sees the real address.
+3. Ship the aligned container, so the consumer cannot get it wrong: a
+   `#[repr(align)]` region type is four lines and removes the class.
+
+### Kernels, across a region that both moved and shrank
+
+| comparison | worst kernel delta |
+|---|---:|
+| esp-alloc to 2.0.1 | 7.698 % |
+| 2.0.1 to 2.0.2 | 0.006 % |
+| 2.0.3 at 220 KiB to 2.0.3 aligned at 196 KiB | **0.007 %** |
+
+Every buffer moved and every kernel held, which refines section 8's placement
+finding rather than contradicting it: the kernels are sensitive to a buffer's
+offset within its page and bank -- fixed by the allocation sequence -- not to
+its absolute address, which the region's base sets.

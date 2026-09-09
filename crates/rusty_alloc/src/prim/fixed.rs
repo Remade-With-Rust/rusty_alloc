@@ -63,8 +63,30 @@ pub const FERR_GEOMETRY: PrimError = 0xF13F;
 /// A region is already registered; this backend takes one, once.
 pub const FERR_REGISTERED: PrimError = 0xF140;
 
+/// The region's BASE costs at least one whole segment: from this address the
+/// region yields fewer segments than the same length would from a
+/// `SEGMENT_SIZE`-aligned one.
+///
+/// This is the shape a caller who sized the region *exactly* — with
+/// [`good_region_size`], `k * SEGMENT_SIZE`, the README — hits when the
+/// container holding it has alignment 1, which is what a plain
+/// `static [u8; N]` has. The Janus firmware did exactly that: a
+/// `good_region_size(220 * 1024)` region at the base the linker chose,
+/// `0x3fc8a1e4`, lost 24,092 bytes to the first boundary and served two
+/// segments where the number said three, and the first allocation past
+/// 128 KiB panicked in `handle_alloc_error` — 484 bytes short of the round
+/// number that had happened to work
+/// (`docs/plans/finished/region-alignment-bug.md`). `init_region` had the
+/// exact answer in hand and threw it away; now it refuses instead. The fix
+/// is [`Region`], which cannot be misaligned and carries no padding.
+pub const FERR_MISALIGNED: PrimError = 0xF141;
+
 /// The smallest region this backend will accept, for a `SEGMENT_SIZE`-ALIGNED
-/// base: one segment for the allocator plus one page for its heap descriptor.
+/// base: one segment. The heap descriptor is not in it — on this backend the
+/// first heap's descriptor lives in a static of its own ([`take_first_heap_box`]),
+/// so a region is whole segments and nothing else. (Until 2.0.3 this was
+/// `SEGMENT_SIZE + FIXED_PAGE`, the page being the descriptor; the rewrite is
+/// §7 of `docs/plans/finished/region-alignment-bug.md`.)
 ///
 /// Exposed so a firmware can settle its budget at COMPILE time rather than on
 /// silicon, which is what the first outside adopter asked for
@@ -78,13 +100,14 @@ pub const FERR_REGISTERED: PrimError = 0xF140;
 /// segment can only start on a segment boundary; [`init_region`] checks the
 /// real base and is therefore exact where this constant is optimistic. Align
 /// the region and the two agree.
-pub const MIN_REGION: usize = crate::types::SEGMENT_SIZE + FIXED_PAGE;
+pub const MIN_REGION: usize = crate::types::SEGMENT_SIZE;
 
 /// Page granularity reported to the layers above. A chip has no paging
 /// hardware, so this is a bookkeeping unit rather than a hardware fact; 4 KiB
 /// matches the flash/RAM block size the ESP parts use and keeps `page_align_up`
 /// rounding modest on a region measured in tens of kilobytes.
-const FIXED_PAGE: usize = 4096;
+/// The backend's page: the granule of every request that is not a segment.
+pub const FIXED_PAGE: usize = 4096;
 
 /// Free extents tracked at once.
 ///
@@ -207,11 +230,16 @@ impl Drop for Guard {
 /// or not at all. A 220 KiB region at the small profile yields three segments
 /// and strands 24,576 bytes — 11 % of the budget, silently.
 ///
-/// Segments are carved from the first `SEGMENT_SIZE`-aligned address upward and
-/// page-sized blocks from the top down, so the answer is
-/// `floor((end - first_aligned - FIXED_PAGE) / SEGMENT_SIZE) * SEGMENT_SIZE`:
-/// the leading bytes before alignment are unusable, and one page is reserved at
-/// the top for the heap descriptor without which the allocator cannot start.
+/// Segments are carved from the first `SEGMENT_SIZE`-aligned address upward,
+/// so the answer is `floor((end - first_aligned) / SEGMENT_SIZE) * SEGMENT_SIZE`:
+/// the leading bytes before alignment are unusable, and everything from the
+/// first boundary is whole segments. Nothing is reserved for the heap
+/// descriptor: on this backend the first heap's descriptor is a static
+/// ([`take_first_heap_box`]), not a page of the region. (Until 2.0.3 one page
+/// was reserved at the top for it, which is why the shipped sizing rule was
+/// `k * SEGMENT_SIZE + FIXED_PAGE` — and why an aligned container of that size
+/// paid `SEGMENT_SIZE - FIXED_PAGE` of padding: §7 of
+/// `docs/plans/finished/region-alignment-bug.md`.)
 ///
 /// **This is not the same question as [`region_stats`]'s `free`.** That reports
 /// bytes nobody has taken, and the stranded tail is genuinely available to
@@ -239,51 +267,52 @@ pub const fn usable_bytes(base: usize, len: usize) -> usize {
         return 0;
     }
     let avail = end - first;
-    // One page at the top for the heap descriptor. Without it `create_heap`
-    // fails and no segment can be used even if one fits.
-    if avail <= FIXED_PAGE {
-        return 0;
-    }
-    ((avail - FIXED_PAGE) / seg) * seg
+    (avail / seg) * seg
 }
 
 /// The largest region no bigger than `budget` that strands NOTHING, for a
-/// `SEGMENT_SIZE`-aligned base: `k * SEGMENT_SIZE + FIXED_PAGE`.
+/// `SEGMENT_SIZE`-aligned base: `k * SEGMENT_SIZE`.
 ///
 /// [`usable_bytes`] lets a firmware *observe* the granule's loss; this is
 /// what lets it *avoid* the loss, and it is pure arithmetic. A region is
-/// carved into whole segments from the bottom plus one page for the heap
-/// descriptor at the top, so any size that is not `k * SEGMENT_SIZE +
-/// FIXED_PAGE` leaves the remainder dead to segments. The Janus firmware that
+/// carved into whole segments, so any size that is not a multiple of
+/// `SEGMENT_SIZE` leaves the remainder dead to them. The Janus firmware that
 /// reported it handed over 220 KiB and got 196,608 usable with 24,576
 /// stranded — 11 % of its budget, and three times what the allocator's whole
 /// code costs on that chip after 2.0.2
 /// (`docs/plans/finished/firmware-what-is-left.md` §1).
 ///
-/// `const fn`, so the answer is settled where the region is declared:
+/// `const fn`, so the answer is settled where the region is declared — in
+/// [`Region`], which is `SEGMENT_SIZE`-aligned by construction and, because
+/// its size is whole segments, carries no padding:
 ///
 /// ```ignore
+/// use rusty_alloc::prim::fixed::{Region, good_region_size};
 /// static HEAP: Region<{ good_region_size(220 * 1024) }> = Region::new();
-/// // 200,704 bytes: three 64 KiB segments plus the page, nothing stranded,
-/// // and 24,576 bytes handed back to the firmware's own use.
+/// // 196,608 bytes: three 64 KiB segments, nothing stranded, 28,672 bytes
+/// // of the budget handed back to the firmware's own use.
 /// ```
+///
+/// **Use [`Region`], not a container of your own.** A plain `static [u8; N]`
+/// has alignment 1: the linker puts it anywhere, this exact size then yields
+/// one segment fewer than its name says, and [`init_region`] refuses it with
+/// [`FERR_MISALIGNED`] rather than serve two thirds of the heap. An aligned
+/// container of your own with the OLD shape (`k * SEGMENT_SIZE + FIXED_PAGE`,
+/// the 2.0.3 rule) is worse: a type's size is rounded up to its alignment, so
+/// `#[repr(align(65536))]` around 200,704 bytes occupies 262,144 — and the
+/// Janus firmware that took that advice lost 60,952 bytes of stack to it.
+/// Both halves of that history are in
+/// `docs/plans/finished/region-alignment-bug.md`.
 ///
 /// Rounds DOWN, because a budget is a ceiling: asking for the largest
 /// zero-waste region that fits is the question a firmware with N bytes to
 /// spare is asking. [`region_for`] is the other direction. Returns 0 when no
-/// zero-waste region fits at all (`budget < MIN_REGION`), which the same
-/// `const` assertion that guards `MIN_REGION` turns into a build error.
-///
-/// Assumes the base is `SEGMENT_SIZE`-aligned, like [`MIN_REGION`]; an
-/// unaligned base loses up to `SEGMENT_SIZE - 1` bytes to the first boundary
-/// and `usable_bytes` on the real base is the exact check.
+/// zero-waste region fits at all (`budget < MIN_REGION`), which [`Region`]'s
+/// compile-time check turns into a build error.
 #[must_use]
 pub const fn good_region_size(budget: usize) -> usize {
     let seg = crate::types::SEGMENT_SIZE;
-    if budget < MIN_REGION {
-        return 0;
-    }
-    ((budget - FIXED_PAGE) / seg) * seg + FIXED_PAGE
+    (budget / seg) * seg
 }
 
 /// The smallest region that serves at least `usable` bytes of segments, for a
@@ -291,8 +320,9 @@ pub const fn good_region_size(budget: usize) -> usize {
 /// end: a firmware that knows what it needs rather than what it can spare.
 ///
 /// ```ignore
-/// // "I need 192 KiB of heap": 196,608 + 4,096 = 200,704 bytes, and
-/// // usable_bytes(0, 200_704) == 196_608 exactly.
+/// // "I need 192 KiB of heap": 196,608 bytes, three segments, and
+/// // usable_bytes(0, 196_608) == 196_608 exactly.
+/// use rusty_alloc::prim::fixed::{Region, region_for};
 /// static HEAP: Region<{ region_for(192 * 1024) }> = Region::new();
 /// ```
 ///
@@ -302,7 +332,7 @@ pub const fn good_region_size(budget: usize) -> usize {
 pub const fn region_for(usable: usize) -> usize {
     let seg = crate::types::SEGMENT_SIZE;
     let segments = if usable == 0 { 1 } else { usable.div_ceil(seg) };
-    segments * seg + FIXED_PAGE
+    segments * seg
 }
 
 /// Hand the backend the region it will serve from, once.
@@ -323,6 +353,10 @@ pub const fn region_for(usable: usize) -> usize {
 ///   the build was clean, and the first `Vec` on the board returned null with a
 ///   backtrace pointing at whatever happened to allocate first. Reported by the
 ///   first outside firmware to adopt 2.0.0 (`docs/plans/embedded-adoption.md`).
+/// - [`FERR_MISALIGNED`] — the base costs a whole segment against what this
+///   length would yield from an aligned base, so the caller's model of the
+///   size is wrong for this address. Use [`Region`], or size from
+///   [`usable_bytes`] on the real base.
 /// - [`FERR_REGISTERED`] — a region is already registered.
 pub fn init_region(region: &'static mut [u8]) -> Result<(), PrimError> {
     let len = region.len();
@@ -338,6 +372,18 @@ pub fn init_region(region: &'static mut [u8]) -> Result<(), PrimError> {
     // segment boundary and still fail on the board.
     if usable_bytes(base, len) == 0 {
         return Err(FERR_GEOMETRY);
+    }
+    // The base can cost a whole segment, and this is the one place that holds
+    // both numbers: `usable_bytes` on the real base is exact, and on base 0 it
+    // is what this length promises from an aligned container. When they
+    // differ, the caller believed a size that this address cannot deliver —
+    // `good_region_size(220 * 1024)` at `0x3fc8a1e4` serves two segments, not
+    // three — and serving the smaller heap silently is how the Janus firmware
+    // reached `handle_alloc_error` 484 bytes short. A round length that
+    // strands as much at an aligned base as it loses here passes: the numbers
+    // agree, and that caller made no claim of exactness.
+    if usable_bytes(base, len) < usable_bytes(0, len) {
+        return Err(FERR_MISALIGNED);
     }
 
     let _g = Guard::acquire(&LOCK);
@@ -362,6 +408,215 @@ fn install_region(base: usize, len: usize) {
     EXT_BASE[0].store(base, Ordering::Relaxed);
     EXT_LEN[0].store(len, Ordering::Relaxed);
     EXT_COUNT.store(1, Ordering::Relaxed);
+}
+
+/// Storage for the FIRST heap's descriptor, so the region needs no page.
+///
+/// `create_heap` used to take one `FIXED_PAGE` from the region for every
+/// `HeapBox`, which made a firmware's region `k * SEGMENT_SIZE + FIXED_PAGE`
+/// — and an aligned container of that size is rounded up to the alignment,
+/// so it paid `SEGMENT_SIZE - FIXED_PAGE` of padding for the privilege
+/// (`docs/plans/finished/region-alignment-bug.md` §7). One heap lives for the
+/// life of a firmware; its descriptor is this static, the region is whole
+/// segments, and the padding has nothing to pad. A second heap, should a
+/// firmware create one, takes a page from the region as before and costs the
+/// segment that page breaks.
+///
+/// Bare metal only — a hosted target has an OS to allocate from, and pays
+/// nothing for this.
+#[cfg(all(not(miri), not(windows), not(unix), not(target_arch = "wasm32")))]
+struct FirstHeapBox(core::cell::UnsafeCell<core::mem::MaybeUninit<crate::init::HeapBox>>);
+
+// SAFETY: handed out exactly once, by `take_first_heap_box`'s swap, on the
+// one thread a bare-metal build has; nothing else names the cell.
+#[cfg(all(not(miri), not(windows), not(unix), not(target_arch = "wasm32")))]
+unsafe impl Sync for FirstHeapBox {}
+
+#[cfg(all(not(miri), not(windows), not(unix), not(target_arch = "wasm32")))]
+static FIRST_HEAP_BOX: FirstHeapBox =
+    FirstHeapBox(core::cell::UnsafeCell::new(core::mem::MaybeUninit::uninit()));
+#[cfg(all(not(miri), not(windows), not(unix), not(target_arch = "wasm32")))]
+static FIRST_HEAP_BOX_TAKEN: AtomicBool = AtomicBool::new(false);
+
+/// The first heap's descriptor storage, once; `None` afterwards and on every
+/// hosted target. Uninitialised: the caller writes every field, as it does
+/// for a fresh page.
+#[must_use]
+pub fn take_first_heap_box() -> Option<*mut crate::init::HeapBox> {
+    #[cfg(all(not(miri), not(windows), not(unix), not(target_arch = "wasm32")))]
+    {
+        if FIRST_HEAP_BOX_TAKEN.swap(true, Ordering::AcqRel) {
+            None
+        } else {
+            Some(FIRST_HEAP_BOX.0.get().cast())
+        }
+    }
+    #[cfg(not(all(not(miri), not(windows), not(unix), not(target_arch = "wasm32"))))]
+    {
+        None
+    }
+}
+
+/// Whether `hb` is the descriptor [`take_first_heap_box`] handed out, i.e.
+/// storage that must never be returned to the region.
+#[must_use]
+pub fn is_first_heap_box(hb: *const crate::init::HeapBox) -> bool {
+    #[cfg(all(not(miri), not(windows), not(unix), not(target_arch = "wasm32")))]
+    {
+        core::ptr::eq(hb, FIRST_HEAP_BOX.0.get().cast_const().cast())
+    }
+    #[cfg(not(all(not(miri), not(windows), not(unix), not(target_arch = "wasm32"))))]
+    {
+        let _ = hb;
+        false
+    }
+}
+
+/// A firmware's heap region: `N` bytes of static storage, `SEGMENT_SIZE`-
+/// aligned by construction, a whole number of segments so it carries no
+/// padding, handed to the allocator once.
+///
+/// ```ignore
+/// use rusty_alloc::prim::fixed::{Region, good_region_size};
+///
+/// static HEAP: Region<{ good_region_size(220 * 1024) }> = Region::new();
+///
+/// fn main() {
+///     let usable = HEAP.give().expect("the region is accepted, and given once");
+///     // usable == 196_608: three 64 KiB segments, nothing stranded.
+/// }
+/// ```
+///
+/// This exists because the alternatives both lose memory. The caller's own
+/// `static [u8; N]` has alignment 1, and every sizing rule in this module
+/// assumes a `SEGMENT_SIZE`-aligned base, so a region sized by
+/// [`good_region_size`] but placed by the linker at an arbitrary address
+/// yields one segment fewer than its name says — the Janus firmware found
+/// that out at `handle_alloc_error`. And the caller's own
+/// `#[repr(align(65536))]` container around an exact size is rounded up to
+/// the alignment: 200,704 bytes became 262,144 in `.bss` and cost that
+/// firmware 60,952 bytes of stack. This type is aligned AND a whole number
+/// of segments, so `size_of::<Region<N>>() == N` and the region is the
+/// segments it serves, exactly (`docs/plans/finished/region-alignment-bug.md`).
+///
+/// `const fn new()`, so it is a `static` and the bytes sit in the image's
+/// `.bss` rather than on anybody's stack; `N` is checked at compile time to
+/// be at least one segment and a multiple of `SEGMENT_SIZE`, so
+/// `Region<{ good_region_size(x) }>` for a budget below the floor is a build
+/// error rather than a board run. At the shipped 32 MiB geometry the
+/// alignment is 32 MiB, which no chip-sized `.bss` can honour — this is a
+/// small-profile type in practice, as every firmware is.
+#[repr(C)]
+#[cfg_attr(ra_small_profile, repr(align(65536)))]
+#[cfg_attr(not(ra_small_profile), repr(align(33554432)))]
+pub struct Region<const N: usize> {
+    bytes: core::cell::UnsafeCell<[u8; N]>,
+}
+
+/// Whether any [`Region`] has been given. ONE flag for every instance rather
+/// than a field in each: a field — even one byte — beside a segment-aligned
+/// array rounds the type's size up to the next segment, which is the padding
+/// this type exists to avoid (measured: `Region<196_608>` with a flag inside
+/// was 262,144 bytes). One region can ever be registered per program, so one
+/// flag is exact, and it is swapped BEFORE the `&mut` is formed so a second
+/// `give` on the same instance never aliases the first.
+static REGION_GIVEN: AtomicBool = AtomicBool::new(false);
+
+// The literal in `repr(align)` cannot name a constant, so pin it to the
+// geometry it is supposed to track; and a whole-segment size with the
+// segment's alignment must not be padded, or the type has failed its purpose.
+const _: () = assert!(
+    core::mem::align_of::<Region<MIN_REGION>>() == crate::types::SEGMENT_SIZE,
+    "Region's alignment must equal SEGMENT_SIZE"
+);
+const _: () = assert!(
+    core::mem::size_of::<Region<MIN_REGION>>() == MIN_REGION,
+    "Region must carry no padding"
+);
+
+// SAFETY: the bytes are handed out exactly once. `give` swaps the
+// module-wide `REGION_GIVEN` first and every later call, on any instance, is
+// refused without touching `bytes`; nothing else in this module reads or
+// writes `bytes`, so the one `&'static mut` that `give` produces is never
+// aliased. The same handoff the Janus seam has carried since 2.0.0, moved
+// here so that the alignment travels with it.
+unsafe impl<const N: usize> Sync for Region<N> {}
+
+impl<const N: usize> Region<N> {
+    /// Bytes this region serves as segments: all of them, because the base
+    /// is aligned and `N` is whole segments. Equal to `N`; spelled out so a
+    /// firmware's `const` assertions read as what they mean.
+    pub const USABLE: usize = usable_bytes(0, N);
+
+    /// Reserve `N` bytes. A build error when `N` is not a whole number of
+    /// segments, or cannot hold one.
+    #[must_use]
+    pub const fn new() -> Self {
+        const {
+            assert!(
+                N >= MIN_REGION,
+                "Region<N>: N cannot hold one segment at this geometry - raise it, \
+                 or set --cfg ra_small_profile (64 KiB segments)"
+            );
+            assert!(
+                N.is_multiple_of(crate::types::SEGMENT_SIZE),
+                "Region<N>: N must be a whole number of segments - size it with \
+                 good_region_size(budget) or region_for(usable)"
+            );
+        }
+        Region {
+            bytes: core::cell::UnsafeCell::new([0; N]),
+        }
+    }
+
+    /// Hand the region to the allocator. Call once, before the first
+    /// allocation. Returns the bytes the allocator can serve from it, which
+    /// for this type is [`Region::USABLE`].
+    ///
+    /// # Errors
+    /// [`FERR_REGISTERED`] on a second call, on any `Region`, or when a
+    /// region was registered through [`init_region`] directly;
+    /// [`init_region`]'s other codes as documented there
+    /// ([`FERR_MISALIGNED`] cannot occur — that is what this type is for).
+    pub fn give(&'static self) -> Result<usize, PrimError> {
+        if REGION_GIVEN.swap(true, Ordering::AcqRel) {
+            return Err(FERR_REGISTERED);
+        }
+        // SAFETY: the swap above succeeded, so this is the first `give` on
+        // any `Region` in the program; `self` is `'static`, so the bytes live
+        // for the program; and no other code touches `bytes`, so this is the
+        // only reference to them there will ever be.
+        let bytes: &'static mut [u8] = unsafe { &mut *self.bytes.get() };
+        let base = bytes.as_ptr().expose_provenance();
+        init_region(bytes)?;
+        Ok(usable_bytes(base, N))
+    }
+
+    /// Bytes the allocator can serve from this region at its real base.
+    /// Equal to [`Region::USABLE`], because the base is aligned; exposed so a
+    /// firmware can log what it measured rather than what it assumed.
+    #[must_use]
+    pub fn usable(&self) -> usize {
+        usable_bytes(self.bytes.get().expose_provenance(), N)
+    }
+
+    /// The region's size in bytes.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        N
+    }
+
+    /// Whether the region is empty; never, since `N >= MIN_REGION`.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        N == 0
+    }
+}
+
+impl<const N: usize> Default for Region<N> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Whether `addr` lies inside the registered region.
@@ -1028,11 +1283,12 @@ mod tests {
     /// adopter's report.
     /// §1 of `firmware-what-is-left.md`: a budget rounds DOWN to the largest
     /// zero-waste region, a need rounds UP to the smallest sufficient one,
-    /// and both agree with `usable_bytes` to the byte.
+    /// and both agree with `usable_bytes` to the byte. Whole segments since
+    /// 2.0.4: the heap descriptor is a static, so no page is added.
     #[test]
     fn good_region_size_strands_nothing() {
         use crate::types::SEGMENT_SIZE as SEG;
-        // The reported case: 220 KiB strands 24,576; the good size strands 0.
+        // The reported case: 220 KiB strands 28,672; the good size strands 0.
         // Only meaningful at the small profile -- at the shipped 32 MiB
         // segment a 220 KiB budget is below the floor and the answer is 0,
         // which is the other thing this function must say.
@@ -1040,16 +1296,8 @@ mod tests {
         let good = good_region_size(budget);
         assert!(good <= budget, "a budget is a ceiling");
         if budget >= MIN_REGION {
-            assert_eq!(
-                good,
-                3 * SEG + FIXED_PAGE,
-                "three segments plus the page at this geometry"
-            );
-            assert_eq!(
-                usable_bytes(0, good),
-                good - FIXED_PAGE,
-                "every byte but the page is a segment"
-            );
+            assert_eq!(good, 3 * SEG, "three segments at this geometry");
+            assert_eq!(usable_bytes(0, good), good, "every byte is a segment");
             assert_eq!(
                 usable_bytes(0, budget),
                 usable_bytes(0, good),
@@ -1057,7 +1305,7 @@ mod tests {
             );
             assert_eq!(
                 budget - good,
-                24_576,
+                28_672,
                 "and that is what the budget was stranding"
             );
         } else {
@@ -1078,8 +1326,8 @@ mod tests {
         while b < 40 * SEG {
             let g = good_region_size(b);
             assert!(g <= b && g >= MIN_REGION);
-            assert_eq!((g - FIXED_PAGE) % SEG, 0, "k * SEGMENT_SIZE + FIXED_PAGE");
-            assert_eq!(usable_bytes(0, g), g - FIXED_PAGE);
+            assert_eq!(g % SEG, 0, "k * SEGMENT_SIZE");
+            assert_eq!(usable_bytes(0, g), g);
             assert!(g + SEG > b, "not the largest: {g} for budget {b}");
             b += 4093; // a coprime stride so every residue gets visited
         }
@@ -1089,23 +1337,15 @@ mod tests {
         // shipped 32 MiB geometry -- the test asks the arithmetic, not a number.
         let need: usize = 192 * 1024;
         let k = need.div_ceil(SEG);
-        assert_eq!(region_for(need), k * SEG + FIXED_PAGE);
+        assert_eq!(region_for(need), k * SEG);
         assert_eq!(usable_bytes(0, region_for(need)), k * SEG);
-        assert_eq!(
-            region_for(1),
-            SEG + FIXED_PAGE,
-            "one byte still costs a segment"
-        );
+        assert_eq!(region_for(1), SEG, "one byte still costs a segment");
         assert_eq!(
             region_for(0),
             MIN_REGION,
             "and so does zero — a region must serve something"
         );
-        assert_eq!(
-            region_for(SEG + 1),
-            2 * SEG + FIXED_PAGE,
-            "a byte over rounds up"
-        );
+        assert_eq!(region_for(SEG + 1), 2 * SEG, "a byte over rounds up");
         let mut u = 1;
         while u < 40 * SEG {
             let r = region_for(u);
@@ -1126,6 +1366,102 @@ mod tests {
         }
     }
 
+    /// `docs/plans/finished/region-alignment-bug.md` §5: for any base, a
+    /// region sized by `good_region_size` either delivers the segments its
+    /// name implies, or the caller is told it did not. Both halves failed
+    /// when the report was written.
+    #[test]
+    fn a_misaligned_exact_region_is_refused_not_served_short() {
+        use crate::types::SEGMENT_SIZE as SEG;
+        // The report's base, at the small profile: the 2.0.3 rule's 200,704
+        // and the whole-segment 196,608 both lose a segment from it.
+        let base = 0x3fc8_a1e4usize;
+        let n = good_region_size(220 * 1024);
+        if n >= MIN_REGION {
+            assert_eq!(n, 196_608);
+            assert_eq!(usable_bytes(base, n), 131_072, "two segments, not three");
+            assert!(usable_bytes(base, n) < n);
+            assert_eq!(usable_bytes(0, n), 196_608, "what the name promised");
+            assert_eq!(
+                usable_bytes(base, 200_704),
+                131_072,
+                "the 2.0.3 shape, same loss"
+            );
+            // The round number the report says was accidentally safe: it
+            // strands 28,672 aligned and loses 24,092 here -- same three
+            // segments, so no claim of exactness is broken and it is NOT the
+            // misaligned case.
+            let round = 220 * 1024;
+            assert_eq!(usable_bytes(base, round), usable_bytes(0, round));
+            assert_eq!(usable_bytes(base, round), 196_608);
+        }
+
+        // The predicate `init_region` now refuses on, at any geometry: the
+        // base costs a segment against the aligned promise. One segment from
+        // a base one byte past a boundary yields nothing (GEOMETRY, checked
+        // first); two segments yield one.
+        let two = 2 * SEG;
+        assert!(usable_bytes(SEG + 1, two) < usable_bytes(0, two));
+        assert_eq!(usable_bytes(SEG + 1, two), SEG);
+
+        // And `init_region` says so, before it touches any state -- so this
+        // probe neither needs nor consumes the process-wide registration.
+        #[cfg(ra_small_profile)]
+        {
+            const M: usize = 196_608;
+            const SLACK: usize = 65_536 + 0x1e4;
+            static mut MIS: [u8; M + SLACK] = [0; M + SLACK];
+            let bp = (&raw mut MIS).cast::<u8>().expose_provenance();
+            // Put the base at the report's residue, 0x1e4 past a boundary.
+            let want = (bp & !(SEG - 1)) + SEG + 0x1e4;
+            let skip = want - bp;
+            assert!(skip <= SLACK);
+            // SAFETY: `skip + M <= M + SLACK` by the bound just asserted, and
+            // this slice is refused before anything retains it.
+            let region: &'static mut [u8] = unsafe {
+                core::slice::from_raw_parts_mut((&raw mut MIS).cast::<u8>().add(skip), M)
+            };
+            assert_eq!(
+                init_region(region),
+                Err(FERR_MISALIGNED),
+                "an exact size at a base that costs a segment must be refused, not served short"
+            );
+        }
+    }
+
+    /// The container that makes the refusal unreachable: aligned by
+    /// construction, whole segments so it is not padded, handed over once.
+    #[test]
+    fn region_type_is_aligned_and_unpadded() {
+        use crate::types::SEGMENT_SIZE as SEG;
+        assert_eq!(core::mem::align_of::<Region<MIN_REGION>>(), SEG);
+        assert_eq!(
+            core::mem::size_of::<Region<MIN_REGION>>(),
+            MIN_REGION,
+            "a whole-segment region carries no padding"
+        );
+        assert_eq!(Region::<MIN_REGION>::USABLE, SEG);
+        // The value on the heap, allocated IN PLACE: a segment-aligned static
+        // does not compile on every host toolchain, and `Box::new(Region::new())`
+        // materialises a 64 KiB-aligned value on the stack first, which on
+        // Windows realigns the frame past the guard page and faults
+        // (STATUS_ACCESS_VIOLATION, found writing this test). Zero is a valid
+        // `Region` -- it is bytes and nothing else -- so `new_zeroed` is exact.
+        #[cfg(ra_small_profile)]
+        {
+            // SAFETY: an all-zero `Region` is a valid value (its only field is
+            // a byte array), so `assume_init` on zeroed storage is sound.
+            let r: &'static Region<MIN_REGION> =
+                Box::leak(unsafe { Box::<Region<MIN_REGION>>::new_zeroed().assume_init() });
+            assert_eq!(r.usable(), Region::<MIN_REGION>::USABLE);
+            assert_eq!(r.len(), MIN_REGION);
+            assert!(!r.is_empty());
+            // NOT given here: the process-wide registration belongs to the
+            // region test above, and a second registration is refused.
+            // `give` itself is exercised in `tests/region.rs`, its own process.
+        }
+    }
+
     #[test]
     fn usable_bytes_answers_the_question_a_firmware_asks() {
         let seg = SEGMENT_SIZE;
@@ -1143,13 +1479,10 @@ mod tests {
             "one byte short buys none"
         );
 
-        // The page at the top is not optional: a region of exactly one segment
-        // has nowhere to put the heap descriptor, so it can serve nothing.
-        assert_eq!(
-            usable_bytes(0, seg),
-            0,
-            "a segment with no page for the heap is unusable"
-        );
+        // No page is reserved: a region of exactly one segment serves one
+        // segment, because the first heap's descriptor is a static, not a
+        // page of the region (2.0.4; it used to be, and this used to be 0).
+        assert_eq!(usable_bytes(0, seg), seg, "a bare segment is a segment");
 
         // An UNALIGNED base loses the run-up. This is why `init_region` checks
         // the real base rather than comparing `len` against `MIN_REGION`: this
@@ -1168,13 +1501,13 @@ mod tests {
         // The stranded tail, which used to be recorded only in a design doc.
         // Sized in segments so it says the same thing at either geometry; at
         // the small profile this is the report's 220 KiB case exactly.
-        let three_and_a_bit = 3 * seg + FIXED_PAGE + seg / 2;
+        let three_and_a_bit = 3 * seg + seg / 2;
         assert_eq!(
             usable_bytes(0, three_and_a_bit),
             3 * seg,
             "a ragged region yields whole segments and strands the remainder"
         );
-        let stranded = three_and_a_bit - usable_bytes(0, three_and_a_bit) - FIXED_PAGE;
+        let stranded = three_and_a_bit - usable_bytes(0, three_and_a_bit);
         assert_eq!(
             stranded,
             seg / 2,

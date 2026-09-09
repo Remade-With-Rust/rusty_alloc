@@ -6,7 +6,7 @@
      6  crates/rusty_alloc/src/options.rs
     12  crates/rusty_alloc/src/os.rs
     38  crates/rusty_alloc/src/page.rs
-    26  crates/rusty_alloc/src/prim/fixed.rs
+    31  crates/rusty_alloc/src/prim/fixed.rs
      8  crates/rusty_alloc/src/prim/mock.rs
     17  crates/rusty_alloc/src/prim/mod.rs
     27  crates/rusty_alloc/src/prim/unix.rs

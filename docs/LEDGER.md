@@ -4,6 +4,62 @@ One entry per milestone/brick: what landed, the numbers with their method lines,
 what was reverted and **which kind** of revert (measured-worse vs within-noise).
 Newest first.
 
+## REGION ALIGNMENT — the documented fix cost 60 KB of stack; whole segments, descriptor in a static (2026-09-09)
+
+`docs/plans/finished/region-alignment-bug.md`: the Janus firmware copied the
+`good_region_size` doc example into an alignment-1 container, the linker put
+it at `0x3fc8a1e4`, the exact size served two segments instead of three, and
+the board panicked 484 bytes short of the round number that had worked. Three
+fixes proposed (fix the example, make `init_region` report, ship an aligned
+container) and a test.
+
+**The sibling finding that changed the fix.** Before writing fix 3 the
+consumer's own workaround — `#[repr(align(65536))]` around 200,704 — was
+measured on the rig: `xiao_s3_probe::HEAP` 225,281 → **262,144** (a type's
+size is rounded up to its alignment), `.bss` +36,860, `.stack` **−60,952**.
+The recommended fix was the most expensive of the three configurations. Root
+cause: every sizing rule carried `+ FIXED_PAGE` for the first heap's
+descriptor, so an exact region was never whole segments and an aligned
+container of it was always padded.
+
+**Fix, measured.** The first heap's descriptor on a one-region target is a
+1,752 B static of the fixed backend's; `MIN_REGION` / `usable_bytes` /
+`good_region_size` / `region_for` lose the page; `prim::fixed::Region<N>`
+(aligned, `N % SEGMENT_SIZE == 0`, `size_of == N`, `give` once → usable
+bytes); `init_region` refuses a base that costs a segment (`FERR_MISALIGNED`).
+
+| probe region declaration | `.bss` | `.stack` | usable |
+|---|---:|---:|---:|
+| round 225,280, align 1 (2.0.2/2.0.3 shape) | 225,672 | 107,412 | 196,608 |
+| consumer's `#[repr(align)]` 200,704 (the workaround) | 262,532 | 46,460 | 196,608 |
+| **`Region<196_608>`** | **198,752** | **110,240** | 196,608 |
+
+Board, footprint sketch on `Region<{ 64 * 1024 }>`: `region given: 65536
+usable of 65536`, peak 4,914, ran to `[heap] end` — the floor is one segment
+plus the static (was 68 KiB). The rig's `size -A` does not count the linker's
+gap before an aligned static; `.stack` is the truth, and against the round
+unaligned region the gain is 2,828 there, not 26,920.
+
+**Two defects the tests caught in the fix itself.** (1) The first `Region`
+had its once-flag as a field: one byte beside a 64 KiB-aligned array rounds
+the type to the next segment — `Region<196_608>` was 262,144 — the exact
+defect being fixed; the flag is a module static now, and a `const` assertion
+pins `size_of == N`. (2) `Box::new(Region::new())` in a host test faulted
+(STATUS_ACCESS_VIOLATION): the 64 KiB-aligned value is materialised on the
+stack past the guard page on Windows; `Box::new_zeroed().assume_init()`
+allocates in place and zero is a valid `Region`.
+
+**Gates.** fmt; clippy host (default, small profile) and riscv32 no_std at
+both geometries; full suite default + small profile (20 binaries each,
+`tests/region.rs` new — its own process so `give` can succeed); wasm flat;
+census 898 → 903 recorded in UNSAFE.md (two `Sync` impls, the handoff, two
+test sites); gate-selftest 9/9 (the misalignment refusal removed goes red).
+
+**Semver note.** `good_region_size` / `region_for` / `usable_bytes` /
+`MIN_REGION` return different values; a consumer asserting the old literal
+fails to build. Shipped as a fix (the old values were the defect); the strict
+reading is a minor.
+
 ## FIRMWARE, WHAT IS LEFT — one region, four folds, flash +7,860 → +3,208 B (2026-09-09)
 
 The consumer's third report (`docs/plans/finished/firmware-what-is-left.md`)
