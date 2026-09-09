@@ -60,6 +60,22 @@ test sites); gate-selftest 9/9 (the misalignment refusal removed goes red).
 fails to build. Shipped as a fix (the old values were the defect); the strict
 reading is a minor.
 
+**Consumer verification of 2.0.4, and a correction to how the saving is
+quoted (later the same day).** `used=196608 free=0` on the board, the seam's
+own container gone, the `const` assert caught the shape change by failing to
+build. And the consumer reconciled the RAM map: `.data + .bss + .stack` is
+335,368 on both unaligned builds and 311,220 on the aligned 2.0.4 build —
+**24,148 bytes in no section**, the linker's gap before the aligned static.
+So against the round unaligned region the gain is the `.stack` number,
++2,828, not the `.bss` number, −26,920; the granule's 24,576 moved from
+inside the region to the gap before it. Method rule adopted: on a fixed RAM
+map, report `.stack` or the section sum, never `.bss` alone; the rig's diff
+now prints the unaccounted remainder. The `Region` docs, the README recipe
+and the CHANGELOG entry say it. One more placement datum: the 4 KiB shift of
+every buffer when the descriptor page went moved a compute kernel **20 %**
+(`yuyv_to_gray8`, 125,218 → 150,247 per unit) with no allocator call inside
+it — the README's placement caution now carries that number.
+
 ## FIRMWARE, WHAT IS LEFT — one region, four folds, flash +7,860 → +3,208 B (2026-09-09)
 
 The consumer's third report (`docs/plans/finished/firmware-what-is-left.md`)

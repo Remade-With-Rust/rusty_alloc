@@ -506,6 +506,25 @@ pub fn is_first_heap_box(hb: *const crate::init::HeapBox) -> bool {
 /// error rather than a board run. At the shipped 32 MiB geometry the
 /// alignment is 32 MiB, which no chip-sized `.bss` can honour — this is a
 /// small-profile type in practice, as every firmware is.
+///
+/// **What the alignment costs, and where.** Reaching a `SEGMENT_SIZE`
+/// boundary costs up to `SEGMENT_SIZE - 1` bytes of RAM whichever way a
+/// firmware declares its region, and sizing cannot avoid it: an unaligned
+/// round region pays it INSIDE, as bytes before the first boundary that
+/// `usable_bytes` reports and `free` never reaches; this type pays it
+/// BEFORE, as the gap the linker leaves in front of an aligned static —
+/// which `size -A` charges to no section, so a `.bss` delta will overstate
+/// the saving by exactly that gap. On the ESP32-S3 firmware that reported
+/// it, moving from a round unaligned 225,280 to `Region<196_608>` gained
+/// **2,828 bytes of stack**, not the 26,920 the `.bss` figure suggested: the
+/// same 196,608 usable, and 24,148 of the old strand moved from inside the
+/// region to the gap before it. Judge a region change by the section SUM
+/// (`.data + .bss + .stack`, constant on a fixed map) or by `.stack`, never
+/// by `.bss` alone. What this type does buy is correctness by construction
+/// — no padding, no misaligned base, `free == 0` where a linker gap would be
+/// invisible — and what only the linker script can buy is the gap itself:
+/// place the region first in its RAM section, or after data that already
+/// ends on a boundary, and the gap is whatever is left over.
 #[repr(C)]
 #[cfg_attr(ra_small_profile, repr(align(65536)))]
 #[cfg_attr(not(ra_small_profile), repr(align(33554432)))]

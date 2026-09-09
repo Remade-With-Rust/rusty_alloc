@@ -212,6 +212,16 @@ the old `k * 64 KiB + 4 KiB` shape is rounded up to the next segment and
 costs more RAM than the granule it was meant to save — 60,952 bytes of stack
 on the firmware that tried it. `Region<N>` is the size it says.
 
+One honest number about what it does *not* save: reaching a 64 KiB boundary
+costs up to 65,535 bytes of RAM however the region is declared. A round
+unaligned region pays it inside (`usable_bytes` reports it, `free` never
+reaches it); `Region` pays it as the linker's gap before the static, which
+`size -A` charges to no section. On the reporting firmware, round 225,280 →
+`Region<196_608>` was the same 196,608 usable and **+2,828 bytes of stack**,
+while the `.bss` delta read −26,920 — judge a region change by `.stack` or
+the section sum, never by `.bss` alone. `Region` buys correctness by
+construction; only the linker script decides how big the gap is.
+
 | flag | what happens without it |
 |---|---|
 | `--cfg ra_single_threaded` | **build fails**, with a message telling you to set it |
@@ -292,10 +302,12 @@ in a medium page.
 - **Addresses held constant.** Both arms allocate the same sequence into the
   same-sized region, so buffer placement is the same in both. That matters:
   an allocator change moved a *compute* kernel on this board by 8 % without
-  executing a single instruction inside it, purely by where the buffers
-  landed (`docs/plans/finished/firmware-code-size.md` §8). A kernel
-  comparison across allocators measures placement unless its addresses are
-  pinned or its floor is established across a reflash.
+  executing a single instruction inside it, and the 4 KiB shift of every
+  buffer when 2.0.4 dropped the descriptor page moved another by **20 %**
+  (`docs/plans/finished/firmware-code-size.md` §8,
+  `region-alignment-bug.md` §8) — purely by where the buffers landed. A
+  kernel comparison across allocators measures placement unless its
+  addresses are pinned or its floor is established across a reflash.
 
 ### Footprint — this is the cost, not a win
 
