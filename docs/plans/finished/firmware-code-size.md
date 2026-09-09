@@ -435,3 +435,58 @@ and it is recorded here rather than done.
 - The ESP32-S3 numbers are local-only evidence, as the embedded CI job's
   comment says: no stock runner carries the Xtensa toolchain. The exact rig is
   in the ledger.
+
+---
+
+## 8. Consumer verification, 2026-09-09
+
+Re-measured independently by the firmware that reported the plan, on the
+board, after 2.0.2 was published. Same source, same 220 KiB budget, same five
+buffers, `size -A` and `nm --size-sort` on the linked ELF.
+
+### The size claim holds
+
+| | esp-alloc | 2.0.1 | 2.0.2 |
+|---|---:|---:|---:|
+| flash delta | — | +16,584 | **+8,084** |
+| attributable symbols | 1,043 / 6 | 16,256 / 57 | **8,297 / 37** |
+| static RAM delta | — | +3,092 | **+3,052** |
+
+**-51.3 %**, against the -52.6 % reported above. Section 7 quotes +7,860 and
+8,262; this measures +8,084 and 8,297. The attributable figures agree to 35
+bytes, and the 224-byte flash gap is the **consumer seam's own** additions —
+three new `Error` variants and their `Display` strings, added after that
+measurement. Not a disagreement, and worth recording so nobody hunts it later.
+
+All five named symbols are absent from the linked image: `adopt_segment`,
+`drain_delayed`, `try_guarded`, `Random::refill`, `init_thread_heap`. The
+`.stack` identity still holds to the byte at the new size (3,052 in, 3,052 out
+of the stack).
+
+### 2.0.2 is also the control that settles section 6's finding
+
+Section 6 reported four of eight kernels moving 3.3 % to -7.7 % between
+allocators, and argued from the mixed sign that it was buffer placement rather
+than allocator work. 2.0.2 tests that directly, because it changes the
+allocator's **code** enormously while leaving its **allocation behaviour**
+identical:
+
+| comparison | what changed | worst kernel delta |
+|---|---|---:|
+| esp-alloc to 2.0.1 | code **and** addresses | **7.698 %** |
+| 2.0.1 to 2.0.2 | code only, ~8 KB removed | **0.006 %** |
+
+All eight kernels agree across the two releases to within 0.006 % after half
+the allocator's code was deleted. If the allocator's code were inside those
+measurements, removing 8 KB of it would have moved them. It did not, so the
+7.7 % was placement — argued on 2026-09-08, demonstrated now.
+
+Which upgrades section 6's caution from an argument to a result: **changing
+an allocator can move a compute benchmark by 8 % without executing a single
+instruction inside the measured region.** Worth a line wherever this repo
+publishes kernel comparisons, because it applies to the README's own tables.
+
+### Runtime, unchanged
+
+`used=200704 free=24576` at every stage, identical to 2.0.1 and to the
+prediction the granule makes. Nothing regressed.

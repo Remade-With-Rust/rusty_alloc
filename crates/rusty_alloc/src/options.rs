@@ -339,9 +339,19 @@ fn parse_value(s: &str) -> Option<i64> {
 }
 
 /// `mi_option_get`.
+///
+/// On a one-region (bare-metal) build this is the compiled-in default, folded
+/// at each call site: there is no environment to read and [`set`] is a no-op
+/// there, so the 38-entry table of 64-bit atomics — 304 bytes of `.data`,
+/// paid once in flash and once in RAM that the linker takes from the stack —
+/// and the split-word atomics that emulate it on a 32-bit chip have no
+/// reader left and leave the image (`firmware-what-is-left.md` §3).
 pub fn get(option: usize) -> i64 {
     if option >= OPTION_COUNT {
         return 0;
+    }
+    if crate::ONE_REGION {
+        return DEFAULTS[option];
     }
     ensure_init();
     let v = VALUES[option].load(Ordering::Acquire);
@@ -349,7 +359,15 @@ pub fn get(option: usize) -> i64 {
 }
 
 /// `mi_option_set`.
+///
+/// A no-op on a one-region (bare-metal) build, where options are compile-time
+/// constants (see [`get`]). A firmware that needs a different value changes
+/// the default it is built with; there is no environment to read one from
+/// and, before this, no known caller setting one at run time.
 pub fn set(option: usize, value: i64) {
+    if crate::ONE_REGION {
+        return;
+    }
     if option < OPTION_COUNT {
         ensure_init();
         VALUES[option].store(value, Ordering::Release);
@@ -357,7 +375,11 @@ pub fn set(option: usize, value: i64) {
 }
 
 /// `mi_option_set_default`: only if still at the built-in default.
+/// A no-op on a one-region build, as [`set`].
 pub fn set_default(option: usize, value: i64) {
+    if crate::ONE_REGION {
+        return;
+    }
     if option < OPTION_COUNT {
         ensure_init();
         let _ = VALUES[option].compare_exchange(

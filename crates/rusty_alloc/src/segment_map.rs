@@ -260,6 +260,13 @@ pub fn register(seg: *mut Segment) {
 /// Register every 32 MiB window overlapped by `[base, base+size)`
 /// (on wasm: every 64 KiB slice, in the base table).
 pub fn register_range(base: usize, size: usize) {
+    // One region: membership is the region's own bounds (`prim::fixed::
+    // region_contains`), so there is nothing to record and the small
+    // profile's range table -- two 256-byte arrays of `.bss`, a lock, and a
+    // scan on every segment allocation and release -- folds away.
+    if crate::ONE_REGION {
+        return;
+    }
     #[cfg(all(target_arch = "wasm32", not(miri)))]
     {
         base_table::set(base, size);
@@ -288,6 +295,9 @@ pub fn unregister(seg: *mut Segment) {
 
 /// Unregister every window of `[base, base+size)`.
 pub fn unregister_range(base: usize, size: usize) {
+    if crate::ONE_REGION {
+        return;
+    }
     #[cfg(all(target_arch = "wasm32", not(miri)))]
     {
         base_table::clear(base, size);
@@ -313,6 +323,9 @@ pub fn unregister_range(base: usize, size: usize) {
 /// Best-effort by design: a racing segment release can flip the answer, so
 /// this is a diagnostic, not a safety oracle.
 pub fn contains(p: *const u8) -> bool {
+    if crate::ONE_REGION {
+        return crate::prim::fixed::region_contains(p.addr());
+    }
     #[cfg(all(target_arch = "wasm32", not(miri)))]
     {
         base_table::get(p.addr()) != 0
@@ -337,6 +350,9 @@ pub fn contains(p: *const u8) -> bool {
 /// workload (must stay exact) from the host battery (legitimately does not).
 #[must_use]
 pub fn range_table_overflowed() -> bool {
+    if crate::ONE_REGION {
+        return false; // two compares cannot overflow
+    }
     #[cfg(all(ra_small_profile, not(all(target_arch = "wasm32", not(miri)))))]
     {
         range_table::overflowed()

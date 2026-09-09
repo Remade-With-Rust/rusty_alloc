@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `prim::fixed::good_region_size(budget)` and `region_for(usable)`, `const fn`s
+  that size a firmware's region so the 64 KiB granule strands nothing: the
+  largest zero-waste region no bigger than a budget, and the smallest region
+  serving at least `usable` bytes. `good_region_size(220 * 1024)` is 200,704
+  (three segments plus the page) where a literal 220 KiB stranded 24,576.
+- `prim::fixed::region_contains(addr)`, the one-region answer to "is this
+  pointer ours".
+- `--cfg ra_max_extents="8"` / `"16"` / `"64"` resizes the fixed backend's
+  free-extent table (default 32 unchanged). Its doc states the bound: never
+  more slots than live blocks plus one.
+
+### Changed
+
+- **Firmware code size, second pass: everything that exists to manage many OS
+  ranges folds to what one linker-handed region needs.** A new internal
+  predicate (`ONE_REGION`, the bare-metal arm of `ONE_THREAD`) folds arenas,
+  the segment map, the runtime option table and the RAM-resident heap sentinel
+  on a bare-metal target: `chunk_alloc` is `None`, `segment_map::contains` is
+  two compares against the region bounds, `options::get` is the compiled-in
+  default at each call site, and the heap sentinel and empty page live in
+  `.rodata` (flash) with `create_heap` copying its template from there. On the
+  ESP32-S3 firmware measured in `docs/plans/finished/firmware-what-is-left.md`
+  the allocator's flash cost went **+7,860 → +3,208 B** and its static RAM
+  **+3,052 → +284 B** (attributed code 8,262 → 4,313 B); board throughput is
+  unchanged to within 5 ns per operation. Hosted builds are byte-for-byte
+  unchanged; the wasm ratchet is flat.
+- What a bare-metal build gives up by it, stated: `arena::reserve_os_memory_ex`
+  and `manage_os_memory_ex` return `Err` there, and `options::set` /
+  `set_default` are no-ops. Neither had a working meaning on a chip before.
+- README embedded figures refreshed from a same-day board run of both arms:
+  2.80x / 2.17x / 3.98x / 1.45x (the 2.0.0-era rows were 7-9 % stale — 2.0.2's
+  free fold had already moved them), the cost table above, the region-sizing
+  advice, and the placement caution for kernel comparisons across allocators.
+
 ## [2.0.2](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.0.1...rusty_alloc-v2.0.2) - 2026-09-09
 
 ### Changed

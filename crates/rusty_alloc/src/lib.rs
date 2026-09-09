@@ -215,6 +215,35 @@ pub(crate) const GUARD_PAGES: bool = cfg!(any(unix, windows, miri));
 /// guarded sampling. A build with neither never seeds it.
 pub(crate) const RNG_USED: bool = GUARD_PAGES || cfg!(feature = "secure");
 
+/// `true` where memory is ONE region the linker handed over: the bare-metal
+/// `prim::fixed` backend, i.e. the first arm of [`ONE_THREAD`].
+///
+/// A hosted allocator manages many OS ranges, and four of its structures
+/// exist only for that: **arenas** (reserved OS ranges carved into segment
+/// chunks), the **segment map** (which of the address space's ranges are
+/// ours), a **runtime option table** (read from the environment, settable at
+/// run time), and a **RAM-resident heap sentinel** (a template every new
+/// thread's heap is copied from). On a chip there is no OS to reserve from,
+/// exactly one range whose bounds the backend already holds, no environment
+/// and no tuner, and one heap for the life of the program. Each of the four
+/// folds on this constant to what a single region needs — nothing, a bounds
+/// check, the compiled-in defaults, a copy from flash — and the linker drops
+/// the rest (`docs/plans/finished/firmware-what-is-left.md` §3 and §7).
+///
+/// What a firmware loses by it, stated rather than hidden: `arena::reserve_*`
+/// and `manage_os_memory_ex` return `Err`, and `options::set` is a no-op
+/// there. Neither had a working meaning on a chip before — an arena carved
+/// from the one region only added an indirection to the same bytes, and an
+/// option set at run time on a target with no environment was already the
+/// exception rather than the rule.
+pub(crate) const ONE_REGION: bool = cfg!(all(
+    ra_single_threaded,
+    not(miri),
+    not(windows),
+    not(unix),
+    not(target_arch = "wasm32")
+));
+
 pub mod alloc;
 pub mod arena;
 pub mod bins;
