@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.5](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.0.4...rusty_alloc-v2.0.5) - 2026-09-09
+
+### Semver note, read this one
+
+**`prim::fixed::Region<N>`'s alignment is reduced**, from `SEGMENT_SIZE`
+(32 MiB at the default geometry, 64 KiB under `--cfg ra_small_profile`) to
+16 bytes. `cargo-semver-checks` classes a `repr(align)` change as breaking
+and would have made this 3.0.0. It ships as a patch deliberately: `Region`
+was introduced one release ago in 2.0.4, at the default geometry its old
+alignment was 32 MiB and its own docs called that unhonourable by any
+chip-sized `.bss`, and the documented use — `static HEAP: Region<N>` then
+`HEAP.give()` — cannot observe the change. `size_of::<Region<N>>()`,
+`Region::USABLE` and every other signature are untouched.
+
+**If you depend on the old alignment for a reason of your own, set
+`--cfg ra_aligned_region`**, which restores the 2.0.4 layout exactly: the
+address mask on `free`, `Region` segment-aligned, and the linker gap in
+front of it. Nothing else in the public API changed except the added
+`REGION_ALIGN` const.
+
 ### Changed
 
 - **A firmware's region no longer needs to be segment-aligned, and the
