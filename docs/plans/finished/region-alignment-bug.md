@@ -295,3 +295,110 @@ whole segments, `size_of` exactly that. `give` returns the usable byte count
 where the seam's returned `()`; the seam's `Error` mapping gains
 `FERR_MISALIGNED` if it wants a name for a refusal its own type can never
 produce.
+
+---
+
+## 8. 2.0.4 validated by the consumer, with one measurement caveat
+
+`Region` works. `used=196608 free=0` on the board, whole segments, nothing
+stranded, no descriptor page taken from the region. The `const` assert pinning
+`HEAP_BYTES` to `good_region_size(220 * 1024)` caught the dropped
+`+ FIXED_PAGE` by failing to build, which is what it is for. The consumer seam
+no longer carries a container of its own.
+
+The bug is fixed and the report that produced it is closed.
+
+### The `.bss` figure overstates the saving, because alignment padding is in no section
+
+Upstream quotes the new `Region` at -63,780 bytes of `.bss`. On a fixed RAM
+map the sections must sum to a constant, and for an aligned region they do
+not:
+
+| build | `.data` | `.bss` | `.stack` | sum | unaccounted |
+|---|---:|---:|---:|---:|---:|
+| esp-alloc @196,608, unaligned | 2,300 | 196,700 | 136,368 | 335,368 | 0 |
+| rusty 2.0.3 @225,280, unaligned | 2,284 | 225,672 | 107,412 | 335,368 | 0 |
+| rusty 2.0.4 @196,608, **aligned** | 2,228 | 198,752 | 110,240 | 311,220 | **24,148** |
+
+The 24,148 is the gap the linker leaves reaching the next 64 KiB boundary. It
+is real RAM, it is unusable, and it appears in no section — so a `.bss` delta
+cannot see it.
+
+What the firmware actually gains, 2.0.3 to 2.0.4:
+
+| | usable heap | stack |
+|---|---:|---:|
+| 2.0.3 @225,280 | 196,608 | 107,412 |
+| 2.0.4 @196,608 | 196,608 | **110,240** |
+
+Same usable heap, **+2,828 bytes of stack** — not the ~26,920 the `.bss` drop
+implies. The 24,576 bytes that `good_region_size` was meant to reclaim were
+not reclaimed; about 24,148 of them moved from *stranded inside the region* to
+*padding before it*.
+
+**This is not a regression and 2.0.4 is the better build** — smaller, correct
+by construction, one less startup panic. The point is narrower: on a fixed RAM
+map, aligning a `SEGMENT_SIZE`-granular region costs up to `SEGMENT_SIZE - 1`
+bytes somewhere, sizing cannot avoid it, and only where the preceding data
+happens to end changes the number. Two suggestions:
+
+1. **Quote the section sum, not `.bss`**, wherever the region container's
+   saving is published. `.bss` moves the loss out of view rather than removing
+   it, and this consumer would have believed the larger number without the
+   reconciliation.
+2. **Say it in the `Region` docs.** A firmware author choosing between a
+   round unaligned region and an exact aligned one should know the alignment
+   is charged either way, so the real choice is *where* the loss is visible,
+   not whether it exists. `free=0` is a much better place for it than a
+   linker gap, which is a genuine argument for `Region` — just not a
+   24 KiB one.
+
+### One more placement data point, and the biggest yet
+
+Dropping the 4 KiB descriptor page shifted every buffer within its segment:
+
+| kernel | 2.0.3 | 2.0.4 | delta |
+|---|---:|---:|---:|
+| `yuyv_to_gray8` | 125,218 | 150,247 | **+20.0 %** |
+| `yuyv_to_rgb565` | 581,875 | 606,915 | +4.3 % |
+| `rgb888_to_rgb565` | 362,892 | 350,371 | -3.4 % |
+| `sad_16x16` | 21,557,782 | 21,559,275 | +0.01 % |
+
+Mixed sign, no allocator call inside any measured kernel, and the kernels that
+are placement-insensitive held at 0.01 %. **A 4 KiB shift in where a buffer
+starts moved a compute benchmark by 20 %** — the strongest form yet of the
+caution in section 8, and worth carrying wherever this repo publishes kernel
+numbers.
+
+### And a miss on the consumer's side, recorded because it was avoidable
+
+The `#[repr(align(65536))]` workaround reported on 2026-09-09 cost **60,952
+bytes of stack** — `.bss` 225,672 to 262,532 — because 200,704 was not a whole
+number of segments and aligning it rounded the size up to 262,144. It was
+verified by reading `free=0` and not by re-reading the section table, having
+established the `.stack` identity in an earlier report. 2.0.4's whole-segment
+`Region` makes that class impossible, which is the right fix.
+
+---
+
+## 9. Upstream response to §8 (2026-09-09)
+
+Both suggestions taken, the same day:
+
+1. **The saving is quoted by `.stack` or the section sum now**, not `.bss`.
+   The CHANGELOG entry for `Region` says +63,780 bytes of stack against the
+   consumer's aligned container (both aligned, gap cancels) and **+2,828**
+   against the round unaligned region; the README recipe carries the
+   reconciliation; the rig's diff prints `.data + .bss + .stack` and the
+   unaccounted remainder so the gap cannot hide again. §7.3 above already
+   named the 2,828 and the gap; §8 is right that the headline number was the
+   other one, and the headline is what gets copied.
+2. **`Region`'s docs say it**: reaching a boundary costs up to
+   `SEGMENT_SIZE - 1` bytes whichever way the region is declared; an
+   unaligned region pays inside, `Region` pays before, `size -A` sees only
+   the first; judge by `.stack` or the sum; what the type buys is
+   correctness by construction, and only the linker script decides the gap.
+
+The 20 % placement datum is in the README's throughput caution beside the
+earlier 8 %. Nothing in the allocator changes for §8 — it is documentation,
+and it ships with the next release's docs; `main` carries it now.

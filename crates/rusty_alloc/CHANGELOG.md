@@ -35,9 +35,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whole number of segments, `size_of::<Region<N>>() == N` (asserted in the
   crate), `give(&'static self) -> Result<usize, PrimError>` hands it over once
   and returns the usable bytes; `Region::USABLE` for `const` assertions. On the
-  rig it replaced the consumer's aligned container for −63,780 bytes of
-  `.bss`, and the footprint sketch runs on `Region<{ 64 * 1024 }>`: one
-  segment, `65536 usable of 65536`.
+  rig it replaced the consumer's aligned container for **+63,780 bytes of
+  stack** (both aligned, so the linker's gap cancels), and the footprint
+  sketch runs on `Region<{ 64 * 1024 }>`: one segment, `65536 usable of
+  65536`. Against a round *unaligned* region the honest gain is +2,828 bytes
+  of stack for the same usable heap: the alignment gap the linker leaves
+  before an aligned static is charged to no section, so a `.bss` delta
+  overstates it — the `Region` docs say so.
 - `FERR_MISALIGNED` (0xF141), `FIXED_PAGE` (now `pub`),
   `take_first_heap_box` / `is_first_heap_box`.
 
