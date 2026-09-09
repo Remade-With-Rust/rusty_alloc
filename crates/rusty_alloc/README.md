@@ -111,8 +111,9 @@ longer decays and churn NULLs fell from 22,533 to 357 per 50,000.
 **`--cfg ra_small_profile`** (nothing tells you, and without it `SEGMENT_SIZE`
 stays 32 MiB, a kilobyte-scale region yields zero segments and every allocation
 fails) — then hand the backend its memory through
-`prim::fixed::Region<{ good_region_size(budget) }>`, which is segment-aligned,
-whole segments and unpadded by construction. The full recipe is in the
+`prim::fixed::Region<{ good_region_size(budget) }>`, which is whole segments,
+unpadded, and only 16-byte aligned by construction — segments stride from its
+base, so the linker owes it no 64 KiB gap. The full recipe is in the
 repository README.
 
 **It costs RAM to get that.** The smallest heap that runs the same workload is

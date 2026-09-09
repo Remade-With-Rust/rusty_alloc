@@ -126,7 +126,12 @@ run_case "good_region_size strands nothing" \
 # under this very mutation (found by this script on 2026-09-09). The broad
 # heaps test `expect`s its arena reservation and asserts that `options::set`
 # round-trips, and both go red.
-run_case "ONE_REGION is false where arenas exist"   "crates/rusty_alloc/src/lib.rs"   's/pub\(crate\) const ONE_REGION: bool = cfg!\(all\(/pub(crate) const ONE_REGION: bool = true || cfg!(all(/'   "--test heaps heaps_arenas_subprocs_options"
+run_case "ONE_REGION is false where arenas exist"   "crates/rusty_alloc/src/lib.rs"   's/pub\(crate\) const ONE_REGION: bool = FIXED_REGION \&\& /pub(crate) const ONE_REGION: bool = true || FIXED_REGION \&\& /'   "--test heaps heaps_arenas_subprocs_options"
+
+# --- region-alignment-dissolve: the arena layer folds on FIXED_REGION too ---
+# Forced true on a host, `segment_of` still resolves (a base of 0 is the
+# mask) but every arena entry point is refused, and the same test goes red.
+run_case "FIXED_REGION is false where an OS exists"   "crates/rusty_alloc/src/lib.rs"   's/pub\(crate\) const FIXED_REGION: bool = cfg!\(all\(/pub(crate) const FIXED_REGION: bool = true || cfg!(all(/'   "--test heaps heaps_arenas_subprocs_options"
 
 # --- region-alignment-bug §3: init_region must refuse a segment-costing base -
 # The refusal is one comparison; remove it and the exact-size-at-the-linker's-

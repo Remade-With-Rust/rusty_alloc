@@ -124,15 +124,46 @@ const _: () = assert!(crate::types::LARGE_OBJ_SIZE_MAX == USABLE_SLICES * SEGMEN
 
 /// Recover the owning segment from any pointer into it. `with_addr` keeps
 /// provenance so the mask trick is miri-clean.
+///
+/// Two arms on one predicate. Hosted segments are `SEGMENT_SIZE`-aligned and
+/// the mask recovers the base from the address. On a fixed region
+/// (`crate::REGION_STRIDES`) segments stride from the region's BASE, so the
+/// mask is applied to the offset from it: that is what lets a firmware's
+/// region be `MAX_ALIGN_SIZE`-aligned rather than segment-aligned, and it
+/// returns the gap the linker used to leave in front of the aligned static —
+/// 24,148 bytes on the ESP32-S3 that measured it
+/// (`docs/plans/finished/region-alignment-dissolve.md`).
 #[cfg(not(all(target_arch = "wasm32", not(miri))))]
 #[inline]
 pub fn segment_of(p: *mut u8) -> *mut Segment {
-    // NOTE (2026-08-21): the GEP form `p.wrapping_sub(p.addr() & (SEGMENT_SIZE
-    // - 1))` — proposed because `with_addr` is an integer round-trip LLVM is
-    // conservative about — measured +1.00 Ir on EVERY malloc and free (small
-    // 59.32 -> 60.32, batch_lifo 59.53 -> 60.53). The round-trip is free here
-    // and the subtraction is not. Do not retry.
-    p.with_addr(p.addr() & !(SEGMENT_SIZE - 1)).cast()
+    if crate::REGION_STRIDES {
+        // COST, on the ESP32-S3 (the bench firmware's `dealloc`, which is
+        // `free` inlined, objdump of the shipped image, 2026-09-09): the mask
+        // is `l32r 0xffff0000; and` — two instructions — and this is
+        // `l32r &REGION_BASE; l32i; sub; l32r 0xffff; and; sub`, of which the
+        // page-index computation reuses the first `sub`, so the free path
+        // grows from 36 to 39 instructions. The board prices that at 9-17 ns
+        // per alloc/free pair (595 / 833 / 1011 / 1134 against 578 / 820 /
+        // 997 / 1125 ns with `--cfg ra_aligned_region`, which is the mask),
+        // for 24,144 bytes of stack returned on the firmware that asked.
+        // (The esp LLVM backend materialises `0xffff` through the literal
+        // pool rather than as an `extui`; that is one instruction of the
+        // three and not worth a special case.)
+        // `wrapping_sub`: a pointer below the base is foreign, and the answer
+        // for a foreign pointer is garbage here exactly as the mask's is; the
+        // `debug_checks` guard in `free` is what refuses those.
+        let base = crate::prim::fixed::stride_base();
+        let off = p.addr().wrapping_sub(base) & (SEGMENT_SIZE - 1);
+        p.with_addr(p.addr().wrapping_sub(off)).cast()
+    } else {
+        // NOTE (2026-08-21): the GEP form `p.wrapping_sub(p.addr() &
+        // (SEGMENT_SIZE - 1))` — proposed because `with_addr` is an integer
+        // round-trip LLVM is conservative about — measured +1.00 Ir on EVERY
+        // malloc and free (small 59.32 -> 60.32, batch_lifo 59.53 -> 60.53).
+        // The round-trip is free here and the subtraction is not. Do not
+        // retry.
+        p.with_addr(p.addr() & !(SEGMENT_SIZE - 1)).cast()
+    }
 }
 
 /// wasm: segments are SLICE-aligned, not SEGMENT_SIZE-aligned (F2,
@@ -156,7 +187,8 @@ pub fn segment_of(p: *mut u8) -> *mut Segment {
 /// Reserve backing memory for a segment of `want` bytes.
 ///
 /// Native: an eagerly committed, SEGMENT_SIZE-aligned OS block, exactly as
-/// always. wasm: the slice pool first — recycled memory at 64 KiB
+/// always (on a fixed region, aligned on the region's own segment strides —
+/// `crate::REGION_STRIDES`). wasm: the slice pool first — recycled memory at 64 KiB
 /// granularity — then a fresh slice-aligned reservation sized to the SLICE
 /// round of `want`, not the chunk round. This is where the segment tax
 /// dies: a 33 MiB huge block reserves 33.06 MiB instead of 64 MiB, and on
@@ -780,14 +812,22 @@ pub fn huge_alloc(
 ) -> Result<(*mut Segment, *mut u8), PrimError> {
     debug_assert!(align.is_power_of_two() && align <= SEGMENT_SIZE / 2);
     let header = SEGMENT_SLICE_SIZE;
-    // Worst-case room for placing the block within the reservation. The area
-    // is 64 KiB-aligned, so only larger alignments — or offsets that shift
-    // the placement off the natural boundary — need slack.
+    // Worst-case room for placing the block within the reservation. Hosted,
+    // the area is slice-aligned, so only larger alignments — or offsets that
+    // shift the placement off the natural boundary — need slack. On a fixed
+    // region it is only `REGION_ALIGN`-aligned in absolute terms, because
+    // segments stride from a `MAX_ALIGN_SIZE`-aligned base
+    // (`crate::REGION_STRIDES`), so anything coarser needs the slack there.
     // `is_multiple_of` on a RUNTIME `align` is a modulo, i.e. a `div`.
     // `bins::is_aligned_to` is the mask, and its conservative direction is the
     // safe one here: a `false` makes this reserve the extra slack it would have
     // reserved for a misaligned offset anyway.
-    let extra = if align > SEGMENT_SLICE_SIZE || !crate::bins::is_aligned_to(offset, align) {
+    let natural = if crate::REGION_STRIDES {
+        crate::prim::fixed::REGION_ALIGN
+    } else {
+        SEGMENT_SLICE_SIZE
+    };
+    let extra = if align > natural || !crate::bins::is_aligned_to(offset, align) {
         align
     } else {
         0

@@ -35,11 +35,24 @@
 //!   the two apart. [`alloc`] therefore reports `is_zero: false` always, which
 //!   is the conservative direction: a caller that needs zeros writes them.
 //!
-//! **What this backend does NOT solve, and P1 does not claim it does:** the
-//! allocator above it asks for `SEGMENT_SIZE`-aligned 32 MiB reservations, and
-//! a chip-sized region can satisfy exactly none of them. That is §2.1 of the
-//! plan, it is P2's work, and it shows up here as an honest `Err` from
-//! [`alloc`] rather than as anything this file can fix.
+//! - **Segments stride from the region's base, not from address zero.** The
+//!   allocator above recovers a block's segment by masking its address; on a
+//!   hosted target the mask runs from zero, so every segment — and a region
+//!   holding them — must be `SEGMENT_SIZE`-aligned. Here `segment_of` masks
+//!   the offset from [`stride_base`] instead (`crate::REGION_STRIDES`), so
+//!   [`alloc`] measures every alignment from that base, a region needs only
+//!   [`REGION_ALIGN`] (16 bytes), and the linker leaves no segment-sized gap
+//!   in front of it: 24,148 bytes returned on the firmware that measured the
+//!   gap (`docs/plans/finished/region-alignment-dissolve.md`). The mask, and
+//!   the segment alignment with it, is one flag away for a firmware that
+//!   would rather have the three instructions per free: `--cfg
+//!   ra_aligned_region`, which every rule in this file follows.
+//!
+//! **What this backend does NOT solve, and P1 does not claim it does:** at the
+//! shipped 32 MiB geometry a chip-sized region cannot hold one segment, and
+//! [`init_region`] refuses it with [`FERR_GEOMETRY`]. That is §2.1 of
+//! `small-metal.md`, it was P2's work (`--cfg ra_small_profile`), and it shows
+//! up here as an honest `Err` rather than as anything this file can fix.
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -65,23 +78,29 @@ pub const FERR_REGISTERED: PrimError = 0xF140;
 
 /// The region's BASE costs at least one whole segment: from this address the
 /// region yields fewer segments than the same length would from a
-/// `SEGMENT_SIZE`-aligned one.
+/// [`REGION_ALIGN`]-aligned one.
 ///
 /// This is the shape a caller who sized the region *exactly* — with
 /// [`good_region_size`], `k * SEGMENT_SIZE`, the README — hits when the
 /// container holding it has alignment 1, which is what a plain
 /// `static [u8; N]` has. The Janus firmware did exactly that: a
 /// `good_region_size(220 * 1024)` region at the base the linker chose,
-/// `0x3fc8a1e4`, lost 24,092 bytes to the first boundary and served two
-/// segments where the number said three, and the first allocation past
+/// `0x3fc8a1e4`, lost 24,092 bytes to the first segment boundary and served
+/// two segments where the number said three, and the first allocation past
 /// 128 KiB panicked in `handle_alloc_error` — 484 bytes short of the round
 /// number that had happened to work
 /// (`docs/plans/finished/region-alignment-bug.md`). `init_region` had the
-/// exact answer in hand and threw it away; now it refuses instead. The fix
-/// is [`Region`], which cannot be misaligned and carries no padding.
+/// exact answer in hand and threw it away; now it refuses instead.
+///
+/// Since segments stride from the region's base rather than from zero
+/// (`docs/plans/finished/region-alignment-dissolve.md`) the boundary that
+/// matters is 16 bytes, not 64 KiB: the same address now loses 12 bytes to
+/// [`REGION_ALIGN`], which still costs an EXACT length its last segment, so
+/// the refusal stands. The fix is [`Region`], which is aligned by
+/// construction and carries no padding.
 pub const FERR_MISALIGNED: PrimError = 0xF141;
 
-/// The smallest region this backend will accept, for a `SEGMENT_SIZE`-ALIGNED
+/// The smallest region this backend will accept, for a [`REGION_ALIGN`]-aligned
 /// base: one segment. The heap descriptor is not in it — on this backend the
 /// first heap's descriptor lives in a static of its own ([`take_first_heap_box`]),
 /// so a region is whole segments and nothing else. (Until 2.0.3 this was
@@ -96,10 +115,10 @@ pub const FERR_MISALIGNED: PrimError = 0xF141;
 /// const _: () = assert!(REGION_BYTES >= rusty_alloc::prim::fixed::MIN_REGION);
 /// ```
 ///
-/// An UNALIGNED base needs up to `SEGMENT_SIZE - 1` more, because the first
-/// segment can only start on a segment boundary; [`init_region`] checks the
-/// real base and is therefore exact where this constant is optimistic. Align
-/// the region and the two agree.
+/// A base off the 16-byte grid needs up to `REGION_ALIGN - 1` more, because
+/// the first segment starts at the first [`REGION_ALIGN`]-aligned address;
+/// [`init_region`] checks the real base and is therefore exact where this
+/// constant is optimistic. [`Region`] is aligned, and the two agree.
 pub const MIN_REGION: usize = crate::types::SEGMENT_SIZE;
 
 /// Page granularity reported to the layers above. A chip has no paging
@@ -108,6 +127,37 @@ pub const MIN_REGION: usize = crate::types::SEGMENT_SIZE;
 /// rounding modest on a region measured in tens of kilobytes.
 /// The backend's page: the granule of every request that is not a segment.
 pub const FIXED_PAGE: usize = 4096;
+
+/// The alignment a region's base needs: `MAX_ALIGN_SIZE`, 16 bytes.
+///
+/// Segments are carved at `SEGMENT_SIZE` strides from the region's first
+/// `REGION_ALIGN`-aligned address, and `segment_of` resolves against that
+/// address rather than masking from zero (`crate::REGION_STRIDES`). So the
+/// base decides the alignment of every block — a page area is a whole number
+/// of slices past a segment, a block a whole number of block sizes past a
+/// page area — and 16 is exactly the natural alignment the allocator promises
+/// (`MAX_ALIGN_SIZE`); coarser requests are placed by address, as they are
+/// everywhere. Until 2.0.4 this was `SEGMENT_SIZE`, and a linker paid up to
+/// `SEGMENT_SIZE - 1` bytes of gap in front of the region to honour it
+/// (`docs/plans/finished/region-alignment-dissolve.md`).
+///
+/// `SEGMENT_SIZE` again under `--cfg ra_aligned_region`, which restores the
+/// hosted mask on the free path — three instructions fewer per segment
+/// resolution on the ESP32-S3 — at the price of the alignment, and of the
+/// gap. Every sizing rule here, [`Region`]'s alignment and the backend's
+/// placement follow this constant, so the two arms cannot disagree.
+pub const REGION_ALIGN: usize = if cfg!(ra_aligned_region) {
+    crate::types::SEGMENT_SIZE
+} else {
+    crate::types::MAX_ALIGN_SIZE
+};
+
+// Every header carved at a stride from the base must be satisfied by it.
+const _: () = assert!(
+    core::mem::align_of::<crate::segment::Segment>() <= REGION_ALIGN
+        && core::mem::align_of::<crate::init::HeapBox>() <= REGION_ALIGN,
+    "a stride from a REGION_ALIGN-aligned base must satisfy every header"
+);
 
 /// Free extents tracked at once.
 ///
@@ -230,10 +280,13 @@ impl Drop for Guard {
 /// or not at all. A 220 KiB region at the small profile yields three segments
 /// and strands 24,576 bytes — 11 % of the budget, silently.
 ///
-/// Segments are carved from the first `SEGMENT_SIZE`-aligned address upward,
-/// so the answer is `floor((end - first_aligned) / SEGMENT_SIZE) * SEGMENT_SIZE`:
-/// the leading bytes before alignment are unusable, and everything from the
-/// first boundary is whole segments. Nothing is reserved for the heap
+/// Segments are carved at `SEGMENT_SIZE` strides from the first
+/// [`REGION_ALIGN`]-aligned address (16 bytes; until 2.0.4 it was the first
+/// `SEGMENT_SIZE`-aligned one, and the run-up to it cost a 4-aligned base a
+/// whole segment), so the answer is
+/// `floor((end - first_aligned) / SEGMENT_SIZE) * SEGMENT_SIZE`: at most 15
+/// leading bytes are unusable, and everything from there is whole segments.
+/// Nothing is reserved for the heap
 /// descriptor: on this backend the first heap's descriptor is a static
 /// ([`take_first_heap_box`]), not a page of the region. (Until 2.0.3 one page
 /// was reserved at the top for it, which is why the shipped sizing rule was
@@ -258,11 +311,12 @@ pub const fn usable_bytes(base: usize, len: usize) -> usize {
     let Some(end) = base.checked_add(len) else {
         return 0;
     };
-    // First segment-aligned address at or above `base`, without overflowing.
-    let Some(run_up) = base.checked_add(seg - 1) else {
+    // The first REGION_ALIGN-aligned address at or above `base`, without
+    // overflowing: the origin every segment strides from.
+    let Some(run_up) = base.checked_add(REGION_ALIGN - 1) else {
         return 0;
     };
-    let first = run_up & !(seg - 1);
+    let first = run_up & !(REGION_ALIGN - 1);
     if first >= end {
         return 0;
     }
@@ -271,7 +325,7 @@ pub const fn usable_bytes(base: usize, len: usize) -> usize {
 }
 
 /// The largest region no bigger than `budget` that strands NOTHING, for a
-/// `SEGMENT_SIZE`-aligned base: `k * SEGMENT_SIZE`.
+/// [`REGION_ALIGN`]-aligned base: `k * SEGMENT_SIZE`.
 ///
 /// [`usable_bytes`] lets a firmware *observe* the granule's loss; this is
 /// what lets it *avoid* the loss, and it is pure arithmetic. A region is
@@ -283,7 +337,7 @@ pub const fn usable_bytes(base: usize, len: usize) -> usize {
 /// (`docs/plans/finished/firmware-what-is-left.md` §1).
 ///
 /// `const fn`, so the answer is settled where the region is declared — in
-/// [`Region`], which is `SEGMENT_SIZE`-aligned by construction and, because
+/// [`Region`], which is [`REGION_ALIGN`]-aligned by construction and, because
 /// its size is whole segments, carries no padding:
 ///
 /// ```ignore
@@ -294,9 +348,10 @@ pub const fn usable_bytes(base: usize, len: usize) -> usize {
 /// ```
 ///
 /// **Use [`Region`], not a container of your own.** A plain `static [u8; N]`
-/// has alignment 1: the linker puts it anywhere, this exact size then yields
-/// one segment fewer than its name says, and [`init_region`] refuses it with
-/// [`FERR_MISALIGNED`] rather than serve two thirds of the heap. An aligned
+/// has alignment 1: fifteen times in sixteen the linker puts it off the
+/// 16-byte grid, this exact size then yields one segment fewer than its name
+/// says, and [`init_region`] refuses it with [`FERR_MISALIGNED`] rather than
+/// serve two thirds of the heap. An aligned
 /// container of your own with the OLD shape (`k * SEGMENT_SIZE + FIXED_PAGE`,
 /// the 2.0.3 rule) is worse: a type's size is rounded up to its alignment, so
 /// `#[repr(align(65536))]` around 200,704 bytes occupies 262,144 — and the
@@ -316,7 +371,7 @@ pub const fn good_region_size(budget: usize) -> usize {
 }
 
 /// The smallest region that serves at least `usable` bytes of segments, for a
-/// `SEGMENT_SIZE`-aligned base — [`good_region_size`] read from the other
+/// [`REGION_ALIGN`]-aligned base — [`good_region_size`] read from the other
 /// end: a firmware that knows what it needs rather than what it can spare.
 ///
 /// ```ignore
@@ -365,11 +420,11 @@ pub fn init_region(region: &'static mut [u8]) -> Result<(), PrimError> {
     }
     let base = region.as_mut_ptr().expose_provenance();
 
-    // EXACT, not conservative. `MIN_REGION` assumes a segment-aligned base; the
-    // real base is in hand here, so ask the question that actually matters --
-    // does an aligned segment plus a page fit inside this region? A check
-    // against `len` alone would accept a region whose base sits one byte past a
-    // segment boundary and still fail on the board.
+    // EXACT, not conservative. `MIN_REGION` assumes a REGION_ALIGN-aligned
+    // base; the real base is in hand here, so ask the question that actually
+    // matters -- does a segment fit past the first aligned address? A check
+    // against `len` alone would accept a region whose base sits one byte past
+    // the grid and still fail on the board.
     if usable_bytes(base, len) == 0 {
         return Err(FERR_GEOMETRY);
     }
@@ -378,7 +433,9 @@ pub fn init_region(region: &'static mut [u8]) -> Result<(), PrimError> {
     // is what this length promises from an aligned container. When they
     // differ, the caller believed a size that this address cannot deliver —
     // `good_region_size(220 * 1024)` at `0x3fc8a1e4` serves two segments, not
-    // three — and serving the smaller heap silently is how the Janus firmware
+    // three, 12 bytes off the 16-byte grid (24,092 off the segment grid, when
+    // that was the grid) — and serving the smaller heap silently is how the
+    // Janus firmware
     // reached `handle_alloc_error` 484 bytes short. A round length that
     // strands as much at an aligned base as it loses here passes: the numbers
     // agree, and that caller made no claim of exactness.
@@ -403,9 +460,20 @@ pub fn init_region(region: &'static mut [u8]) -> Result<(), PrimError> {
 /// segment is dead on arrival, which is exactly what [`init_region`] now
 /// refuses. Private, so the refusal has no public bypass.
 fn install_region(base: usize, len: usize) {
-    REGION_BASE.store(base, Ordering::Relaxed);
+    // The origin every segment strides from is the first REGION_ALIGN-aligned
+    // address; the bytes before it (at most 15) are not the region's. The
+    // callers have established that a segment, or a page, fits past it. Under
+    // the mask there is no origin: the base is kept as handed over, and the
+    // bytes below the first boundary stay servable to page-sized requests.
+    let origin = if cfg!(ra_aligned_region) {
+        base
+    } else {
+        align_up(base, REGION_ALIGN)
+    };
+    let len = (base + len).saturating_sub(origin);
+    REGION_BASE.store(origin, Ordering::Relaxed);
     REGION_LEN.store(len, Ordering::Relaxed);
-    EXT_BASE[0].store(base, Ordering::Relaxed);
+    EXT_BASE[0].store(origin, Ordering::Relaxed);
     EXT_LEN[0].store(len, Ordering::Relaxed);
     EXT_COUNT.store(1, Ordering::Relaxed);
 }
@@ -489,10 +557,11 @@ pub fn is_first_heap_box(hb: *const crate::init::HeapBox) -> bool {
 ///
 /// This exists because the alternatives both lose memory. The caller's own
 /// `static [u8; N]` has alignment 1, and every sizing rule in this module
-/// assumes a `SEGMENT_SIZE`-aligned base, so a region sized by
+/// assumes a [`REGION_ALIGN`]-aligned base, so a region sized by
 /// [`good_region_size`] but placed by the linker at an arbitrary address
-/// yields one segment fewer than its name says — the Janus firmware found
-/// that out at `handle_alloc_error`. And the caller's own
+/// yields one segment fewer than its name says fifteen times in sixteen —
+/// the Janus firmware found that out at `handle_alloc_error`. And the
+/// caller's own
 /// `#[repr(align(65536))]` container around an exact size is rounded up to
 /// the alignment: 200,704 bytes became 262,144 in `.bss` and cost that
 /// firmware 60,952 bytes of stack. This type is aligned AND a whole number
@@ -503,50 +572,46 @@ pub fn is_first_heap_box(hb: *const crate::init::HeapBox) -> bool {
 /// `.bss` rather than on anybody's stack; `N` is checked at compile time to
 /// be at least one segment and a multiple of `SEGMENT_SIZE`, so
 /// `Region<{ good_region_size(x) }>` for a budget below the floor is a build
-/// error rather than a board run. At the shipped 32 MiB geometry the
-/// alignment is 32 MiB, which no chip-sized `.bss` can honour — this is a
-/// small-profile type in practice, as every firmware is.
+/// error rather than a board run.
 ///
-/// **What the alignment costs, and where.** Reaching a `SEGMENT_SIZE`
-/// boundary costs up to `SEGMENT_SIZE - 1` bytes of RAM whichever way a
-/// firmware declares its region, and sizing cannot avoid it: an unaligned
-/// round region pays it INSIDE, as bytes before the first boundary that
-/// `usable_bytes` reports and `free` never reaches; this type pays it
-/// BEFORE, as the gap the linker leaves in front of an aligned static —
-/// which `size -A` charges to no section, so a `.bss` delta will overstate
-/// the saving by exactly that gap. On the ESP32-S3 firmware that reported
-/// it, moving from a round unaligned 225,280 to `Region<196_608>` gained
-/// **2,828 bytes of stack**, not the 26,920 the `.bss` figure suggested: the
-/// same 196,608 usable, and 24,148 of the old strand moved from inside the
-/// region to the gap before it. Judge a region change by the section SUM
-/// (`.data + .bss + .stack`, constant on a fixed map) or by `.stack`, never
-/// by `.bss` alone. What this type does buy is correctness by construction
-/// — no padding, no misaligned base, `free == 0` where a linker gap would be
-/// invisible — and what only the linker script can buy is the gap itself:
-/// place the region first in its RAM section, or after data that already
-/// ends on a boundary, and the gap is whatever is left over.
+/// **Its alignment is 16 bytes, not a segment, and that is the whole RAM
+/// story.** Segments stride from the region's base rather than from address
+/// zero (`crate::REGION_STRIDES`,
+/// `docs/plans/finished/region-alignment-dissolve.md`), so the linker owes
+/// this static no gap. Until 2.0.4 the type was `SEGMENT_SIZE`-aligned, and
+/// on the ESP32-S3 firmware that measured it the linker left 24,148 bytes in
+/// front of it — charged to no section, so `size -A` could not see it and a
+/// `.bss` delta overstated the saving by exactly that. Now
+/// `.data + .bss + .stack` reconciles, and the section a region lives in is
+/// the section it costs. Judging a region change by that sum, or by `.stack`,
+/// is still the honest method on a fixed RAM map; it just has nothing left
+/// to find. Under `--cfg ra_aligned_region` — the mask, for a firmware that
+/// would rather have three instructions per free than the RAM — the type is
+/// a segment-aligned again, and the gap is back with it.
 #[repr(C)]
-#[cfg_attr(ra_small_profile, repr(align(65536)))]
-#[cfg_attr(not(ra_small_profile), repr(align(33554432)))]
+#[cfg_attr(not(ra_aligned_region), repr(align(16)))]
+#[cfg_attr(all(ra_aligned_region, ra_small_profile), repr(align(65536)))]
+#[cfg_attr(all(ra_aligned_region, not(ra_small_profile)), repr(align(33554432)))]
 pub struct Region<const N: usize> {
     bytes: core::cell::UnsafeCell<[u8; N]>,
 }
 
 /// Whether any [`Region`] has been given. ONE flag for every instance rather
-/// than a field in each: a field — even one byte — beside a segment-aligned
-/// array rounds the type's size up to the next segment, which is the padding
-/// this type exists to avoid (measured: `Region<196_608>` with a flag inside
-/// was 262,144 bytes). One region can ever be registered per program, so one
+/// than a field in each: a field — even one byte — beside the array pads the
+/// type to its alignment, which is the padding this type exists to avoid
+/// (measured when the type was segment-aligned: `Region<196_608>` with a
+/// flag inside was 262,144 bytes; at 16 it would still be 16 bytes of
+/// nothing). One region can ever be registered per program, so one
 /// flag is exact, and it is swapped BEFORE the `&mut` is formed so a second
 /// `give` on the same instance never aliases the first.
 static REGION_GIVEN: AtomicBool = AtomicBool::new(false);
 
 // The literal in `repr(align)` cannot name a constant, so pin it to the
-// geometry it is supposed to track; and a whole-segment size with the
-// segment's alignment must not be padded, or the type has failed its purpose.
+// alignment a region's base needs; and a whole-segment size at that
+// alignment must not be padded, or the type has failed its purpose.
 const _: () = assert!(
-    core::mem::align_of::<Region<MIN_REGION>>() == crate::types::SEGMENT_SIZE,
-    "Region's alignment must equal SEGMENT_SIZE"
+    core::mem::align_of::<Region<MIN_REGION>>() == REGION_ALIGN,
+    "Region's alignment must equal REGION_ALIGN"
 );
 const _: () = assert!(
     core::mem::size_of::<Region<MIN_REGION>>() == MIN_REGION,
@@ -653,6 +718,15 @@ pub fn region_contains(addr: usize) -> bool {
     len != 0 && addr >= base && addr - base < len
 }
 
+/// The origin segments stride from: the registered region's base, or 0 while
+/// none is registered — when no pointer can be ours and the answer is the
+/// hosted mask's. Crate-internal: `segment_of` and the free-list plausibility
+/// check are its callers (`crate::REGION_STRIDES`).
+#[inline]
+pub(crate) fn stride_base() -> usize {
+    REGION_BASE.load(Ordering::Relaxed)
+}
+
 /// The region's occupancy: `(used, free, total)` bytes.
 ///
 /// A fixed-region allocator that cannot report how much of its region is out
@@ -728,14 +802,26 @@ pub(super) fn mem_init() -> MemConfig {
 /// the HIGHEST such address when `from_top`, the lowest otherwise. `None` when
 /// it does not fit. `align` is a power of two (it comes from a `Layout` or from
 /// [`FIXED_PAGE`]), so the top-down case is a mask.
-fn place(base: usize, len: usize, size: usize, align: usize, from_top: bool) -> Option<usize> {
+fn place(
+    base: usize,
+    len: usize,
+    size: usize,
+    align: usize,
+    from_top: bool,
+    origin: usize,
+) -> Option<usize> {
     if size > len {
         return None;
     }
+    debug_assert!(base >= origin, "an extent lies inside the region");
+    // Alignment is measured from `origin` — the region's base — not from
+    // address zero: segments stride from it and `segment_of` resolves against
+    // it (`crate::REGION_STRIDES`). `origin` is REGION_ALIGN-aligned, so a
+    // request aligned no coarser than that is aligned in absolute terms too.
     let at = if from_top {
-        (base + len - size) & !(align - 1)
+        origin + ((base + len - size - origin) & !(align - 1))
     } else {
-        align_up(base, align)
+        origin + align_up(base - origin, align)
     };
     // Top-down can mask below `base`; bottom-up can align past the end. Compare
     // on the sum, not a subtraction that would wrap.
@@ -749,8 +835,8 @@ fn place(base: usize, len: usize, size: usize, align: usize, from_top: bool) -> 
 ///
 /// **Coarsely-aligned requests take the bottom; merely page-aligned ones take
 /// the top.** That split is the whole point on a chip-sized region. A
-/// `SEGMENT_SIZE` reservation can only start on a `SEGMENT_SIZE` boundary, so
-/// every byte handed out below one pushes it to the next — a single 4 KiB heap
+/// `SEGMENT_SIZE` reservation can only start on a `SEGMENT_SIZE` stride from
+/// the region's base, so every byte handed out below one pushes it to the next — a single 4 KiB heap
 /// block placed at the bottom of the region costs an entire segment of reach.
 /// Measured on a XIAO ESP32-S3 (docs/plans/small-metal.md §2.9): bottom-only
 /// placement needed a 192 KiB region for a workload whose segments and metadata
@@ -783,6 +869,13 @@ pub(super) unsafe fn alloc(
     if REGION_LEN.load(Ordering::Relaxed) == 0 {
         return Err(FERR);
     }
+    // What alignment is measured from: the region's base where segments
+    // stride from it, address zero under `ra_aligned_region`.
+    let origin = if cfg!(ra_aligned_region) {
+        0
+    } else {
+        REGION_BASE.load(Ordering::Relaxed)
+    };
 
     // Page-aligned requests search from the HIGHEST extent down and settle at
     // its top; coarsely-aligned ones search from the lowest up, as before.
@@ -792,7 +885,7 @@ pub(super) unsafe fn alloc(
         let i = if from_top { n - 1 - k } else { k };
         let base = EXT_BASE[i].load(Ordering::Relaxed);
         let len = EXT_LEN[i].load(Ordering::Relaxed);
-        let Some(aligned) = place(base, len, size, align, from_top) else {
+        let Some(aligned) = place(base, len, size, align, from_top, origin) else {
             continue;
         };
         let head = aligned - base;
@@ -1037,24 +1130,42 @@ mod tests {
     /// base is the shape the board actually has, and the shape that
     /// discriminates.
     ///
-    /// The alignment is taken at RUNTIME from an oversized backing array rather
-    /// than with `#[repr(align(65536))]`, because rustc 1.97.1 on MSVC crashes
-    /// (STATUS_ILLEGAL_INSTRUCTION) compiling a half-megabyte static at that
-    /// alignment. Carving the window also matches how a linker script hands a
-    /// chip its heap, so nothing is lost by it.
-    const REGION_ALIGN: usize = 64 * 1024;
+    /// The base is carved at RUNTIME from an oversized backing array, and
+    /// carved DELIBERATELY OFF every segment boundary: `RAGGED` bytes past a
+    /// 64 KiB line, on the 16-byte grid. Segments stride from the base
+    /// (`crate::REGION_STRIDES`), so a region at such an address must serve
+    /// exactly what an aligned one does; until 2.0.4 it lost a segment to the
+    /// run-up, which is what the Janus firmware hit. Carving the window also
+    /// matches how a linker script hands a chip its heap.
+    const GRID: usize = 64 * 1024;
+    /// Zero under `--cfg ra_aligned_region`, where the base must sit ON the
+    /// segment grid and the assertions below say so instead.
+    const RAGGED: usize = if cfg!(ra_aligned_region) { 0 } else { 0x1f0 };
+    const SLACK: usize = GRID + RAGGED;
     const N: usize = 512 * 1024 + FIXED_PAGE;
-    static mut BACKING: [u8; N + REGION_ALIGN] = [0; N + REGION_ALIGN];
+    static mut BACKING: [u8; N + SLACK] = [0; N + SLACK];
     static mut OTHER: [u8; FIXED_PAGE] = [0; FIXED_PAGE];
 
     #[test]
     fn serves_and_recycles_a_static_region() {
-        // The REGION_ALIGN-aligned window inside BACKING. `add` keeps the
-        // array's provenance, so the slice below is a real borrow of it.
+        // The window inside BACKING: `RAGGED` past a 64 KiB line, so at the
+        // small profile the base is off the segment grid on purpose. `add`
+        // keeps the array's provenance, so the slice below is a real borrow
+        // of it.
         let bp = (&raw mut BACKING).cast::<u8>();
-        let skip = align_up(bp.expose_provenance(), REGION_ALIGN) - bp.expose_provenance();
-        // SAFETY: `skip < REGION_ALIGN`, so `skip + N` is inside BACKING.
+        let skip = align_up(bp.expose_provenance(), GRID) - bp.expose_provenance() + RAGGED;
+        // SAFETY: `skip < GRID + RAGGED == SLACK`, so `skip + N` is inside BACKING.
         let rp = unsafe { bp.add(skip) };
+        assert_eq!(
+            rp.expose_provenance() % REGION_ALIGN,
+            0,
+            "on the grid the base needs"
+        );
+        assert_eq!(
+            rp.expose_provenance() % GRID,
+            RAGGED,
+            "and where the test put it"
+        );
         // SAFETY: the only reference ever taken to REGION, handed straight to
         // init_region which requires (and consumes) exactly that exclusivity.
         let region: &'static mut [u8] = unsafe { core::slice::from_raw_parts_mut(rp, N) };
@@ -1180,50 +1291,80 @@ mod tests {
                 "a refused request leaves the list untouched"
             );
 
-            // The ALIGNMENT half is decided by the region's ADDRESS, not its
-            // size: a region smaller than SEGMENT_SIZE still holds one
-            // SEGMENT_SIZE-aligned page whenever it straddles a boundary, and
-            // where BACKING lands is the loader's choice. The one-sided form
-            // of this check ("unsatisfiable in a region smaller than it")
-            // passed for days and then went red on CI on 2026-09-08 when ASLR
-            // put the window across a 32 MiB line -- a 1-in-64 chance per run
-            // at this N. So decide from the address, and demand the answer
-            // that follows from it either way.
             let base = REGION_BASE.load(Ordering::Relaxed);
-            let boundary = align_up(base, SEGMENT_SIZE);
-            let straddles = boundary + FIXED_PAGE <= base + N;
-            // SAFETY: prim contract, as above.
-            let al = unsafe { alloc(FIXED_PAGE, SEGMENT_SIZE, true, false) };
-            if straddles {
-                let al = al.expect("the boundary is inside the region, so a page at it fits");
+            if cfg!(ra_aligned_region) {
+                // The ALIGNMENT half is decided by the region's ADDRESS, not
+                // its size: a region smaller than SEGMENT_SIZE still holds one
+                // SEGMENT_SIZE-aligned page whenever it straddles a boundary,
+                // and where BACKING lands is the loader's choice (a 1-in-64
+                // chance per run at this N; the one-sided form went red on CI
+                // on 2026-09-08 when ASLR put the window across a 32 MiB
+                // line). Decide from the address, and demand the answer that
+                // follows from it either way.
+                let boundary = align_up(base, SEGMENT_SIZE);
+                let straddles = boundary + FIXED_PAGE <= base + N;
+                // SAFETY: prim contract, as above.
+                let al = unsafe { alloc(FIXED_PAGE, SEGMENT_SIZE, true, false) };
+                if straddles {
+                    let al = al.expect("the boundary is inside the region, so a page at it fits");
+                    assert_eq!(
+                        al.ptr.expose_provenance(),
+                        boundary,
+                        "served AT the one SEGMENT_SIZE-aligned address the region has"
+                    );
+                    // SAFETY: `al` is live and unfreed.
+                    unsafe { free(al.ptr, FIXED_PAGE).expect("free the aligned page") };
+                } else {
+                    assert!(
+                        al.is_err(),
+                        "no SEGMENT_SIZE-aligned address lies inside this region"
+                    );
+                }
+            } else {
+                // Segments stride from the region's base, so the base IS the
+                // first stride and a SEGMENT_SIZE-aligned page is served
+                // there, whatever the address: the straddle case above is the
+                // one this dissolves.
+                // SAFETY: prim contract, as above.
+                let al = unsafe { alloc(FIXED_PAGE, SEGMENT_SIZE, true, false) }
+                    .expect("the region's base is its first segment stride");
                 assert_eq!(
                     al.ptr.expose_provenance(),
-                    boundary,
-                    "served AT the one SEGMENT_SIZE-aligned address the region has"
+                    base,
+                    "served AT the base: stride 0, whatever the address"
                 );
                 // SAFETY: `al` is live and unfreed.
                 unsafe { free(al.ptr, FIXED_PAGE).expect("free the aligned page") };
-                assert_eq!(free_total(), N, "and the list is whole again");
-            } else {
-                assert!(
-                    al.is_err(),
-                    "no SEGMENT_SIZE-aligned address lies inside this region"
-                );
-                assert_eq!(
-                    free_total(),
-                    N,
-                    "a refused request leaves the list untouched"
-                );
             }
+            assert_eq!(free_total(), N, "and the list is whole again");
         } else {
             // The small profile: this is what P2 bought. A whole segment, at
             // segment alignment, served from a chip-sized region.
             let a = seg.expect("a segment must fit once the geometry allows it");
-            assert_eq!(
-                a.ptr.expose_provenance() % SEGMENT_SIZE,
-                0,
-                "a segment must be SEGMENT_SIZE-aligned — `segment_of` masks on it"
-            );
+            let base = REGION_BASE.load(Ordering::Relaxed);
+            if cfg!(ra_aligned_region) {
+                assert_eq!(
+                    a.ptr.expose_provenance() % SEGMENT_SIZE,
+                    0,
+                    "a segment must be SEGMENT_SIZE-aligned — `segment_of` masks on it"
+                );
+            } else {
+                assert_eq!(
+                    (a.ptr.expose_provenance() - base) % SEGMENT_SIZE,
+                    0,
+                    "a segment sits on a SEGMENT_SIZE stride from the base — `segment_of` masks the offset"
+                );
+                assert_eq!(
+                    a.ptr.expose_provenance(),
+                    base,
+                    "the first stride is the base itself"
+                );
+                assert_ne!(
+                    a.ptr.expose_provenance() % SEGMENT_SIZE,
+                    0,
+                    "and it is NOT segment-aligned in absolute terms: the region was carved ragged on purpose"
+                );
+            }
             // `saturating_sub`: the compiler const-evaluates this arm even when
             // the branch is dead, and at the shipped geometry SEGMENT_SIZE > N.
             assert_eq!(free_total(), N.saturating_sub(SEGMENT_SIZE));
@@ -1392,8 +1533,10 @@ mod tests {
     #[test]
     fn a_misaligned_exact_region_is_refused_not_served_short() {
         use crate::types::SEGMENT_SIZE as SEG;
-        // The report's base, at the small profile: the 2.0.3 rule's 200,704
-        // and the whole-segment 196,608 both lose a segment from it.
+        // The report's base, at the small profile. 0x1e4 is 4-aligned, not
+        // 16-aligned: the base is 12 bytes off the grid. When segments had to
+        // be segment-aligned that cost 24,092 bytes; now it costs 12 — and
+        // against an EXACT length, 12 bytes is still a segment.
         let base = 0x3fc8_a1e4usize;
         let n = good_region_size(220 * 1024);
         if n >= MIN_REGION {
@@ -1401,13 +1544,31 @@ mod tests {
             assert_eq!(usable_bytes(base, n), 131_072, "two segments, not three");
             assert!(usable_bytes(base, n) < n);
             assert_eq!(usable_bytes(0, n), 196_608, "what the name promised");
-            assert_eq!(
-                usable_bytes(base, 200_704),
-                131_072,
-                "the 2.0.3 shape, same loss"
-            );
+            if cfg!(ra_aligned_region) {
+                assert_eq!(
+                    usable_bytes(base + 12, n),
+                    131_072,
+                    "masked: the run-up is 24,080"
+                );
+                assert_eq!(
+                    usable_bytes(base, 200_704),
+                    131_072,
+                    "the 2.0.3 shape, same loss"
+                );
+            } else {
+                assert_eq!(
+                    usable_bytes(base + 12, n),
+                    196_608,
+                    "the same region on the grid is the three it says"
+                );
+                assert_eq!(
+                    usable_bytes(base, 200_704),
+                    196_608,
+                    "the 2.0.3 shape carries 4 KiB of slack, which absorbs 12 bytes"
+                );
+            }
             // The round number the report says was accidentally safe: it
-            // strands 28,672 aligned and loses 24,092 here -- same three
+            // strands 28,672 aligned and loses 12 here -- same three
             // segments, so no claim of exactness is broken and it is NOT the
             // misaligned case.
             let round = 220 * 1024;
@@ -1431,7 +1592,8 @@ mod tests {
             const SLACK: usize = 65_536 + 0x1e4;
             static mut MIS: [u8; M + SLACK] = [0; M + SLACK];
             let bp = (&raw mut MIS).cast::<u8>().expose_provenance();
-            // Put the base at the report's residue, 0x1e4 past a boundary.
+            // Put the base at the report's residue, 0x1e4 past a boundary:
+            // 12 bytes off the 16-byte grid.
             let want = (bp & !(SEG - 1)) + SEG + 0x1e4;
             let skip = want - bp;
             assert!(skip <= SLACK);
@@ -1453,23 +1615,34 @@ mod tests {
     #[test]
     fn region_type_is_aligned_and_unpadded() {
         use crate::types::SEGMENT_SIZE as SEG;
-        assert_eq!(core::mem::align_of::<Region<MIN_REGION>>(), SEG);
+        assert_eq!(
+            core::mem::align_of::<Region<MIN_REGION>>(),
+            REGION_ALIGN,
+            "16 bytes: segments stride from the base, so the type owes the linker no gap"
+        );
         assert_eq!(
             core::mem::size_of::<Region<MIN_REGION>>(),
             MIN_REGION,
             "a whole-segment region carries no padding"
         );
         assert_eq!(Region::<MIN_REGION>::USABLE, SEG);
-        // The value on the heap, allocated IN PLACE: a segment-aligned static
-        // does not compile on every host toolchain, and `Box::new(Region::new())`
-        // materialises a 64 KiB-aligned value on the stack first, which on
-        // Windows realigns the frame past the guard page and faults
-        // (STATUS_ACCESS_VIOLATION, found writing this test). Zero is a valid
-        // `Region` -- it is bytes and nothing else -- so `new_zeroed` is exact.
         #[cfg(ra_small_profile)]
         {
+            // A plain `static`, exactly as a firmware declares it. (While the
+            // type was segment-aligned this had to be a leaked `Box`: a
+            // 64 KiB-aligned static did not compile on every host toolchain,
+            // and `Box::new(Region::new())` faulted past Windows' guard page.)
+            #[cfg(not(ra_aligned_region))]
+            let r: &'static Region<MIN_REGION> = {
+                static R: Region<MIN_REGION> = Region::new();
+                &R
+            };
+            // Under `ra_aligned_region` the type is segment-aligned again, and
+            // a 64 KiB-aligned static does not compile on every host toolchain;
+            // allocate it in place instead. Zero is a valid `Region`.
             // SAFETY: an all-zero `Region` is a valid value (its only field is
             // a byte array), so `assume_init` on zeroed storage is sound.
+            #[cfg(ra_aligned_region)]
             let r: &'static Region<MIN_REGION> =
                 Box::leak(unsafe { Box::<Region<MIN_REGION>>::new_zeroed().assume_init() });
             assert_eq!(r.usable(), Region::<MIN_REGION>::USABLE);
@@ -1503,18 +1676,31 @@ mod tests {
         // page of the region (2.0.4; it used to be, and this used to be 0).
         assert_eq!(usable_bytes(0, seg), seg, "a bare segment is a segment");
 
-        // An UNALIGNED base loses the run-up. This is why `init_region` checks
-        // the real base rather than comparing `len` against `MIN_REGION`: this
-        // region is >= MIN_REGION and still yields nothing.
+        // A base ANYWHERE on the 16-byte grid loses nothing: segments stride
+        // from it, so a page-aligned base off every segment boundary serves
+        // exactly what an aligned one does. Until 2.0.4 this was 0.
         assert_eq!(
             usable_bytes(FIXED_PAGE, MIN_REGION),
+            if cfg!(ra_aligned_region) { 0 } else { seg },
+            "a base off the segment grid serves the segment, because strides start at the base \
+             (masked, the run-up eats it)"
+        );
+        assert_eq!(usable_bytes(REGION_ALIGN, MIN_REGION), seg);
+        assert_eq!(usable_bytes(3 * seg + 5 * REGION_ALIGN, MIN_REGION), seg);
+        // A base OFF the 16-byte grid loses the run-up to it -- at most 15
+        // bytes, and against an exact length that is still a whole segment.
+        // This is why `init_region` checks the real base rather than comparing
+        // `len` against `MIN_REGION`: this region is >= MIN_REGION and still
+        // yields nothing.
+        assert_eq!(
+            usable_bytes(REGION_ALIGN + 1, MIN_REGION),
             0,
-            "unaligned base eats the segment"
+            "a base off the grid eats the segment"
         );
         assert_eq!(
-            usable_bytes(FIXED_PAGE, MIN_REGION + seg),
+            usable_bytes(REGION_ALIGN + 1, MIN_REGION + REGION_ALIGN),
             seg,
-            "one more segment of slack absorbs the misalignment"
+            "sixteen bytes of slack absorb it"
         );
 
         // The stranded tail, which used to be recorded only in a design doc.

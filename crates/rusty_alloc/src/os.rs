@@ -126,8 +126,16 @@ pub fn alloc_aligned(
     // `% alignment` by a RUNTIME divisor is a real `div`. Debug-only, but
     // `debug_checks` runs the whole datasweep corpus, so it is worth the mask
     // — same substitution as the five release sites (D7).
+    // On a fixed region alignment is measured from the region's base, which
+    // is where its segments stride from (`crate::REGION_STRIDES`). Computed
+    // outside the assert so the check has no side effect to be skipped.
+    let from_origin = if crate::REGION_STRIDES {
+        (a.ptr as usize).wrapping_sub(crate::prim::fixed::stride_base())
+    } else {
+        a.ptr as usize
+    };
     debug_assert!(
-        crate::bins::is_aligned_to(a.ptr as usize, alignment),
+        crate::bins::is_aligned_to(from_origin, alignment),
         "prim returned misaligned block"
     );
     Ok(OsBlock {

@@ -1133,11 +1133,16 @@ impl Heap {
         // against the same heap, the same page and the same free list, with
         // nothing in between. Repeating it could only fail again, so the copy
         // that used to sit here was pure cold-path tax.
-        // Natural fit: only sound when the offset keeps block starts aligned.
-        if bins::is_aligned_to(offset, align)
-            && size <= MEDIUM_OBJ_SIZE_MAX
-            && align <= SEGMENT_SLICE_SIZE
-        {
+        // Natural fit: only sound when the offset keeps block starts aligned,
+        // and only as far as the page area itself is aligned — a slice,
+        // hosted; `REGION_ALIGN` on a fixed region, where segments stride
+        // from a `MAX_ALIGN_SIZE`-aligned base (`crate::REGION_STRIDES`).
+        let natural = if crate::REGION_STRIDES {
+            crate::prim::fixed::REGION_ALIGN
+        } else {
+            SEGMENT_SLICE_SIZE
+        };
+        if bins::is_aligned_to(offset, align) && size <= MEDIUM_OBJ_SIZE_MAX && align <= natural {
             // The bin is derived ONCE and handed on. `good_size(size)` is
             // `bin_size(bin(size))`, and the `malloc` it decides to call then
             // re-derived the very same bin to reach the same queue —

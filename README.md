@@ -33,7 +33,7 @@ does not offer.
   releases have cut what it adds to a gzipped bundle by two thirds** (+7,760 ->
   +3,829 -> +2,435 bytes on a minimal module) — see
   [Shipping it to a browser](#shipping-it-to-a-browser).
-- **Runs on a microcontroller, and is 2.2-4.0x faster than `esp-alloc` there** —
+- **Runs on a microcontroller, and is 2.1-3.9x faster than `esp-alloc` there** —
   measured on a XIAO ESP32-S3 at 240 MHz, both allocators built from one source.
   It costs more RAM to get that (64 KiB vs 8 KiB); both numbers are below.
 
@@ -196,31 +196,38 @@ RUSTFLAGS="--cfg ra_single_threaded --cfg ra_small_profile"
 ```rust
 use rusty_alloc::prim::fixed::{Region, good_region_size};
 
-// The region: whole 64 KiB segments, segment-aligned by construction, with
-// no padding. Size it from a budget (or `region_for(usable)` from a need),
-// never a round number, and hand it over once before the first allocation.
+// The region: whole 64 KiB segments with no padding, and only 16-byte
+// aligned — segments stride from its base, so the linker owes it no gap.
+// Size it from a budget (or `region_for(usable)` from a need), never a
+// round number, and hand it over once before the first allocation.
 static HEAP: Region<{ good_region_size(220 * 1024) }> = Region::new();
 
 let usable = HEAP.give().expect("region accepted, given once");
 // usable == 196_608: three segments, nothing stranded.
 ```
 
-Do not write your own container. A plain `static [u8; N]` has alignment 1
-and yields a segment fewer than its size says (`init_region` now refuses that
-with `FERR_MISALIGNED`); a `#[repr(align(65536))]` wrapper of your own around
-the old `k * 64 KiB + 4 KiB` shape is rounded up to the next segment and
-costs more RAM than the granule it was meant to save — 60,952 bytes of stack
-on the firmware that tried it. `Region<N>` is the size it says.
+Do not write your own container. A plain `static [u8; N]` has alignment 1,
+so fifteen times in sixteen it sits off the 16-byte grid and yields a
+segment fewer than its size says (`init_region` refuses that with
+`FERR_MISALIGNED`); a `#[repr(align(65536))]` wrapper of your own is rounded
+up to the next segment and costs more RAM than the granule it was meant to
+save — 60,952 bytes of stack on the firmware that tried it. `Region<N>` is
+the size it says, and nothing more.
 
-One honest number about what it does *not* save: reaching a 64 KiB boundary
-costs up to 65,535 bytes of RAM however the region is declared. A round
-unaligned region pays it inside (`usable_bytes` reports it, `free` never
-reaches it); `Region` pays it as the linker's gap before the static, which
-`size -A` charges to no section. On the reporting firmware, round 225,280 →
-`Region<196_608>` was the same 196,608 usable and **+2,828 bytes of stack**,
-while the `.bss` delta read −26,920 — judge a region change by `.stack` or
-the section sum, never by `.bss` alone. `Region` buys correctness by
-construction; only the linker script decides how big the gap is.
+**The 64 KiB alignment gap is gone.** Until 2.0.4 `Region` had to be
+segment-aligned, because `free` recovered a block's segment by masking its
+address, and the linker paid for that with a gap of up to 65,535 bytes in
+front of the static — charged to no section, so `size -A` never showed it,
+and the reporting firmware found it only when `.data + .bss + .stack` failed
+to reconcile by 24,148 bytes. Segments now stride from the region's *base*
+(`REGION_STRIDES` in `lib.rs`; wasm made the same trade with a slice table),
+so `Region` is 16-byte aligned, the sum reconciles, and that firmware got
+**24,144 bytes of stack back** with `.bss` unchanged. The price is three
+instructions on every `free` (39 against 36 on the ESP32-S3), which the
+board prices at 9–17 ns per alloc/free pair. A firmware that would rather
+have those than the RAM sets `--cfg ra_aligned_region`: the mask is back,
+`Region` is segment-aligned again, and so is the gap. Either way, judge a
+region change by `.stack` or the section sum, never by `.bss` alone.
 
 | flag | what happens without it |
 |---|---|
@@ -228,6 +235,7 @@ construction; only the linker script decides how big the gap is.
 | `--cfg ra_small_profile` | **builds and links clean, then nothing allocates** — `SEGMENT_SIZE` stays 32 MiB, a kilobyte-scale region yields zero segments, and the first `Vec` returns null |
 | `Region::give` (or `init_region`) | every allocation fails; the backend has no memory |
 | *(optional)* `--cfg ra_max_extents="8"` | the free-extent table keeps its default 32 slots (256 B of `.bss`, i.e. stack); 8 is plenty for a region of a few segments and returns 192 B — the doc on `MAX_EXTENTS` states the bound |
+| *(optional)* `--cfg ra_aligned_region` | segments stride from the region's base: `Region` is 16-byte aligned, the linker leaves no gap before it, and `free` pays three instructions. With the flag, the 2.0.4 layout: the address mask on `free`, `Region` segment-aligned, up to 64 KiB of gap in front of it |
 
 Size the region with the two `const fn`s in `prim::fixed`, not a round
 number: `good_region_size(220 * 1024)` is 196,608 — three whole segments,
@@ -254,19 +262,25 @@ reach — abandon, adopt, the delayed-free list, the thread-exit hook — and on
 `wasm32-unknown-unknown` without the atomics feature the same pruning happens
 without any flag at all, because that target has one thread by construction.
 
-### Throughput — 2.2x to 4.0x faster
+### Throughput — 2.1x to 3.9x faster
 
 Nanoseconds per allocate/free pair, lower is better:
 
 | workload | `esp-alloc` | `rusty_alloc` | speedup |
 |---|---:|---:|---:|
-| 32 B alloc/free, one size | 1,638 | **586** | **2.80x** |
-| 64 mixed blocks (8-512 B), batch out then back | 1,792 | **824** | **2.17x** |
-| **churn: 64 live, random sizes 8-512 B, random replacement** | 3,987 | **1,002** | **3.98x** |
-| 2048 B alloc/free | 1,638 | **1,133** | **1.45x** |
+| 32 B alloc/free, one size | 1,638 | **595** | **2.75x** |
+| 64 mixed blocks (8-512 B), batch out then back | 1,792 | **833** | **2.15x** |
+| **churn: 64 live, random sizes 8-512 B, random replacement** | 3,987 | **1,011** | **3.94x** |
+| 2048 B alloc/free | 1,638 | **1,134** | **1.44x** |
 
-Both arms measured in the same session (2026-09-09, `main` after 2.0.2),
-floors of 158 and 162 ns/op, with matching checksums. The rows moved twice
+Both arms measured in the same session (2026-09-09, after the
+region-alignment dissolve), floors of 166 and 162 ns/op, with matching
+checksums. With `--cfg ra_aligned_region` the `rusty_alloc` column reads
+578 / 820 / 997 / 1,125: the base-relative segment stride costs 9–17 ns of
+each pair, and a dead acquire load found on the way
+(`docs/plans/finished/region-alignment-dissolve.md` §7) gave 8 back on both
+arms, so the default is within 9 ns of 2.0.4 on every row and the knob is
+under it. The rows moved twice
 since 2.0.0: the medium-band collect-and-retry took the 2 KiB row from 1.19x
 to 1.37x, and 2.0.2's single-context free fold — one compare off every free,
 the guarded probe off the generic path — took 7-9 % off every row. The
@@ -297,7 +311,7 @@ in a medium page.
   printed. **Every checksum matches across the two arms**, so both allocators
   provably did the same work.
 - **A null arm.** The same benchmark twice within one arm reproduced to the
-  nanosecond (586 and 586; 1,638 and 1,638), so the resolution floor is below
+  nanosecond (595 and 595; 1,638 and 1,638), so the resolution floor is below
   any gap claimed here. Best-of-5, spread <= 1% on every row.
 - **Addresses held constant.** Both arms allocate the same sequence into the
   same-sized region, so buffer placement is the same in both. That matters:
@@ -315,9 +329,10 @@ in a medium page.
 |---|---:|---:|
 | smallest heap that runs the same workload | **8 KiB** | 64 KiB + a 1,752 B descriptor static *(needs `--cfg ra_small_profile`)* |
 | peak live bytes (identical, the parity check) | 4,914 | 4,914 |
-| flash (`.text` + `.rodata` + `.data`), one firmware, two arms | — | **+3,208 B** |
+| flash (`.text` + `.rodata` + `.data`), one firmware, two arms | — | **+3,228 B** (+3,092 B with `--cfg ra_aligned_region`) |
 | static RAM (`.bss` + `.data`) | — | **+284 B** |
 | heap region stranded by the 64 KiB granule | — | **0** with `Region<{ good_region_size(..) }>` (28,672 B for a round 220 KiB) |
+| linker gap before the region | — | **0**: `Region` is 16-byte aligned (24,148 B on this firmware while it was segment-aligned, through 2.0.4) |
 
 **Flash and static RAM are two more budgets, and the second one is a
 hazard.** The rows above are from `size -A` on the linked ELF of one

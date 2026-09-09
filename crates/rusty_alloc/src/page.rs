@@ -204,7 +204,10 @@ unsafe fn blockmap_transition(page: *mut Page, b: *const u8, to_live: bool) {
 /// Segments are SEGMENT_SIZE-aligned and SEGMENT_SIZE is a power of two, so
 /// `(a ^ b) < SEGMENT_SIZE` IS "same segment" in two ALU ops with no memory
 /// access — cheaper than asking the global segment map (an atomic load) and
-/// stronger than it, since the map would accept any segment we own.
+/// stronger than it, since the map would accept any segment we own. On a
+/// fixed region the segments stride from the region's base instead
+/// (`crate::REGION_STRIDES`), and the same identity holds of the two OFFSETS
+/// from it.
 ///
 /// Split out of [`block_next`] so the PREDICATE can be tested exhaustively
 /// in-process (`link_tests` below) while the fault PATH — which aborts, and so
@@ -220,6 +223,15 @@ unsafe fn blockmap_transition(page: *mut Page, b: *const u8, to_live: bool) {
 #[inline]
 #[doc(hidden)]
 pub fn link_is_plausible(dec: usize, b_addr: usize) -> bool {
+    // On a fixed region "same segment" is a property of the offsets from the
+    // region's base, not of the addresses; the base is `MAX_ALIGN_SIZE`-
+    // aligned, so the alignment test reads the same on either.
+    let (dec, b_addr) = if crate::REGION_STRIDES {
+        let base = crate::prim::fixed::stride_base();
+        (dec.wrapping_sub(base), b_addr.wrapping_sub(base))
+    } else {
+        (dec, b_addr)
+    };
     dec.is_multiple_of(crate::types::MAX_ALIGN_SIZE.min(8))
         && (dec ^ b_addr) < crate::types::SEGMENT_SIZE
 }

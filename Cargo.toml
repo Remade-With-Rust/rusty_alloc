@@ -155,7 +155,7 @@ unsafe_op_in_unsafe_fn = "deny"
 # unify across the dependency graph, so two consumers wanting different
 # geometries would silently get one of them. A cfg is set by the DELIVERABLE,
 # the same way a Janus firmware picks its chip.
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(kani)", "cfg(ra_small_profile)", "cfg(ra_single_threaded)", "cfg(ra_max_extents, values(\"8\", \"16\", \"64\"))"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(kani)", "cfg(ra_small_profile)", "cfg(ra_single_threaded)", "cfg(ra_max_extents, values(\"8\", \"16\", \"64\"))", "cfg(ra_aligned_region)"] }
 
 # Lint policy (hardening gate H-15). `pedantic` and `nursery` are ENABLED at
 # workspace level and the build is clean under them, because every group
