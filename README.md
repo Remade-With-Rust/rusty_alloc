@@ -9,6 +9,7 @@
 > It makes personal and work files AI-readable without them leaving the machine:
 > the whole conversion runs as WebAssembly in the browser tab, with nothing
 > uploaded and nothing to install.
+
 > [Rusty_JSON_Turbo](https://github.com/Remade-With-Rust/rusty_json_turbo) is a Serde fork, and saw a 54% top speed increase by implementing
 > Rusty_alloc, and nothing else.
 
