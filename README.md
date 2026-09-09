@@ -37,14 +37,15 @@ does not offer.
   measured on a XIAO ESP32-S3 at 240 MHz, both allocators built from one source.
   It costs more RAM to get that (64 KiB vs 8 KiB); both numbers are below.
 
-> **Status: `2.0.3`.** The API is frozen and changes follow semver. 2.0.1
-> through 2.0.3 are patch releases: no public API moved. 2.0.2 halved the
+> **Status: `2.0.4`.** The API is frozen and changes follow semver. 2.0.1
+> through 2.0.4 are patch releases: no public API moved. 2.0.2 halved the
 > allocator's flash cost on a microcontroller and cut its gzipped wasm overhead
-> by a third; 2.0.3 halves the flash cost again, takes the static RAM cost from
-> 3 KB to under 300 bytes, and hands the region granule back to the firmware
-> with `good_region_size` (see
-> [Embedded](#embedded-bare-metal-measured-on-silicon) and
-> [Shipping it to a browser](#shipping-it-to-a-browser)).
+> by a third; 2.0.3 halved the flash cost again and took the static RAM cost
+> from 3 KB to under 300 bytes; 2.0.4 makes a firmware's region whole segments
+> with `prim::fixed::Region<N>` — unpadded by construction, the floor 64 KiB —
+> and refuses a base that would silently cost a segment. Note that 2.0.4 moves
+> what `good_region_size` / `region_for` / `MIN_REGION` return (see
+> [Embedded](#embedded-bare-metal-measured-on-silicon) and the CHANGELOG).
 >
 > **What breaks, and why it is a major.** Two things, neither of which touches a
 > consumer on default features: `default-features = false` now selects the
