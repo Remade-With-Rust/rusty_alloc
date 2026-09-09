@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.2](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.0.1...rusty_alloc-v2.0.2) - 2026-09-09
+
 ### Changed
 
 - **Firmware code size halved: `--cfg ra_single_threaded` now prunes what it

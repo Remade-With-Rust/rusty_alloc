@@ -29,14 +29,19 @@ does not offer.
   cross-thread path and abort.
 - **~150 of mimalloc's ~157 `mi_*` entry points**, gated against the C
   implementation as a differential oracle on every change.
-- **Runs on WebAssembly** with no C toolchain and no emscripten, and **2.0.0
-  halves what it adds to a gzipped bundle** (+7,760 -> +3,829 bytes on a minimal
-  module) — see [Shipping it to a browser](#shipping-it-to-a-browser).
+- **Runs on WebAssembly** with no C toolchain and no emscripten, and **two
+  releases have cut what it adds to a gzipped bundle by two thirds** (+7,760 ->
+  +3,829 -> +2,435 bytes on a minimal module) — see
+  [Shipping it to a browser](#shipping-it-to-a-browser).
 - **Runs on a microcontroller, and is 2.0-3.7x faster than `esp-alloc` there** —
   measured on a XIAO ESP32-S3 at 240 MHz, both allocators built from one source.
   It costs more RAM to get that (68 KiB vs 8 KiB); both numbers are below.
 
-> **Status: `2.0.0`.** The API is frozen and changes follow semver.
+> **Status: `2.0.2`.** The API is frozen and changes follow semver. 2.0.1 and
+> 2.0.2 are patch releases: no public API moved. 2.0.2 halves the allocator's
+> flash cost on a microcontroller and cuts its gzipped wasm overhead by a third
+> (see [Embedded](#embedded-bare-metal-measured-on-silicon) and
+> [Shipping it to a browser](#shipping-it-to-a-browser)).
 >
 > **What breaks, and why it is a major.** Two things, neither of which touches a
 > consumer on default features: `default-features = false` now selects the
@@ -357,13 +362,22 @@ you the wrong one.
 ## Shipping it to a browser
 
 An integrator reported `rusty_alloc` adding ~12 % to their gzipped wasm bundle.
-It was measured, and most of it is gone in 2.0.0.
+It was measured, and most of it is gone: half in 2.0.0, another third of what
+was left in 2.0.2.
 
 | | raw | gzip | overhead vs the Rust default |
 |---|---:|---:|---:|
 | dlmalloc (Rust default for wasm32) | 15,536 | 6,706 | — |
 | rusty_alloc 1.1.x | 34,285 | 14,466 | +7,760 |
-| **rusty_alloc 2.0.0** | **25,734** | **10,535** | **+3,829** |
+| rusty_alloc 2.0.0 | 25,734 | 10,535 | +3,829 |
+| **rusty_alloc 2.0.2** | **22,550** | **9,141** | **+2,435** |
+
+The 2.0.2 row is the embedded work paying off elsewhere: `wasm32-unknown-unknown`
+without the atomics feature has one thread by construction, so the same
+predicate that prunes the cross-thread machinery from a microcontroller image
+prunes it here too, and guarded-object sampling — which needs an MMU wasm does
+not have — no longer ships at all. The base row was rebuilt for this
+measurement and did not move.
 
 Measured on a minimal consumer built the way you would ship it (`opt-level="z"`,
 `lto="fat"`, `panic="abort"`, `strip`), attributed by a set difference against
