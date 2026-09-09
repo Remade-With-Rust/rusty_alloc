@@ -110,11 +110,13 @@ longer decays and churn NULLs fell from 22,533 to 357 per 50,000.
 `--cfg ra_single_threaded` (the build fails without it, loudly) and
 **`--cfg ra_small_profile`** (nothing tells you, and without it `SEGMENT_SIZE`
 stays 32 MiB, a kilobyte-scale region yields zero segments and every allocation
-fails) — then hand the backend its memory with
-`prim::fixed::init_region`. The full recipe is in the repository README.
+fails) — then hand the backend its memory through
+`prim::fixed::Region<{ good_region_size(budget) }>`, which is segment-aligned,
+whole segments and unpadded by construction. The full recipe is in the
+repository README.
 
 **It costs RAM to get that.** The smallest heap that runs the same workload is
-**68 KiB for `rusty_alloc` (at that geometry) against 8 KiB for `esp-alloc`** — a linked-list
+**64 KiB for `rusty_alloc` (at that geometry, plus a 1,752-byte descriptor static) against 8 KiB for `esp-alloc`** — a linked-list
 heap's floor is `bytes live + header`, while a size-class page allocator's is
 `(classes touched) x (page size)`, independent of bytes requested. That floor is
 roughly fixed, so it amortises as the working set grows. Reach for `esp-alloc`
@@ -133,8 +135,10 @@ exactly `Δ.bss + Δ.data`. A firmware near its stack limit gets an overflow,
 not a bigger binary, and nothing in the build says so. Flash is a fixed cost
 that stops mattering as the firmware grows; the heap floor scales with the
 size classes touched and does not; and the region's 64 KiB granule is yours
-to avoid — declare it with `prim::fixed::good_region_size(budget)` instead of
-a round number, or a 220 KiB region strands 24 KiB. Decompositions and
+to avoid — declare it as `Region<{ good_region_size(budget) }>` instead of a
+round number, or a 220 KiB region strands 28 KiB; and do not wrap the region
+in an aligned container of your own, which is rounded up to the next segment
+and cost the firmware that tried it 60 KB of stack. Decompositions and
 levers: `docs/plans/finished/firmware-code-size.md` and
 `firmware-what-is-left.md` in the repository.
 

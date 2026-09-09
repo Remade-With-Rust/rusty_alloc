@@ -35,7 +35,7 @@ does not offer.
   [Shipping it to a browser](#shipping-it-to-a-browser).
 - **Runs on a microcontroller, and is 2.2-4.0x faster than `esp-alloc` there** —
   measured on a XIAO ESP32-S3 at 240 MHz, both allocators built from one source.
-  It costs more RAM to get that (68 KiB vs 8 KiB); both numbers are below.
+  It costs more RAM to get that (64 KiB vs 8 KiB); both numbers are below.
 
 > **Status: `2.0.3`.** The API is frozen and changes follow semver. 2.0.1
 > through 2.0.3 are patch releases: no public API moved. 2.0.2 halved the
@@ -182,7 +182,7 @@ ESP32-S3. Everything below was measured on a **Seeed XIAO ESP32-S3 Sense at
 ### What a firmware has to set
 
 **All three of these, not two.** Every number in this section is *of this
-configuration*; the 68 KiB floor below is meaningless without the geometry flag.
+configuration*; the 64 KiB floor below is meaningless without the geometry flag.
 
 ```toml
 rusty_alloc-api = { version = "2", default-features = false }
@@ -193,28 +193,37 @@ RUSTFLAGS="--cfg ra_single_threaded --cfg ra_small_profile"
 ```
 
 ```rust
-// A region the linker owns, aligned to a segment. Hand it over once, before
-// the first allocation.
-#[repr(align(65536))]
-struct Region([u8; 68 * 1024]);
-static mut REGION: Region = Region([0; 68 * 1024]);
+use rusty_alloc::prim::fixed::{Region, good_region_size};
 
-// SAFETY: the only reference ever taken to REGION.
-rusty_alloc::prim::fixed::init_region(unsafe { &mut (*(&raw mut REGION)).0 })
-    .expect("region is large enough and registered once");
+// The region: whole 64 KiB segments, segment-aligned by construction, with
+// no padding. Size it from a budget (or `region_for(usable)` from a need),
+// never a round number, and hand it over once before the first allocation.
+static HEAP: Region<{ good_region_size(220 * 1024) }> = Region::new();
+
+let usable = HEAP.give().expect("region accepted, given once");
+// usable == 196_608: three segments, nothing stranded.
 ```
+
+Do not write your own container. A plain `static [u8; N]` has alignment 1
+and yields a segment fewer than its size says (`init_region` now refuses that
+with `FERR_MISALIGNED`); a `#[repr(align(65536))]` wrapper of your own around
+the old `k * 64 KiB + 4 KiB` shape is rounded up to the next segment and
+costs more RAM than the granule it was meant to save — 60,952 bytes of stack
+on the firmware that tried it. `Region<N>` is the size it says.
 
 | flag | what happens without it |
 |---|---|
 | `--cfg ra_single_threaded` | **build fails**, with a message telling you to set it |
 | `--cfg ra_small_profile` | **builds and links clean, then nothing allocates** — `SEGMENT_SIZE` stays 32 MiB, a kilobyte-scale region yields zero segments, and the first `Vec` returns null |
-| `init_region` | every allocation fails; the backend has no memory |
+| `Region::give` (or `init_region`) | every allocation fails; the backend has no memory |
 | *(optional)* `--cfg ra_max_extents="8"` | the free-extent table keeps its default 32 slots (256 B of `.bss`, i.e. stack); 8 is plenty for a region of a few segments and returns 192 B — the doc on `MAX_EXTENTS` states the bound |
 
 Size the region with the two `const fn`s in `prim::fixed`, not a round
-number: `good_region_size(220 * 1024)` is 200,704 — three segments plus the
-page, nothing stranded — where a literal 220 KiB strands 24,576 bytes that
-neither the allocator nor the firmware can use.
+number: `good_region_size(220 * 1024)` is 196,608 — three whole segments,
+nothing stranded — where a literal 220 KiB strands 28,672 bytes that neither
+the allocator nor the firmware can use. The first heap's descriptor is a
+1,752-byte static of the crate's, not a page of the region, which is what
+lets the region be whole segments.
 
 That middle row is the trap, and it was reported by the first outside firmware
 to adopt 2.0.0 (`docs/plans/embedded-adoption.md`). `ra_single_threaded`
@@ -291,11 +300,11 @@ in a medium page.
 
 | | `esp-alloc` | `rusty_alloc` |
 |---|---:|---:|
-| smallest heap that runs the same workload | **8 KiB** | 68 KiB *(needs `--cfg ra_small_profile`)* |
+| smallest heap that runs the same workload | **8 KiB** | 64 KiB + a 1,752 B descriptor static *(needs `--cfg ra_small_profile`)* |
 | peak live bytes (identical, the parity check) | 4,914 | 4,914 |
 | flash (`.text` + `.rodata` + `.data`), one firmware, two arms | — | **+3,208 B** |
 | static RAM (`.bss` + `.data`) | — | **+284 B** |
-| heap region stranded by the 64 KiB granule | — | **0** with `good_region_size` (24,576 B for a round 220 KiB) |
+| heap region stranded by the 64 KiB granule | — | **0** with `Region<{ good_region_size(..) }>` (28,672 B for a round 220 KiB) |
 
 **Flash and static RAM are two more budgets, and the second one is a
 hazard.** The rows above are from `size -A` on the linked ELF of one
@@ -324,7 +333,7 @@ overflow, and nothing in the build says so. Check `size -A` before and after.
 The two costs have different shapes, and a reader choosing an allocator wants
 both curves. **Flash is roughly fixed** — about 3 KB whether the firmware is
 240 KB (1.3 %) or 900 KB with a TLS stack in it (under 0.4 %), so it stops
-mattering as the firmware grows. **The 68 KiB heap floor does not** — it
+mattering as the firmware grows. **The 64 KiB heap floor does not** — it
 scales with the size classes a program touches, not with the program, so it
 matters exactly as much on a big firmware as on a small one. And **the region
 granule is the consumer's to fix**: a region yields whole 64 KiB segments plus
@@ -343,9 +352,10 @@ size)` — independent of how many bytes you actually asked for. The measured
 workload touches 10 classes and holds 4,914 bytes; nine of its pages hold 1,412
 bytes between them.
 
-**Read 68 KiB as this workload's floor, not a general budget.** It is the least
-memory that runs *this* sketch. A stress battery that touches 24 distinct size
-classes holds only 5 of them at 68 KiB — because the floor scales with the
+**Read 64 KiB as this workload's floor, not a general budget.** It is the least
+memory that runs *this* sketch: one whole segment, measured
+`65536 usable of 65536` with the same 4,914-byte peak. A stress battery that
+touches 24 distinct size classes holds only 5 of them there — because the floor scales with the
 number of classes a program uses, which is the same sentence as above read from
 the other end.
 
@@ -356,9 +366,11 @@ page allocator starts earning what it charges, and the throughput above is what
 it buys.
 
 We got from 192 KiB to 68 KiB by fixing a placement bug in the fixed-region
-backend and halving the slice; the full decomposition, the levers taken and the
-one deliberately left on the table are in
-[`docs/plans/small-metal.md`](docs/plans/small-metal.md).
+backend and halving the slice, and from 68 KiB to 64 KiB by moving the first
+heap's descriptor out of the region into a static, so the region is whole
+segments and an aligned container of it is not padded; the decompositions are
+in [`docs/plans/finished/small-metal.md`](docs/plans/finished/small-metal.md)
+and [`docs/plans/finished/region-alignment-bug.md`](docs/plans/finished/region-alignment-bug.md).
 
 ### Stress: what a hostile workload does to each
 

@@ -113,7 +113,11 @@ run_case "ONE_THREAD is false where threads exist"   "crates/rusty_alloc/src/lib
 # --- firmware-what-is-left §1: good_region_size must do the arithmetic ------
 # A const fn that returned a plausible number for the reported case but got the
 # granule wrong would strand memory on every board that trusted it.
-run_case "good_region_size strands nothing"   "crates/rusty_alloc/src/prim/fixed.rs"   's/\(\(budget - FIXED_PAGE\) \/ seg\) \* seg \+ FIXED_PAGE/((budget - FIXED_PAGE) \/ seg) * seg/'   "--lib prim::fixed::tests::good_region_size"   "--cfg ra_single_threaded --cfg ra_small_profile"
+run_case "good_region_size strands nothing" \
+  "crates/rusty_alloc/src/prim/fixed.rs" \
+  's/\(budget \/ seg\) \* seg\n\}/budget\n}/' \
+  "--lib prim::fixed::tests::good_region_size" \
+  "--cfg ra_single_threaded --cfg ra_small_profile"
 
 # --- firmware-what-is-left §3: ONE_REGION must be FALSE on a hosted target ----
 # It folds arenas, the segment map and the option table to what one region
@@ -123,6 +127,12 @@ run_case "good_region_size strands nothing"   "crates/rusty_alloc/src/prim/fixed
 # heaps test `expect`s its arena reservation and asserts that `options::set`
 # round-trips, and both go red.
 run_case "ONE_REGION is false where arenas exist"   "crates/rusty_alloc/src/lib.rs"   's/pub\(crate\) const ONE_REGION: bool = cfg!\(all\(/pub(crate) const ONE_REGION: bool = true || cfg!(all(/'   "--test heaps heaps_arenas_subprocs_options"
+
+# --- region-alignment-bug §3: init_region must refuse a segment-costing base -
+# The refusal is one comparison; remove it and the exact-size-at-the-linker's-
+# base probe is accepted and served two thirds of its heap, which is the
+# startup panic the Janus firmware reported.
+run_case "init_region refuses a misaligned exact region"   "crates/rusty_alloc/src/prim/fixed.rs"   's/if usable_bytes\(base, len\) < usable_bytes\(0, len\) \{/if false {/'   "--lib prim::fixed::tests::a_misaligned_exact_region"   "--cfg ra_single_threaded --cfg ra_small_profile"
 
 echo
 if ((fail > 0)); then

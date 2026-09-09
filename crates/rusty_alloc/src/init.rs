@@ -546,10 +546,26 @@ pub fn ensure_heap(hb: *mut HeapBox) -> *mut HeapBox {
 /// in the hardening audit).
 pub fn create_heap(tag: i32, allow_destroy: bool, arena_id: i32) -> *mut HeapBox {
     let size = core::mem::size_of::<HeapBox>();
-    let Ok(block) = os::alloc_aligned(size, os::page_size(), true, false) else {
-        return ptr::null_mut();
+    // On a one-region target the FIRST descriptor is a static of the fixed
+    // backend's, so that a firmware's region is whole segments and needs no
+    // page carved out of it — the page is what made an aligned container of
+    // the region pad itself out to the next segment
+    // (`docs/plans/finished/region-alignment-bug.md` §7). Every later heap,
+    // and every heap on a hosted target, takes a page as before.
+    let first = if crate::ONE_REGION {
+        prim::fixed::take_first_heap_box()
+    } else {
+        None
     };
-    let hb: *mut HeapBox = block.ptr.cast();
+    let hb: *mut HeapBox = match first {
+        Some(p) => p,
+        None => {
+            let Ok(block) = os::alloc_aligned(size, os::page_size(), true, false) else {
+                return ptr::null_mut();
+            };
+            block.ptr.cast()
+        }
+    };
     // SAFETY: fresh committed mapping large enough for HeapBox; we initialize
     // every field before publishing the pointer.
     unsafe {
@@ -800,16 +816,20 @@ pub unsafe fn thread_done(hb: *mut HeapBox) {
             crate::page::remote_free(pg, b);
             b = next;
         }
-        // Release the heap storage and clear the fast-path pointer.
+        // Release the heap storage and clear the fast-path pointer. The
+        // first descriptor on a one-region target is a static, not a page:
+        // nothing to return (and this path is unreachable there anyway).
         heaps_unregister(hb);
-        let size = core::mem::size_of::<HeapBox>();
-        let blockdesc = os::OsBlock {
-            ptr: hb.cast(),
-            size: os::page_align_up(size),
-            is_large: false,
-            is_zero: false,
-        };
-        let _ = os::free(blockdesc);
+        if !(crate::ONE_REGION && prim::fixed::is_first_heap_box(hb)) {
+            let size = core::mem::size_of::<HeapBox>();
+            let blockdesc = os::OsBlock {
+                ptr: hb.cast(),
+                size: os::page_align_up(size),
+                is_large: false,
+                is_zero: false,
+            };
+            let _ = os::free(blockdesc);
+        }
     }
     // Back to the SENTINEL, not null — the slot is never null, so a
     // post-teardown malloc re-enters the generic path and re-initialises.
@@ -941,6 +961,12 @@ unsafe fn release_heap_box(hb: *mut HeapBox) {
     heaps_unregister(hb);
     if heap_tls::get() == hb {
         heap_tls::set(backing_heap());
+    }
+    // A first-class heap created before the first allocation would have been
+    // handed the fixed backend's static descriptor; that is not a page and
+    // must not be returned to the region.
+    if crate::ONE_REGION && prim::fixed::is_first_heap_box(hb) {
+        return;
     }
     let size = core::mem::size_of::<HeapBox>();
     let blockdesc = os::OsBlock {

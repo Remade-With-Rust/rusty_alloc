@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A region sized by `good_region_size` at an unaligned base silently served
+  a segment fewer than its size said** (reported by the Janus firmware:
+  `good_region_size(220 * 1024)` at the base the linker chose served two
+  segments, not three, and panicked in `handle_alloc_error` 484 bytes short of
+  the round number that had happened to work). `init_region` now refuses a
+  base that costs a whole segment against what the length promises, with
+  `FERR_MISALIGNED`; a round region that strands as much aligned as it loses
+  misaligned still passes.
+- **The documented fix was worse than the bug, and every sizing rule was the
+  reason.** The 2.0.3 rule `k * SEGMENT_SIZE + FIXED_PAGE` reserved a page of
+  the region for the first heap's descriptor, so an exact region was never a
+  whole number of segments, so a `#[repr(align(65536))]` container of it was
+  rounded up to the next segment: 200,704 bytes became 262,144 in `.bss`, and
+  the firmware that took the advice lost 60,952 bytes of stack. The first
+  heap's descriptor on a one-region target is now a static of the fixed
+  backend's (1,752 bytes), and the region is whole segments.
+
+### Added
+
+- `prim::fixed::Region<N>`: the region container a firmware should use.
+  `SEGMENT_SIZE`-aligned by construction, `N` checked at compile time to be a
+  whole number of segments, `size_of::<Region<N>>() == N` (asserted in the
+  crate), `give(&'static self) -> Result<usize, PrimError>` hands it over once
+  and returns the usable bytes; `Region::USABLE` for `const` assertions. On the
+  rig it replaced the consumer's aligned container for −63,780 bytes of
+  `.bss`, and the footprint sketch runs on `Region<{ 64 * 1024 }>`: one
+  segment, `65536 usable of 65536`.
+- `FERR_MISALIGNED` (0xF141), `FIXED_PAGE` (now `pub`),
+  `take_first_heap_box` / `is_first_heap_box`.
+
+### Changed
+
+- **The sizing rules lose their `+ FIXED_PAGE`**, which changes what these
+  return: `MIN_REGION` is `SEGMENT_SIZE`; `usable_bytes(0, len)` is
+  `⌊len / SEGMENT_SIZE⌋ · SEGMENT_SIZE`; `good_region_size(220 * 1024)` is
+  196,608 (was 200,704); `region_for(192 * 1024)` is 196,608. A consumer
+  `const`-asserting the old literal will fail to build, which is the point:
+  the old shape is the padded one. The strict semver reading of a changed
+  `const fn` result is a minor bump; it is presented as a fix because the old
+  results were the defect.
+- The README's recipe declares the region through `Region`, and its floor row
+  reads 64 KiB plus the descriptor static (was 68 KiB).
+
 ## [2.0.3](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.0.2...rusty_alloc-v2.0.3) - 2026-09-09
 
 ### Added
