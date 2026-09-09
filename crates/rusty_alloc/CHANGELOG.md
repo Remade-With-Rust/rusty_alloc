@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.3](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.0.2...rusty_alloc-v2.0.3) - 2026-09-09
+
 ### Added
 
 - `prim::fixed::good_region_size(budget)` and `region_for(usable)`, `const fn`s
