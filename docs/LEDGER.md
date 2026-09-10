@@ -48,6 +48,35 @@ slice from `dedicated_segments` and the sizing test goes red); the reproduction
 is a permanent property-based test against the real extent allocator. Unsafe
 +4, all `#[cfg(test)]` — the fix is arithmetic and adds none to shipped code.
 
+## SMALL-PROFILE EXTEND — every page carved one block at a time; 100% slow path -> 12.5% (2026-09-10)
+
+`docs/plans/finished/fixed-prim-small-step.md` §8.6-8.7, pulled out of the
+Kairos step report rather than reported directly.
+
+`page_extend` bounds its batch at 4 KiB of payload via
+`span_shift = 4 + slice_count.trailing_zeros()`. The identity is
+`4096/bsize == reserved / (slice_count * 16)` and the `16` is
+`SEGMENT_SLICE_SIZE / 4096` -- so the literal `4` holds only at the 64 KiB
+slice. Under `ra_small_profile` (4 KiB slice) the bound was **256 bytes**, the
+batch for a 512 B class computed to 0, `.max(1)` clamped it to ONE, and every
+page carried `capacity == 1`. A page with one block has no second block for the
+fast path, which is why `generic` read exactly 1.0000/op at every binned size.
+
+**Found by tracing `collect_inner`'s reclaim** while chasing the reported
+512-byte step: every reclaimed page printed `cap=1` with `resv=8`, and reserved
+being right while capacity was 1 named the extend immediately.
+
+**Fixed** by deriving the term (`SEGMENT_SLICE_SIZE.trailing_zeros() - 12`).
+Counted, 100k pairs, small profile: generic/op **1.0000 -> 0.1250** (512 B),
+0.1667 (513), 0.2500 (1024); churn 195 -> 24/32/49 per 100k. Timing, 32-bit
+host, ABBA, three reproductions: the 512-vs-513 step inverts +8.6% -> -36%,
+and 512 absolute 390,200 -> ~200,000 ns, ~1.9x. Default geometry byte-identical
+(the derived value IS the old literal; all-features asm moves one debug blob).
+
+**Not measured on silicon** -- that rig is the consumer's, and the prediction to
+falsify is that 256-512 stops being the only range losing to heap_4. Also still
+open: the bin route enters generic on every op even after this.
+
 ## SMALL-PATH STEP — not the prim, the POINTER WIDTH; the heartbeat knob bare metal could not reach (2026-09-10)
 
 `docs/plans/finished/fixed-prim-small-step.md`: the Kairos RTOS measured one

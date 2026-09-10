@@ -1,6 +1,7 @@
 # The small-path step — a 16% cliff at 512 bytes that only exists on bare metal
 
-**Status:** RESOLVED 2026-09-10 — see §8. The attribution was wrong and the
+**Status:** RESOLVED 2026-09-10 — see §8, and §8.7 for the DEFECT the
+report led to: the small profile extended every page one block at a time. The attribution was wrong and the
 correction is the finding. Originally: measured, nothing implemented · **Date:** 2026-09-10 · **Build:**
 `=2.1.0` from crates.io, unmodified · **Cfgs:** `ra_single_threaded`,
 `ra_small_profile` · **Boxes:** ESP32-S3 DevKit (Xtensa LX7, 32-bit,
@@ -377,3 +378,65 @@ Recorded rather than chased because it is a hot-path change (`page_extend` and
 `page_fresh`) that needs the full instruction-count battery, not a session's
 tail. The reproducer is three lines of `eprintln` in `collect_inner` and the
 counter probe in §8.2.
+
+---
+
+## 8.7 The defect, found by pulling §8.6 — the extend bound was sixteen times too small
+
+`page_extend` links a batch of blocks and bounds it by 4 KiB of payload
+("one OS page seems to work well"). It computed that bound as
+
+```rust
+let span_shift = 4 + (*page).slice_count.trailing_zeros();
+let take = ((reserved >> span_shift).max(1)).min(reserved - capacity);
+```
+
+The identity behind it is `4096 / bsize == reserved / (slice_count * 16)`, and
+**the `16` is `SEGMENT_SLICE_SIZE / 4096`** — so the literal `4` is `log2(16)`
+and is correct only for the shipped 64 KiB slice. Under `ra_small_profile` the
+slice is 4 KiB, the true factor is 1, and the bound this computed was **256
+bytes of payload instead of 4 KiB**.
+
+For a 512-byte class `reserved >> shift` is then `8 >> 4 == 0`, `.max(1)`
+rescues it to one, and **every page on the profile firmware actually uses was
+extended ONE BLOCK AT A TIME**. That is why §8.6 saw `capacity = 1` on every
+reclaimed page, and why `generic` read exactly 1.0000 per op in §8.2: a page
+with one block has no second block for the fast path to find, so every single
+allocation took the slow path.
+
+**Fixed** by deriving the constant term from the geometry
+(`SEGMENT_SLICE_SIZE.trailing_zeros() - 12`), which is 4 at the default slice
+and 0 at the small profile. Counted, 100,000 alloc+free pairs, small profile:
+
+| size | `generic`/op before | after | blocks per extend |
+|---|---:|---:|---:|
+| 512 | 1.0000 | **0.1250** | 8 |
+| 513 | 1.0000 | **0.1667** | 6 |
+| 1024 | 1.0000 | **0.2500** | 4 |
+
+Page churn falls with it, 195 carve-and-retire cycles per 100,000 becoming 24,
+32 and 49 respectively.
+
+**The step inverts.** On the 32-bit host, ABBA-interleaved, reproduced three
+times: 512 against 513 goes from **+8.6 % (slower)** to **−36 % (faster)**, and
+512 in absolute terms from 390,200 ns to ~200,000 ns for the same 50,000 pairs
+— about **1.9× faster**. The `direct[]` route is now the fast route, which is
+what its name always claimed.
+
+**The default geometry does not move.** `65536.trailing_zeros() - 12 == 4`, the
+old literal, so the constant is identical there; the all-features x86-64
+assembly diff against `main` changes exactly one symbol, the debug-record blob,
+with no executable function touched.
+
+### What this does and does not settle for the report
+
+It closes the 512-byte step and it should take a large bite out of §0's 24×
+host-versus-device gap, because the device was paying `malloc_generic` on 100 %
+of allocations where it should pay it on one in eight. **It is not measured on
+silicon** — that rig is Kairos's, and §7's `heap_4` A/B at 256–512 is the row
+to re-run. The prediction to falsify: the 256–512 range stops being the only
+one `rusty_alloc` loses.
+
+What it does NOT explain is why the bin route enters `malloc_generic` on every
+op even now (`generic` still 1.0000/op at 1025 and 2048, unchanged by this
+fix). That is a separate thread, and the trace in §8.6 is where to pick it up.

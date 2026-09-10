@@ -1029,6 +1029,17 @@ unsafe fn page_collect_impl<const SET_FLAG: bool>(page: *mut Page, flag: usize) 
     }
 }
 
+/// The constant term of [`page_extend`]'s batch shift: `SEGMENT_SLICE_SIZE`
+/// expressed in 4 KiB pages, as a shift. 4 at the shipped 64 KiB slice, 0 at
+/// the small profile's 4 KiB one. See the note in `page_extend`.
+const EXTEND_SHIFT_BASE: u32 = {
+    assert!(
+        crate::types::SEGMENT_SLICE_SIZE >= 4096,
+        "the extend bound assumes a slice of at least one 4 KiB page"
+    );
+    crate::types::SEGMENT_SLICE_SIZE.trailing_zeros() - 12
+};
+
 /// Lazily extend the free list into never-used capacity (`mi_page_extend_free`).
 ///
 /// # Safety
@@ -1130,7 +1141,24 @@ pub unsafe fn page_extend(page: *mut Page, area: *mut u8) {
             "extend bound assumes a power-of-two span, got {}",
             (*page).slice_count
         );
-        let span_shift = 4 + (*page).slice_count.trailing_zeros();
+        // The `16` in that identity is `SEGMENT_SLICE_SIZE / 4096`, so the
+        // shift's constant term is the GEOMETRY's, not a literal 4.
+        //
+        // DEFECT (found 2026-09-10, `docs/plans/finished/fixed-prim-small-step.md`
+        // §8.7): it was written as a literal `4`, which is right only for the
+        // shipped 64 KiB slice. Under `ra_small_profile` the slice is 4 KiB, so
+        // the bound this computes was 256 BYTES of payload rather than 4 KiB --
+        // sixteen times too small. For a 512-byte class `reserved >> shift` is
+        // then 0, `.max(1)` rescues it to ONE BLOCK, and every page on the
+        // profile firmware actually uses was extended one block at a time:
+        // `capacity == 1` on every page, and `malloc_generic` on 100 % of
+        // allocations instead of one in eight. Measured on a host at the small
+        // profile before the fix: `generic` exactly 1.0000/op at 512, 640 and
+        // 1024 bytes.
+        //
+        // Derived, so it is correct at every geometry and byte-identical at the
+        // default (65536 >> 12 == 16, whose log2 is the old 4).
+        let span_shift = EXTEND_SHIFT_BASE + (*page).slice_count.trailing_zeros();
         let take = ((reserved >> span_shift).max(1)).min(reserved - capacity);
         let start = area.add(capacity * bsize);
         // Link the fresh blocks in address order.
