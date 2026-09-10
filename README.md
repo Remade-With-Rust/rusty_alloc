@@ -665,7 +665,7 @@ suite asserts the allocator *aborts* on a poisoned free list.
 
 ```toml
 [dependencies]
-rusty_alloc-api = "1.0"
+rusty_alloc-api = "2.1"
 ```
 
 | crate | docs | what |
