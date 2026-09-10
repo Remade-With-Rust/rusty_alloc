@@ -57,7 +57,19 @@
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
-use super::{Alloc, MemConfig, PrimError, TlsDtor, align_up};
+use super::{Alloc, MemConfig, TlsDtor, align_up};
+
+/// The error type every fallible entry point here returns, re-exported so the
+/// whole fixed-region recipe is reachable from ONE path.
+///
+/// It has always been public as [`crate::prim::PrimError`], but only from the
+/// parent module — so a seam re-exporting this API in one `pub use` could name
+/// `Region`, `good_region_size`, `init_region` and the `FERR_*` values but not
+/// the type they fail with. The Kairos RTOS allocator seam hit exactly that
+/// and carried a "arrives with the next release" comment for it
+/// (`rusty_rtos_alloc::small_metal`, `rusty_RTOS/docs/plans/build-me-bare.md`
+/// B3). Same type, one more path.
+pub use super::PrimError;
 
 /// Synthetic error code. The backends surface no errno, so any non-zero
 /// sentinel does; this one is distinct from wasm's `0xBEEF` and the mock's.
@@ -390,6 +402,105 @@ pub const fn region_for(usable: usize) -> usize {
     segments * seg
 }
 
+/// The largest allocation that can SHARE a segment with other allocations.
+///
+/// At or below this, a request is carved as a span of slices inside a segment
+/// and several of them pack together. **Above it the cost jumps**: the request
+/// gets a dedicated run of segments of its own, because the segment header
+/// owns slice 0 and so no allocation of `SEGMENT_SIZE` can ever share a
+/// segment with the metadata describing it.
+///
+/// 61,440 bytes at the default small profile; `--cfg ra_segment_size` raises
+/// it (`crate::types::SLICES_PER_SEGMENT`). **This is the number a firmware
+/// with a large allocation unit must design against**, and the one the
+/// README's floor model used to omit.
+pub const LARGEST_SHARED_ALLOC: usize = crate::types::LARGE_OBJ_SIZE_MAX;
+
+/// Whole segments one allocation of `size` bytes reserves FOR ITSELF; `0` when
+/// it shares a segment ([`LARGEST_SHARED_ALLOC`]).
+///
+/// The cliff this reports is the one a `rusty_zstd` firmware fell off: at the
+/// default geometry a 64 KiB request answers **2**, so a four-segment 256 KiB
+/// region holds one of them and a second fails with 192 KiB free
+/// (`docs/plans/finished/esp32-large-alloc-ceiling.md`).
+///
+/// ```ignore
+/// use rusty_alloc::prim::fixed::dedicated_segments;
+/// const _: () = assert!(dedicated_segments(64 * 1024) <= 1, "raise ra_segment_size");
+/// ```
+#[must_use]
+pub const fn dedicated_segments(size: usize) -> usize {
+    if size <= LARGEST_SHARED_ALLOC {
+        return 0;
+    }
+    // Mirrors `segment::huge_alloc`: one slice of header, then the payload,
+    // rounded up to whole segments because the reservation must start on a
+    // segment stride. Page-rounding inside `huge_alloc` cannot change this
+    // count, since a segment is a whole number of pages.
+    (crate::types::SEGMENT_SLICE_SIZE + size).div_ceil(crate::types::SEGMENT_SIZE)
+}
+
+/// The smallest region that can hold `count` simultaneously-live allocations
+/// of `size` bytes each — the question a firmware actually has, answered
+/// including the costs that are easy to forget.
+///
+/// Two of those bit the reporting firmware. **`count` large allocations do not
+/// cost `count * size`**: once each is over [`LARGEST_SHARED_ALLOC`] it takes
+/// [`dedicated_segments`] of its own, so three 64 KiB blocks cost six segments
+/// at the default geometry, not three. And **the small allocations every
+/// program makes need somewhere to live** — a `Vec`'s spine, a formatting
+/// buffer — which is a whole extra segment when the large blocks took
+/// dedicated ones, and one more slice when they are sharing.
+///
+/// ```ignore
+/// use rusty_alloc::prim::fixed::{Region, region_for_allocs};
+/// // three live 64 KiB tables, plus room for everything smaller
+/// static HEAP: Region<{ region_for_allocs(64 * 1024, 3) }> = Region::new();
+/// // 448 KiB at the default geometry; 256 KiB under --cfg ra_segment_size="256k"
+/// ```
+///
+/// Returns 0 if the arithmetic would overflow.
+#[must_use]
+pub const fn region_for_allocs(size: usize, count: usize) -> usize {
+    let seg = crate::types::SEGMENT_SIZE;
+    let usable_slices = crate::types::SLICES_PER_SEGMENT - 1;
+    let dedicated = dedicated_segments(size);
+    let segments = if dedicated == 0 {
+        // Shares: every block is a span of slices, and the small allocations
+        // take one more slice from the same segments rather than a segment of
+        // their own. `+ 1` slice, not `+ 1` segment — getting that wrong is
+        // what made a 3-block region read 512 KiB when 256 KiB serves it.
+        let slices_each = if size == 0 {
+            1
+        } else {
+            size.div_ceil(crate::types::SEGMENT_SLICE_SIZE)
+        };
+        let total = match slices_each.checked_mul(count) {
+            Some(n) => match n.checked_add(1) {
+                Some(n) => n,
+                None => return 0,
+            },
+            None => return 0,
+        };
+        total.div_ceil(usable_slices)
+    } else {
+        // Dedicated: each block owns its segments, so the small allocations
+        // have no carved segment to share and need one of their own.
+        match dedicated.checked_mul(count) {
+            Some(n) => match n.checked_add(1) {
+                Some(n) => n,
+                None => return 0,
+            },
+            None => return 0,
+        }
+    };
+    let segments = if segments == 0 { 1 } else { segments };
+    match segments.checked_mul(seg) {
+        Some(bytes) => bytes,
+        None => 0,
+    }
+}
+
 /// Hand the backend the region it will serve from, once.
 ///
 /// Takes `&'static mut [u8]` because that is exactly the claim being made: the
@@ -718,6 +829,19 @@ pub fn region_contains(addr: usize) -> bool {
     len != 0 && addr >= base && addr - base < len
 }
 
+/// What alignment is measured from: the region's base where segments stride
+/// from it, address zero under `ra_aligned_region` (where they stride from
+/// zero, as on a hosted target). The one definition both [`alloc`] and
+/// [`region_capacity`] read, so a placement and a report cannot disagree.
+#[inline]
+fn stride_origin() -> usize {
+    if cfg!(ra_aligned_region) {
+        0
+    } else {
+        REGION_BASE.load(Ordering::Relaxed)
+    }
+}
+
 /// The origin segments stride from: the registered region's base, or 0 while
 /// none is registered — when no pointer can be ours and the answer is the
 /// hosted mask's. Crate-internal: `segment_of` and the free-list plausibility
@@ -745,6 +869,50 @@ pub fn region_stats() -> (usize, usize, usize) {
         .map(|i| EXT_LEN[i].load(Ordering::Relaxed))
         .sum();
     (total - free, free, total)
+}
+
+/// What the region can still SERVE, which is not what is merely free:
+/// `(whole segments still placeable, largest single allocation in bytes)`.
+///
+/// [`region_stats`] answers "how many bytes are unclaimed" and that number
+/// **hides the constraint that actually fails an allocation**. The reporting
+/// firmware saw 192 KiB free and a failing 64 KiB request; this function would
+/// have answered `(1, 61_440)` and named the reason — one segment left, and
+/// nothing bigger than a shared span can be placed in it.
+///
+/// The second value is the largest DEDICATED allocation placeable in a fresh
+/// run of segments. A request at or below [`LARGEST_SHARED_ALLOC`] may still
+/// succeed above this figure by sharing a segment that is already carved,
+/// which this backend cannot see — so treat it as the floor of what will
+/// work, not the ceiling.
+///
+/// A snapshot, as [`region_stats`] is.
+#[must_use]
+pub fn region_capacity() -> (usize, usize) {
+    let _g = Guard::acquire(&LOCK);
+    let seg = crate::types::SEGMENT_SIZE;
+    let origin = stride_origin();
+    let mut segments = 0usize;
+    let mut largest = 0usize;
+    for i in 0..EXT_COUNT.load(Ordering::Relaxed) {
+        let base = EXT_BASE[i].load(Ordering::Relaxed);
+        let len = EXT_LEN[i].load(Ordering::Relaxed);
+        let end = base + len;
+        // The first segment stride at or above this extent's base.
+        let first = origin + (base - origin).next_multiple_of(seg);
+        if first >= end {
+            continue;
+        }
+        let run = end - first;
+        segments += run / seg;
+        if run > crate::types::SEGMENT_SLICE_SIZE {
+            let placeable = run - crate::types::SEGMENT_SLICE_SIZE;
+            if placeable > largest {
+                largest = placeable;
+            }
+        }
+    }
+    (segments, largest)
 }
 
 /// Remove the extent at `idx`, shifting the tail down to keep the list sorted.
@@ -869,13 +1037,7 @@ pub(super) unsafe fn alloc(
     if REGION_LEN.load(Ordering::Relaxed) == 0 {
         return Err(FERR);
     }
-    // What alignment is measured from: the region's base where segments
-    // stride from it, address zero under `ra_aligned_region`.
-    let origin = if cfg!(ra_aligned_region) {
-        0
-    } else {
-        REGION_BASE.load(Ordering::Relaxed)
-    };
+    let origin = stride_origin();
 
     // Page-aligned requests search from the HIGHEST extent down and settle at
     // its top; coarsely-aligned ones search from the lowest up, as before.
@@ -1418,6 +1580,93 @@ mod tests {
         // SAFETY: `hdr` is live and unfreed.
         unsafe { free(hdr.ptr, FIXED_PAGE).expect("free hdr") };
         assert_eq!(free_total(), N, "and the region ends whole");
+
+        // ---- the large-allocation ceiling, reported from rusty_zstd ----
+        //
+        // `docs/plans/finished/esp32-large-alloc-ceiling.md`: a 64 KiB request
+        // in a 256 KiB region served ONCE, with 192 KiB free. Here against the
+        // real extent allocator, and pinned to what `dedicated_segments`
+        // predicts so the sizing API and the backend cannot drift.
+        //
+        // Also here rather than standalone, for the same process-wide-state
+        // reason as §2.1 and §2.9.
+        assert_eq!(free_total(), N, "the region is whole before this");
+        let seg_count = N / SEGMENT_SIZE;
+        if seg_count >= 2 {
+            // A request of exactly SEGMENT_SIZE is the reported shape.
+            let size = SEGMENT_SIZE;
+            let cost = dedicated_segments(size);
+            // The whole finding in one assertion: an allocation the size of a
+            // segment can NEVER share one, because the header owns slice 0.
+            if size > LARGEST_SHARED_ALLOC {
+                assert!(
+                    cost >= 2,
+                    "a SEGMENT_SIZE request cannot fit one segment: the header owns slice 0"
+                );
+            }
+            let served = greedy_dedicated(size);
+            assert_eq!(free_total(), N, "counting leaves the region whole");
+            assert!(served >= 1, "a region of {seg_count} segments serves none");
+
+            // THE REPORTED SYMPTOM, as a property rather than a placement
+            // count: the region is left with far more free bytes than the
+            // payload it managed to serve. At a geometry where a
+            // segment-sized request is DEDICATED, utilisation cannot reach
+            // half, because every block drags a header into a second segment.
+            if cost >= 2 {
+                assert!(
+                    served * size * 2 <= N + SEGMENT_SIZE,
+                    "dedicated blocks cannot use half the region: served {served} x {size} of {N}"
+                );
+            }
+
+            // And the half the report could not see: the FIRST small
+            // allocation claims a WHOLE segment (a normal segment is a
+            // SEGMENT_SIZE reservation), so it costs a large consumer reach.
+            // This is why the firmware measured 1 where the arithmetic on
+            // free bytes alone suggested more.
+            // SAFETY: prim contract - a power-of-two alignment, page multiple.
+            let seg_taken =
+                unsafe { alloc(SEGMENT_SIZE, SEGMENT_SIZE, true, false).expect("a segment") };
+            let after_small = greedy_dedicated(size);
+            // SAFETY: `seg_taken` is live and unfreed.
+            unsafe { free(seg_taken.ptr, SEGMENT_SIZE).expect("free the segment") };
+            assert_eq!(free_total(), N, "and the region ends whole");
+            assert!(
+                after_small <= served,
+                "taking a segment cannot increase the large-allocation reach"
+            );
+
+            // `region_for_allocs` must not promise a region that would fail:
+            // whatever this region actually served, the API's answer for one
+            // MORE block has to be bigger than this region.
+            let promised = region_for_allocs(size, served + 1);
+            assert!(
+                promised > N,
+                "region_for_allocs({size}, {}) = {promised} must exceed the {N} that served {served}",
+                served + 1
+            );
+        }
+    }
+
+    /// Serve as many DEDICATED reservations of `size` as the region will take,
+    /// then hand them all back. The request shape is `segment::huge_alloc`'s:
+    /// one slice of header, the payload, page-rounded, at `SEGMENT_SIZE`
+    /// alignment - which is exactly why it cannot share a segment.
+    fn greedy_dedicated(size: usize) -> usize {
+        let want = align_up(crate::types::SEGMENT_SLICE_SIZE + size, FIXED_PAGE);
+        let mut held = Vec::new();
+        // SAFETY: prim contract - SEGMENT_SIZE is a power of two, and every
+        // pointer collected here is freed below before the function returns.
+        while let Ok(a) = unsafe { alloc(want, SEGMENT_SIZE, true, false) } {
+            held.push(a.ptr);
+        }
+        let n = held.len();
+        for p in held {
+            // SAFETY: each `p` came from the `alloc` above and is unfreed.
+            unsafe { free(p, want).expect("free a counted reservation") };
+        }
+        n
     }
 
     /// Serve `SEGMENT_SIZE`-aligned segments until the region refuses, then
@@ -1456,7 +1705,9 @@ mod tests {
         let good = good_region_size(budget);
         assert!(good <= budget, "a budget is a ceiling");
         if budget >= MIN_REGION {
-            assert_eq!(good, 3 * SEG, "three segments at this geometry");
+            // The PROPERTY, true at every geometry: whole segments, and the
+            // remainder is exactly what a round budget strands.
+            assert_eq!(good, (budget / SEG) * SEG, "whole segments");
             assert_eq!(usable_bytes(0, good), good, "every byte is a segment");
             assert_eq!(
                 usable_bytes(0, budget),
@@ -1465,9 +1716,17 @@ mod tests {
             );
             assert_eq!(
                 budget - good,
-                28_672,
+                budget % SEG,
                 "and that is what the budget was stranding"
             );
+            // The REPORTED numbers, pinned at the geometry they were measured
+            // on (4 KiB x 16). `ra_segment_size` moves them, and a test that
+            // asserted them everywhere would fail for the wrong reason.
+            if SEG == 64 * 1024 {
+                assert_eq!(good, 3 * SEG, "three segments at the default");
+                assert_eq!(good, 196_608);
+                assert_eq!(budget - good, 28_672);
+            }
         } else {
             assert_eq!(
                 good, 0,
@@ -1526,6 +1785,66 @@ mod tests {
         }
     }
 
+    /// The sizing API a firmware plans with, and the cliff it exists to make
+    /// visible (`docs/plans/finished/esp32-large-alloc-ceiling.md`).
+    #[test]
+    fn dedicated_segments_names_the_large_allocation_cliff() {
+        use crate::types::{SEGMENT_SIZE as SEG, SEGMENT_SLICE_SIZE as SLICE};
+
+        // Below the cliff nothing is dedicated: the request is a span that
+        // packs with its neighbours.
+        assert_eq!(dedicated_segments(0), 0);
+        assert_eq!(dedicated_segments(1), 0);
+        assert_eq!(dedicated_segments(LARGEST_SHARED_ALLOC), 0);
+        assert_eq!(LARGEST_SHARED_ALLOC, SEG - SLICE, "the header owns slice 0");
+
+        // One byte over, and the request owns segments outright. TWO of them,
+        // always: the header cannot share the segment its payload fills.
+        assert_eq!(dedicated_segments(LARGEST_SHARED_ALLOC + 1), 2);
+        assert_eq!(dedicated_segments(SEG), 2);
+        assert_eq!(dedicated_segments(2 * SEG), 3);
+
+        // Monotone, and never less than the payload needs.
+        let mut prev = 0;
+        let mut size = 0;
+        while size < 5 * SEG {
+            let d = dedicated_segments(size);
+            assert!(d >= prev, "cost cannot fall as the request grows");
+            if d > 0 {
+                assert!(d * SEG >= size + SLICE, "must hold header plus payload");
+            }
+            prev = d;
+            size += SLICE / 2 + 1;
+        }
+
+        // The region a firmware must declare, including the segment the small
+        // allocations take when the large ones are dedicated.
+        let three = region_for_allocs(SEG, 3);
+        assert_eq!(three % SEG, 0, "whole segments");
+        assert_eq!(good_region_size(three), three, "already a good size");
+        if dedicated_segments(SEG) == 0 {
+            // A sharing geometry: three spans plus a slice for the smalls.
+            assert!(three <= 2 * SEG, "sharing should not need a segment each");
+        } else {
+            assert_eq!(
+                three,
+                (3 * dedicated_segments(SEG) + 1) * SEG,
+                "three dedicated runs, plus one segment for everything smaller"
+            );
+        }
+        // The reported case, pinned at the geometry it was measured on: a
+        // 256 KiB region is four segments and serves ONE 64 KiB block once a
+        // small allocation has taken a segment.
+        if SEG == 64 * 1024 {
+            assert_eq!(dedicated_segments(64 * 1024), 2);
+            assert_eq!(region_for_allocs(64 * 1024, 3), 448 * 1024);
+            assert!(
+                region_for_allocs(64 * 1024, 3) > 256 * 1024,
+                "the reported 256 KiB region cannot hold three, and now says so"
+            );
+        }
+    }
+
     /// `docs/plans/finished/region-alignment-bug.md` §5: for any base, a
     /// region sized by `good_region_size` either delivers the segments its
     /// name implies, or the caller is told it did not. Both halves failed
@@ -1539,7 +1858,10 @@ mod tests {
         // against an EXACT length, 12 bytes is still a segment.
         let base = 0x3fc8_a1e4usize;
         let n = good_region_size(220 * 1024);
-        if n >= MIN_REGION {
+        // The reported case is a DEFAULT-geometry case: a 220 KiB budget is
+        // three 64 KiB segments. At a raised `ra_segment_size` it is one
+        // segment or none, and none of the numbers below describe it.
+        if n >= MIN_REGION && SEG == 64 * 1024 {
             assert_eq!(n, 196_608);
             assert_eq!(usable_bytes(base, n), 131_072, "two segments, not three");
             assert!(usable_bytes(base, n) < n);
@@ -1588,8 +1910,11 @@ mod tests {
         // probe neither needs nor consumes the process-wide registration.
         #[cfg(ra_small_profile)]
         {
-            const M: usize = 196_608;
-            const SLACK: usize = 65_536 + 0x1e4;
+            // Two segments EXACTLY, so the base's run-up costs the last one
+            // (one segment would be refused as GEOMETRY before MISALIGNED
+            // could fire). Derived, so `ra_segment_size` moves it.
+            const M: usize = 2 * crate::types::SEGMENT_SIZE;
+            const SLACK: usize = crate::types::SEGMENT_SIZE + 0x1e4;
             static mut MIS: [u8; M + SLACK] = [0; M + SLACK];
             let bp = (&raw mut MIS).cast::<u8>().expose_provenance();
             // Put the base at the report's residue, 0x1e4 past a boundary:

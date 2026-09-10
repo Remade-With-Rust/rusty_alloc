@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`--cfg ra_segment_size="256k"`, for a firmware whose allocation unit is
+  tens of kilobytes.** A segment's slice 0 is its header, so the largest object
+  that can share a segment is `SEGMENT_SIZE - SEGMENT_SLICE_SIZE` — 61,440
+  bytes at the default small profile — and one byte over that takes a dedicated
+  run of segments. Since no allocation of `SEGMENT_SIZE` can share a segment
+  with its own metadata, a 64 KiB request costs **two** segments and a 128 KiB
+  request three. A `rusty_zstd` firmware measured the consequence on an
+  ESP32-S3: one 64 KiB block served from a 256 KiB region, the second refused
+  with 192 KiB unused. The flag moves the small profile to an 8 KiB slice x 32,
+  raising `LARGEST_SHARED_ALLOC` to 253,952 so a 64 KiB request becomes a span
+  three of which pack into one segment — **3 blocks instead of 1 in the same
+  256 KiB region, measured on the board**. Opt-in, because it doubles the page
+  floor `(classes touched) x slice` that a small-object workload pays.
+- **`prim::fixed::LARGEST_SHARED_ALLOC`, `dedicated_segments(size)` and
+  `region_for_allocs(size, count)`** — the sizing API that predicts the above at
+  compile time, instead of leaving a firmware to discover it on silicon.
+  `region_for_allocs` also counts the segment the first small allocation claims,
+  which is what took the reporting firmware from two blocks to one.
+- **`prim::fixed::PrimError`**, re-exported so the whole fixed-region recipe is
+  reachable from one path. The type has always been public as
+  `prim::PrimError`, but only from the parent module, so a seam re-exporting
+  this API in a single `pub use` could name `Region`, `good_region_size`,
+  `init_region` and the `FERR_*` values but not the type they fail with. The
+  Kairos RTOS allocator seam hit exactly that and carried an "arrives with the
+  next release" comment for it. Same type, one more path.
+- **`prim::fixed::region_capacity() -> (free_segments, largest_servable)`.**
+  `region_stats` reports free BYTES, and free bytes hide this failure: the
+  refused allocation above had 126,976 bytes free and read
+  `free_segments=1, largest_servable=61440`.
+
+### Fixed
+
+- **The README's footprint model did not cover large allocations and implied
+  the opposite of the truth for them.** It described the floor as
+  `(classes touched) x (page size)`, "independent of bytes requested" and
+  amortising as the working set grows. That holds for small objects; for
+  segment-sized ones the cost is a granularity tax that scales with how many
+  are live. The section now says so, with the measured numbers and the flag.
+
 ## [2.0.5](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.0.4...rusty_alloc-v2.0.5) - 2026-09-09
 
 ### Semver note, read this one

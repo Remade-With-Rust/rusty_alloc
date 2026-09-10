@@ -243,6 +243,7 @@ region change by `.stack` or the section sum, never by `.bss` alone.
 | `Region::give` (or `init_region`) | every allocation fails; the backend has no memory |
 | *(optional)* `--cfg ra_max_extents="8"` | the free-extent table keeps its default 32 slots (256 B of `.bss`, i.e. stack); 8 is plenty for a region of a few segments and returns 192 B — the doc on `MAX_EXTENTS` states the bound |
 | *(optional)* `--cfg ra_aligned_region` | segments stride from the region's base: `Region` is 16-byte aligned, the linker leaves no gap before it, and `free` pays three instructions. With the flag, the 2.0.4 layout: the address mask on `free`, `Region` segment-aligned, up to 64 KiB of gap in front of it |
+| *(optional)* `--cfg ra_segment_size="256k"` | a 64 KiB segment, so `LARGEST_SHARED_ALLOC` is 61,440 and any bigger request takes a dedicated **two** segments. With the flag, an 8 KiB slice x 32: a 64 KiB block is a span and three pack into one segment. Set it when your allocation unit is tens of KB; leave it unset for small objects, since it doubles the page floor |
 
 Size the region with the two `const fn`s in `prim::fixed`, not a round
 number: `good_region_size(220 * 1024)` is 196,608 — three whole segments,
@@ -399,6 +400,49 @@ That floor is roughly **fixed** for a given mix of sizes: the same pages serve a
 `classes x page size` — below it `esp-alloc` wins by construction, above it the
 page allocator starts earning what it charges, and the throughput above is what
 it buys.
+
+#### The floor model does NOT cover large allocations — read this if your unit is tens of KB
+
+**Everything above is about a workload of small objects, and it inverts for one
+whose unit approaches the segment.** A `rusty_zstd` firmware allocating 64 KiB
+match tables measured the inversion on an ESP32-S3: in a 256 KiB region it got
+**one** 64 KiB block, and the second failed with 192 KiB unused
+([`docs/plans/finished/esp32-large-alloc-ceiling.md`](docs/plans/finished/esp32-large-alloc-ceiling.md)).
+
+The reason is structural and worth stating plainly. A segment's slice 0 holds
+its header, so the largest object that can live in a segment is
+`SEGMENT_SIZE - SEGMENT_SLICE_SIZE` — **61,440 bytes** at the default small
+profile, exposed as `prim::fixed::LARGEST_SHARED_ALLOC`. One byte over that and
+the request gets a dedicated run of segments, and since **no allocation of
+`SEGMENT_SIZE` can share a segment with the metadata describing it**, a 64 KiB
+request takes two segments and a 128 KiB request takes three. So the cost is
+not a fixed floor that amortises; for segment-sized blocks it is a
+**granularity tax that scales with how many are live**.
+
+Two things follow, and the crate now answers both:
+
+- **Size the region with `region_for_allocs(size, count)`**, not by adding up
+  payloads. It knows the tax, and it adds the segment the first small
+  allocation claims — which is what took the reporting firmware from two blocks
+  to one.
+- **If your unit is at or above `LARGEST_SHARED_ALLOC`, set
+  `--cfg ra_segment_size="256k"`.** It moves the small profile to an 8 KiB
+  slice x 32, so `LARGEST_SHARED_ALLOC` becomes 253,952 and a 64 KiB request is
+  a span the allocator packs three-to-a-segment instead of a dedicated
+  two-segment run. Measured on the same board, same 256 KiB region:
+
+  | geometry | 64 KiB blocks served | payload live | region used for it |
+  |---|---:|---:|---:|
+  | default | 1 | 64 KiB | 25 % |
+  | `--cfg ra_segment_size="256k"` | **3** | **192 KiB** | **75 %** |
+
+  It is opt-in because it doubles the page floor every small workload pays
+  (`(classes touched) x 8 KiB`), which is the wrong trade for the sketch above
+  and the right one for a codec.
+
+And when an allocation does fail, `prim::fixed::region_capacity()` says why:
+free BYTES hide this, free SEGMENTS do not. On the failing run it read
+`free_segments=1, largest_servable=61440` with 126,976 bytes free.
 
 We got from 192 KiB to 68 KiB by fixing a placement bug in the fixed-region
 backend and halving the slice, and from 68 KiB to 64 KiB by moving the first

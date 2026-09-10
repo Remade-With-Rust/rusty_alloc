@@ -13,12 +13,13 @@
 #![cfg(ra_small_profile)]
 
 use rusty_alloc::prim::fixed::{
-    FERR_REGISTERED, MIN_REGION, REGION_ALIGN, Region, good_region_size, usable_bytes,
+    FERR_REGISTERED, MIN_REGION, REGION_ALIGN, Region, good_region_size, region_for, usable_bytes,
 };
 
-/// The report's budget: 220 KiB, which a round declaration strands 28,672
-/// bytes of and `good_region_size` trims to three whole segments.
-const N: usize = good_region_size(220 * 1024);
+/// Three whole segments, whatever the geometry. At the default small profile
+/// this IS the report's case — a 220 KiB budget trimmed to 196,608 — and
+/// `--cfg ra_segment_size` moves it without making the test vacuous.
+const N: usize = region_for(3 * rusty_alloc::types::SEGMENT_SIZE);
 
 /// A plain `static`, exactly as a firmware declares it: 16-byte aligned, so
 /// the linker owes it no gap, and `size_of` is the heap it serves.
@@ -29,8 +30,12 @@ static OTHER: Region<MIN_REGION> = Region::new();
 
 #[test]
 fn a_region_given_once_serves_exactly_what_its_size_says() {
-    assert_eq!(N, 196_608);
-    assert_eq!(Region::<N>::USABLE, 196_608);
+    assert_eq!(N, 3 * rusty_alloc::types::SEGMENT_SIZE, "three segments");
+    assert_eq!(Region::<N>::USABLE, N);
+    if N == 196_608 {
+        // The default geometry: the reported budget, pinned.
+        assert_eq!(good_region_size(220 * 1024), N);
+    }
     assert_eq!(
         core::mem::size_of::<Region<N>>(),
         N,
@@ -70,7 +75,7 @@ fn a_region_given_once_serves_exactly_what_its_size_says() {
 
     // The handoff returns what the allocator can serve: three whole segments.
     let usable = heap.give().expect("first give of an exact region");
-    assert_eq!(usable, 196_608);
+    assert_eq!(usable, N);
     assert_eq!(usable, Region::<N>::USABLE);
 
     // Given once: a second call is refused without touching the bytes.

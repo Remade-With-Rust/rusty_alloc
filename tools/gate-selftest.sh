@@ -139,6 +139,12 @@ run_case "FIXED_REGION is false where an OS exists"   "crates/rusty_alloc/src/li
 # startup panic the Janus firmware reported.
 run_case "init_region refuses a misaligned exact region"   "crates/rusty_alloc/src/prim/fixed.rs"   's/if usable_bytes\(base, len\) < usable_bytes\(0, len\) \{/if false {/'   "--lib prim::fixed::tests::a_misaligned_exact_region"   "--cfg ra_single_threaded --cfg ra_small_profile"
 
+# --- esp32-large-alloc-ceiling: a segment-sized request costs TWO segments -
+# Drop the header slice from the price and a 64 KiB request looks like it fits
+# one segment. That is the arithmetic a firmware sizes its region with, and the
+# defect the rusty_zstd report measured as one block served from four segments.
+run_case "dedicated_segments prices the header slice"   "crates/rusty_alloc/src/prim/fixed.rs"   's/\(crate::types::SEGMENT_SLICE_SIZE \+ size\)\.div_ceil/(size).div_ceil/'   "--lib prim::fixed::tests::dedicated_segments"   "--cfg ra_single_threaded --cfg ra_small_profile"
+
 echo
 if ((fail > 0)); then
   echo "GATE SELFTEST FAILED: $fail of $((pass + fail)) gates did not fire."

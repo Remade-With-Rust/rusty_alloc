@@ -41,12 +41,21 @@ pub const SEGMENT_SLICE_SIZE: usize = 64 * 1024;
 /// caught it. `good_size` is ABI-visible and G2-pinned against the oracle, so
 /// the slice is the side that moves. See the const assert in `prim/fixed.rs`.
 #[cfg(ra_small_profile)]
-pub const SEGMENT_SLICE_SIZE: usize = 4 * 1024;
+pub const SEGMENT_SLICE_SIZE: usize = if cfg!(ra_segment_size = "256k") {
+    // The 256 KiB geometry keeps the slice COUNT at 32 (so `Segment` still fits
+    // slice 0) and doubles the slice instead. 8 KiB is safe on the axis the
+    // 2 KiB probe failed: a slice must be at least one `prim` page, and
+    // `FIXED_PAGE` is 4 KiB.
+    8 * 1024
+} else {
+    4 * 1024
+};
 
 /// Slices per segment (`MI_SLICES_PER_SEGMENT` = 512).
 #[cfg(not(ra_small_profile))]
 pub const SLICES_PER_SEGMENT: usize = 512;
 /// Slices per segment, small profile: 16, so a segment is 64 KiB.
+/// `--cfg ra_segment_size="128k"` / `"256k"` raises it — see below.
 ///
 /// Raised with the slice halving so `SEGMENT_SIZE` does NOT move. Segment size
 /// is the wrong lever — it is the granule the region is carved in, and
@@ -55,8 +64,64 @@ pub const SLICES_PER_SEGMENT: usize = 512;
 /// slices leaves 15 usable, and the measured workload needs 13. Holding the
 /// slice COUNT while shrinking the slice is what collapsed this workload from
 /// two 64 KiB segments to one 32 KiB one.
+///
+/// **That reasoning is about a workload of SMALL objects, and it inverts for a
+/// workload whose unit is the segment.** [`LARGE_OBJ_SIZE_MAX`] is
+/// `(SLICES_PER_SEGMENT - 1) * SEGMENT_SLICE_SIZE`, because the header owns
+/// slice 0 — so at the default geometry the largest object that fits in one
+/// segment is **61,440 bytes**, and a 64 KiB request is a HUGE allocation:
+/// it reserves `4 KiB + 64 KiB` on a `SEGMENT_SIZE` grid and therefore
+/// consumes **two** segments. A 128 KiB request consumes three. That is
+/// structural rather than a leak — **no allocation of `SEGMENT_SIZE` can ever
+/// share a segment with the metadata that describes it** — and it is why a
+/// `rusty_zstd` firmware allocating 64 KiB match tables got exactly one of
+/// them out of a 256 KiB region with 192 KiB free
+/// (`docs/plans/finished/esp32-large-alloc-ceiling.md`).
+///
+/// **So `SEGMENT_SIZE` is the lever for a large-unit workload**, and it is a
+/// knob rather than a new default because the two workloads want opposite
+/// values: raising it raises the page floor every small workload pays, and
+/// raising it raises [`LARGE_OBJ_SIZE_MAX`] with it, which is what turns a
+/// segment-sized request back into a span the span allocator can pack.
+///
+/// | `ra_segment_size` | slice | slices | `SEGMENT_SIZE` | `LARGE_OBJ_SIZE_MAX` | 64 KiB blocks per segment | bytes per block |
+/// |---|---:|---:|---:|---:|---:|---:|
+/// | *(unset)* | 4 KiB | 16 | 64 KiB | 61,440 | 0 — huge, 2 segments each | 131,072 |
+/// | `"256k"` | 8 KiB | 32 | 256 KiB | 253,952 | **3**, 56 KiB left over | **87,381** |
+///
+/// **Why the slice count stops at 32, why 256k doubles the SLICE instead, and
+/// why there is no 128 KiB rung.** Two hard constraints bracket this.
+/// `Segment` is `48 + 92 * SLICES_PER_SEGMENT` bytes (a `Page` is 88, a
+/// `page_off` entry 4) and must fit in slice 0, which caps the count at 44 for
+/// a 4 KiB slice; and `SEGMENT_SIZE` must remain a POWER OF TWO, because
+/// `segment_of` recovers a segment by masking with `SEGMENT_SIZE - 1` and
+/// `segment_map` asserts `1 << WINDOW_SHIFT == SEGMENT_SIZE`. 44 slices is
+/// neither, so the next power of two above 32 needs a bigger slice.
+///
+/// A 4 KiB x 32 (128 KiB) rung was built and **withdrawn**, for a reason worth
+/// keeping: it buys a 64 KiB consumer NOTHING. That request becomes a 16-slice
+/// span in a 31-slice segment, so exactly one fits and the block still costs
+/// 128 KiB — the same as the default's two-segment huge path, reached by a
+/// different route. The lever is not the segment size by itself; it is
+/// **`LARGE_OBJ_SIZE_MAX / size`, the number of blocks that pack into one
+/// segment**, and that only exceeds 1 when the slice grows too. (It also
+/// segfaulted 11 runs in 12 under the concurrent host battery where the
+/// default and `"256k"` never did — chased far enough to know it is real, not
+/// far enough to name it, and recorded in
+/// `docs/plans/finished/esp32-large-alloc-ceiling.md`.)
+///
+/// The cost of raising it, stated: a segment is the granule the region is
+/// carved in, so a region rounds DOWN to a whole number of them
+/// ([`crate::prim::fixed::good_region_size`]). At `"256k"` a 256 KiB region is
+/// one segment and a 320 KiB region is still one, stranding 64 KiB — size the
+/// region from the knob, never from a round number. And the page floor is
+/// `(bins touched) * SEGMENT_SLICE_SIZE`, so `"256k"` doubles it.
 #[cfg(ra_small_profile)]
-pub const SLICES_PER_SEGMENT: usize = 16;
+pub const SLICES_PER_SEGMENT: usize = if cfg!(ra_segment_size = "256k") {
+    32
+} else {
+    16
+};
 
 /// Segment size (`MI_SEGMENT_SIZE` = 32 MiB on 64-bit): the unit of OS/arena
 /// allocation, and the shift+mask that takes any block pointer to its segment
@@ -142,11 +207,26 @@ mod tests {
         assert_eq!(SEGMENT_SIZE, 32 * 1024 * 1024);
         // The small profile's geometry is a DECISION, pinned here so moving it
         // has to be meant. 4 KiB slices x 16 = a 64 KiB segment
-        // (docs/plans/small-metal.md §2.10).
+        // (docs/plans/small-metal.md §2.10). The segment size is a knob
+        // (`ra_segment_size`), so pin each arm rather than pinning the
+        // default's numbers and passing vacuously at every other setting.
         #[cfg(ra_small_profile)]
-        assert_eq!(SEGMENT_SIZE, 64 * 1024);
-        #[cfg(ra_small_profile)]
-        assert_eq!(SEGMENT_SLICE_SIZE, 4 * 1024);
+        {
+            let (slice, slices) = if cfg!(ra_segment_size = "256k") {
+                (8 * 1024, 32)
+            } else {
+                (4 * 1024, 16)
+            };
+            assert_eq!(SEGMENT_SLICE_SIZE, slice);
+            assert_eq!(SLICES_PER_SEGMENT, slices);
+            assert_eq!(SEGMENT_SIZE, slice * slices);
+            // The mask in `segment_of` needs this, and so does `segment_map`.
+            assert!(SEGMENT_SIZE.is_power_of_two());
+            // The routing constant must track the geometry, or a segment-sized
+            // request is sent to a dedicated huge segment while a span would
+            // have held it — the defect this knob exists for.
+            assert_eq!(LARGE_OBJ_SIZE_MAX, (slices - 1) * slice);
+        }
         assert_eq!(BIN_FULL, 74);
     }
 }
