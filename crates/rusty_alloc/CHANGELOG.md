@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`--cfg ra_generic_collect="64" | "4096" | "65536"`**, so a bare-metal
+  firmware can move the periodic-collect heartbeat. It is the only lever over a
+  real trade — a sweep returns an empty page, and the next allocation of that
+  class carves and extends a fresh one, so a short period costs page churn
+  while a long one costs capacity — and it was unreachable: `options::set` is a
+  no-op under `ONE_REGION`, and the option's own doc told firmwares to "change
+  the default it is built with" when no cfg existed. The default does not move.
+- **`prim::fixed::shape_of(size) -> Shape`** — page bytes, dedicated segments
+  and `direct_route`, `const` and derived from the active geometry. Answers
+  "which page kind, and how many region bytes, does this size cost", which
+  `region_stats()` cannot because it reports over region extents.
+  **`Shape::direct_route` names a boundary that moves with POINTER WIDTH**:
+  `SMALL_SIZE_MAX` is `128 * size_of::<usize>()`, so it is 1,024 on a 64-bit
+  host and 512 on a 32-bit chip. The Kairos RTOS measured a 16 % step there on
+  a device and could not reproduce it on a workstation for exactly that reason
+  (`docs/plans/finished/fixed-prim-small-step.md`).
+
 ## [2.1.0](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.0.5...rusty_alloc-v2.1.0) - 2026-09-10
 
 ### Added

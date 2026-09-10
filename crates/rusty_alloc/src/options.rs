@@ -194,12 +194,43 @@ const _: () = assert!(GENERIC_COLLECT < OPTION_COUNT);
 /// a short sweep period buys the same ageing without touching that path.
 /// Upstream's per-page countdown stays unimplemented and is recorded in
 /// `docs/plans/small-metal.md` §6.
+/// **The period is a TRADE, and on bare metal it is the only lever over it.**
+/// A sweep returns an empty page to its segment; the next allocation of that
+/// class then carves and extends a fresh one. In a tight alloc/free loop that
+/// keeps one block live, the page IS empty at every sweep, so a short period
+/// turns into steady page churn — measured on a host at exactly
+/// `100_000 / 512 = 195` carve-and-retire cycles per 100,000 allocations on
+/// the `direct[]` route (`size <= SMALL_SIZE_MAX`), against **zero** on the
+/// bin route just above it. That is the visible half of the 512-byte step the
+/// Kairos RTOS reported (`docs/plans/finished/fixed-prim-small-step.md`);
+/// raising this option takes the churn to zero.
+///
+/// Which way to err is workload-dependent and neither answer is free. Short
+/// sweeps cost page churn; long ones cost capacity, which is the defect the
+/// 512 exists to prevent. **Do not raise it because a benchmark that keeps one
+/// block live got faster** — that workload cannot decay.
+///
 /// Shipped geometry: upstream's 10,000.
 #[cfg(not(ra_small_profile))]
 pub const GENERIC_COLLECT_DEFAULT: i64 = 10_000;
-/// Small profile: 512, for the reasons above.
+/// Small profile: 512 by default, `--cfg ra_generic_collect="N"` to move it.
+///
+/// **The cfg exists because this doc used to tell a firmware to "change the
+/// default it is built with" and there was no way to.** `options::set` is a
+/// no-op under `crate::ONE_REGION` — options are compile-time constants there,
+/// which is what lets the whole option table leave a firmware image — so a
+/// bare-metal consumer could neither set it at run time nor override the
+/// built-in. Now it can, and the value is still a constant the linker folds.
 #[cfg(ra_small_profile)]
-pub const GENERIC_COLLECT_DEFAULT: i64 = 512;
+pub const GENERIC_COLLECT_DEFAULT: i64 = if cfg!(ra_generic_collect = "64") {
+    64
+} else if cfg!(ra_generic_collect = "4096") {
+    4096
+} else if cfg!(ra_generic_collect = "65536") {
+    65_536
+} else {
+    512
+};
 
 /// Option names in ABI index order (also the env-var suffixes, uppercased).
 pub const OPTION_NAMES: [&str; OPTION_COUNT] = [

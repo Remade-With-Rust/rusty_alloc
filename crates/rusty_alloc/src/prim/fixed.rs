@@ -402,6 +402,64 @@ pub const fn region_for(usable: usize) -> usize {
     segments * seg
 }
 
+/// What one allocation of a given size costs, and which path serves it —
+/// the compile-time answer to "why did that size behave differently?".
+///
+/// Every field is derived from the active geometry, so it moves with
+/// `--cfg ra_small_profile` and `--cfg ra_segment_size` instead of being a
+/// second copy of the routing rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Shape {
+    /// Bytes of page the request is served from: a small page, a medium page,
+    /// its own span, or its own segments.
+    pub page_bytes: usize,
+    /// Whole segments this allocation reserves for ITSELF; `0` when it shares
+    /// (see [`dedicated_segments`]).
+    pub dedicated_segments: usize,
+    /// Whether the request takes the `direct[]` fast-path route, i.e.
+    /// `size <= SMALL_SIZE_MAX`.
+    ///
+    /// **This is the boundary that moves with POINTER WIDTH**, not with the
+    /// profile: `SMALL_SIZE_MAX` is `128 * size_of::<usize>()`, so it is 1,024
+    /// on a 64-bit host and **512 on a 32-bit chip**. A sweep that looks flat
+    /// on a workstation can step on the device for that reason alone, which is
+    /// exactly what the Kairos RTOS measured
+    /// (`docs/plans/finished/fixed-prim-small-step.md`).
+    pub direct_route: bool,
+}
+
+/// The [`Shape`] of an allocation of `size` bytes.
+///
+/// ```ignore
+/// use rusty_alloc::prim::fixed::shape_of;
+/// // On a 32-bit target this steps at 512; on a 64-bit one, at 1024.
+/// const _: () = assert!(shape_of(512).direct_route);
+/// ```
+#[must_use]
+pub const fn shape_of(size: usize) -> Shape {
+    use crate::types::{
+        LARGE_OBJ_SIZE_MAX, MEDIUM_OBJ_SIZE_MAX, MEDIUM_PAGE_SIZE, SEGMENT_SLICE_SIZE,
+        SMALL_OBJ_SIZE_MAX, SMALL_PAGE_SIZE, SMALL_SIZE_MAX,
+    };
+    let dedicated = dedicated_segments(size);
+    let page_bytes = if size <= SMALL_OBJ_SIZE_MAX {
+        SMALL_PAGE_SIZE
+    } else if size <= MEDIUM_OBJ_SIZE_MAX {
+        MEDIUM_PAGE_SIZE
+    } else if size <= LARGE_OBJ_SIZE_MAX {
+        // Its own span of whole slices inside a shared segment.
+        size.div_ceil(SEGMENT_SLICE_SIZE) * SEGMENT_SLICE_SIZE
+    } else {
+        dedicated * crate::types::SEGMENT_SIZE
+    };
+    Shape {
+        page_bytes,
+        dedicated_segments: dedicated,
+        direct_route: size <= SMALL_SIZE_MAX,
+    }
+}
+
 /// The largest allocation that can SHARE a segment with other allocations.
 ///
 /// At or below this, a request is carved as a span of slices inside a segment
@@ -1977,6 +2035,39 @@ mod tests {
             // region test above, and a second registration is refused.
             // `give` itself is exercised in `tests/region.rs`, its own process.
         }
+    }
+
+    /// The Kairos RTOS measured a step at 512 on a 32-bit device and could not
+    /// reproduce it on a 64-bit host. The reason is here, as an assertion
+    /// rather than as prose: the `direct[]` route's top is a function of
+    /// POINTER WIDTH, so it lands on a different size on the two machines and
+    /// a host sweep cannot see the device's boundary
+    /// (`docs/plans/finished/fixed-prim-small-step.md`).
+    #[test]
+    fn the_direct_route_boundary_moves_with_pointer_width() {
+        use crate::types::{SMALL_OBJ_SIZE_MAX, SMALL_SIZE_MAX, SMALL_WSIZE_MAX};
+        assert_eq!(
+            SMALL_SIZE_MAX,
+            SMALL_WSIZE_MAX * core::mem::size_of::<usize>()
+        );
+        assert!(shape_of(SMALL_SIZE_MAX).direct_route);
+        assert!(!shape_of(SMALL_SIZE_MAX + 1).direct_route);
+        // 64-bit: 1024, and it does NOT coincide with the small-page top.
+        // 32-bit: 512, where it DOES -- which is why the device sees one step
+        // and the host sees two boundaries with nothing between them.
+        if core::mem::size_of::<usize>() == 8 {
+            assert_eq!(SMALL_SIZE_MAX, 1024);
+            assert_ne!(SMALL_SIZE_MAX, SMALL_OBJ_SIZE_MAX);
+        } else if core::mem::size_of::<usize>() == 4 {
+            assert_eq!(SMALL_SIZE_MAX, 512);
+        }
+        // The page kinds a firmware could not observe before.
+        assert!(shape_of(16).page_bytes <= shape_of(SMALL_OBJ_SIZE_MAX).page_bytes);
+        assert!(
+            shape_of(SMALL_OBJ_SIZE_MAX + 1).page_bytes > shape_of(SMALL_OBJ_SIZE_MAX).page_bytes
+        );
+        assert_eq!(shape_of(16).dedicated_segments, 0);
+        assert!(shape_of(LARGEST_SHARED_ALLOC + 1).dedicated_segments >= 1);
     }
 
     #[test]
