@@ -2052,15 +2052,29 @@ mod tests {
         );
         assert!(shape_of(SMALL_SIZE_MAX).direct_route);
         assert!(!shape_of(SMALL_SIZE_MAX + 1).direct_route);
-        // 64-bit: 1024, and it does NOT coincide with the small-page top.
-        // 32-bit: 512, where it DOES -- which is why the device sees one step
-        // and the host sees two boundaries with nothing between them.
+        // The route top is 1024 on 64-bit and 512 on 32-bit, whatever the
+        // geometry -- it is a pointer-width fact, not a profile one.
         if core::mem::size_of::<usize>() == 8 {
             assert_eq!(SMALL_SIZE_MAX, 1024);
-            assert_ne!(SMALL_SIZE_MAX, SMALL_OBJ_SIZE_MAX);
         } else if core::mem::size_of::<usize>() == 4 {
             assert_eq!(SMALL_SIZE_MAX, 512);
         }
+        // WHETHER it coincides with the small-page top is a fact about the
+        // GEOMETRY, so it is derived rather than asserted -- an unconditional
+        // `assert_ne!` here passed at the default slice and failed under
+        // `ra_segment_size="256k"`, where an 8 KiB slice puts
+        // SMALL_OBJ_SIZE_MAX at 1024 and the two meet on 64-bit too.
+        //
+        // The coincidence is the interesting part and is what made the device
+        // confusing: where the two constants land on the same byte, one step
+        // hides two boundaries and a sweep cannot tell them apart.
+        assert_eq!(SMALL_OBJ_SIZE_MAX, crate::types::SEGMENT_SLICE_SIZE / 8);
+        let coincide = SMALL_SIZE_MAX == SMALL_OBJ_SIZE_MAX;
+        assert_eq!(
+            coincide,
+            SMALL_WSIZE_MAX * core::mem::size_of::<usize>() == crate::types::SEGMENT_SLICE_SIZE / 8,
+            "the two boundaries coincide exactly when the arithmetic says so"
+        );
         // The page kinds a firmware could not observe before.
         assert!(shape_of(16).page_bytes <= shape_of(SMALL_OBJ_SIZE_MAX).page_bytes);
         assert!(
