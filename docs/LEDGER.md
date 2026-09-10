@@ -48,6 +48,43 @@ slice from `dedicated_segments` and the sizing test goes red); the reproduction
 is a permanent property-based test against the real extent allocator. Unsafe
 +4, all `#[cfg(test)]` — the fix is arithmetic and adds none to shipped code.
 
+## SMALL-PATH STEP — not the prim, the POINTER WIDTH; the heartbeat knob bare metal could not reach (2026-09-10)
+
+`docs/plans/finished/fixed-prim-small-step.md`: the Kairos RTOS measured one
+alloc+free stepping 314 -> 271 cycles/op across 512 bytes on a 32-bit ESP32-S3,
+could not reproduce it on a 64-bit host, and concluded it "points at
+`prim::fixed`".
+
+**Re-attributed.** `SMALL_SIZE_MAX` is `128 * size_of::<usize>()` — 1,024 on
+their host, **512 on the device**, where it coincides with
+`SMALL_OBJ_SIZE_MAX`. Their refutation ("the 512 step is not `SMALL_SIZE_MAX`")
+was run on a machine where that constant sits at 1,024. Moving ONE variable,
+pointer width, with `prim::windows` in both arms (ABBA, 50k ops/arm, min of 40
+blocks): x86-64 **+0.1 %** at 512 vs 513, i686 **+8.6 %**, control (256 vs 264)
+under 1 % on both. The prim is exonerated; the run that settled it was
+`--target i686-pc-windows-msvc`, outside the crate, not the fixed-prim-on-host
+build the report asked us for.
+
+**Mechanism, by counter not clock.** Per 100,000 pairs with one block live, the
+`direct[]` route carves/extends/retires **195** pages and the bin route just
+above it **0**, while `generic`/op is 1.0000 on both — so the slow path is not
+the difference, page churn is. `100_000 / 512 = 195` is
+`GENERIC_COLLECT_DEFAULT` at the small profile. The boundary is the ROUTE, not
+the page kind: on 64-bit, 513–1024 are medium pages that still churn.
+
+**Shipped:** `--cfg ra_generic_collect` (the trade was real and the knob was
+unreachable — `options::set` is a no-op under `ONE_REGION`); and
+`prim::fixed::shape_of` so the route and page kind are a `const` answer rather
+than a silicon discovery. Default unchanged: the 512 exists because 10,000
+starved this profile (168 -> 8 blocks, 22,533/50,000 nulls).
+
+**Withdrawn rather than quoted:** how much of the 16 % the churn accounts for.
+Raising the heartbeat took churn to a measured zero, but that experiment's
+timing control flipped +8.0 % -> +0.6 % on re-run, so the instrument was
+deciding it. The device is the right box; the counter half needs no quiet one.
+
+**Gates:** 20 suites at both profiles, gate-selftest 11/11, wasm 20,168.
+
 ## REGION ALIGNMENT DISSOLVED — segments stride from the base; 24,144 B of stack back, +3 instructions per free, one knob (2026-09-09)
 
 `docs/plans/finished/region-alignment-dissolve.md`: the Janus firmware's
