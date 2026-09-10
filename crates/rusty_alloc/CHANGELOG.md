@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.0](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.1.0...rusty_alloc-v2.2.0) - 2026-09-10
+
 ### Fixed
 
 - **The small profile extended every page ONE BLOCK AT A TIME, so 100 % of

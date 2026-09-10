@@ -40,9 +40,13 @@ does not offer.
   measured on a XIAO ESP32-S3 at 240 MHz, both allocators built from one source.
   It costs more RAM to get that (64 KiB vs 8 KiB); both numbers are below.
 
-> **Status: `2.1.0`.** The API is frozen and changes follow semver. 2.0.1
-> through 2.0.5 were patch releases; **2.1.0 is a minor because it ADDS public
-> items and moves nothing** — `cargo-semver-checks` calls it API-compatible.
+> **Status: `2.2.0`.** The API is frozen and changes follow semver. 2.0.1
+> through 2.0.5 were patch releases; 2.1.0 and 2.2.0 are minors because they
+> ADD public items and move none — `cargo-semver-checks` calls both
+> API-compatible. **2.2.0 also carries the largest embedded speed fix in this
+> series:** under `--cfg ra_small_profile` every page was being extended one
+> block at a time, so `malloc_generic` ran on 100 % of allocations; on a XIAO
+> ESP32-S3 fixing it is **13–16 % faster on every binned workload**.
 > 2.0.2 halved the allocator's flash cost on a microcontroller and cut its
 > gzipped wasm overhead by a third; 2.0.3 halved the flash cost again and took
 > the static RAM cost from 3 KB to under 300 bytes; 2.0.4 makes a firmware's
