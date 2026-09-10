@@ -219,6 +219,15 @@ claim that "there is no region size on an ESP32-S3 at which this consumer can
 use rusty_alloc" no longer holds: 256 KiB at this geometry serves 3 x 64 KiB
 with 56 KiB of slices left for everything smaller, inside the 320 KiB ceiling.
 
+**What was NOT verified, stated plainly.** The kill test in section 8 was run,
+and passes. `rusty_zstd`'s actual workload was not: this end measured 64 KiB
+blocks in a loop, not match tables through a real round trip. The peak that
+firmware reported, 175,832 bytes, is inside the 253,952 usable at this geometry
+and its 64 KiB units pack three to a segment, so the arithmetic says it fits —
+but packing depends on the live SET, and only that firmware can run it. If it
+does not fit, `region_capacity()` and `region_for_allocs` are now there to say
+why in one line rather than a bisect.
+
 Also shipped: `LARGEST_SHARED_ALLOC`, `dedicated_segments(size)` and
 `region_for_allocs(size, count)` so the ceiling is a compile-time answer rather
 than a board discovery; `region_for_allocs` counts the small-allocation segment
