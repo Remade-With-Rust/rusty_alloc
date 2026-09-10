@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The small profile extended every page ONE BLOCK AT A TIME, so 100 % of
+  allocations took the slow path.** `page_extend` bounds its batch at 4 KiB of
+  payload and computed that bound with a hardcoded shift whose constant term is
+  really `SEGMENT_SLICE_SIZE / 4096`. At the shipped 64 KiB slice the literal
+  was right; under `--cfg ra_small_profile` the slice is 4 KiB, so the bound
+  was **256 bytes instead of 4 KiB** — sixteen times too small. For a 512-byte
+  class the batch computed to 0 and was clamped to 1, leaving every page with
+  `capacity == 1` and no second block for the fast path to find. Counted over
+  100,000 alloc+free pairs at the small profile, entries into `malloc_generic`
+  per op: **512 B 1.0000 -> 0.1250, 513 B 1.0000 -> 0.1667, 1 KiB 1.0000 ->
+  0.2500**, with page carve-and-retire churn falling from 195 per 100,000 to
+  24/32/49. On a 32-bit host the 512-vs-513 step inverts from +8.6 % (slower)
+  to −36 % (faster), about **1.9× faster at 512**. **Measured on silicon** too
+  — a XIAO ESP32-S3, `main` against the fix on one board with identical
+  checksums and floor: **13.0 % faster** on 32 B ping-pong, **15.7 %** on a
+  64-block mixed batch, **15.3 %** on 8-512 B churn, and 1.1 % at 2,048 B,
+  which is on the bin route this does not touch. Found by the Kairos RTOS
+  report (`docs/plans/finished/fixed-prim-small-step.md` §8.7).
+  **The default geometry is unchanged** — the derived constant equals the old
+  literal there, and the all-features x86-64 assembly diff moves no executable
+  function.
+
 ### Added
 
 - **`--cfg ra_generic_collect="64" | "4096" | "65536"`**, so a bare-metal

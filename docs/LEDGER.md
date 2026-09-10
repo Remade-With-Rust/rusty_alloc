@@ -48,6 +48,39 @@ slice from `dedicated_segments` and the sizing test goes red); the reproduction
 is a permanent property-based test against the real extent allocator. Unsafe
 +4, all `#[cfg(test)]` — the fix is arithmetic and adds none to shipped code.
 
+## SMALL-PROFILE EXTEND — every page carved one block at a time; 100% slow path -> 12.5% (2026-09-10)
+
+`docs/plans/finished/fixed-prim-small-step.md` §8.6-8.7, pulled out of the
+Kairos step report rather than reported directly.
+
+`page_extend` bounds its batch at 4 KiB of payload via
+`span_shift = 4 + slice_count.trailing_zeros()`. The identity is
+`4096/bsize == reserved / (slice_count * 16)` and the `16` is
+`SEGMENT_SLICE_SIZE / 4096` -- so the literal `4` holds only at the 64 KiB
+slice. Under `ra_small_profile` (4 KiB slice) the bound was **256 bytes**, the
+batch for a 512 B class computed to 0, `.max(1)` clamped it to ONE, and every
+page carried `capacity == 1`. A page with one block has no second block for the
+fast path, which is why `generic` read exactly 1.0000/op at every binned size.
+
+**Found by tracing `collect_inner`'s reclaim** while chasing the reported
+512-byte step: every reclaimed page printed `cap=1` with `resv=8`, and reserved
+being right while capacity was 1 named the extend immediately.
+
+**Fixed** by deriving the term (`SEGMENT_SLICE_SIZE.trailing_zeros() - 12`).
+Counted, 100k pairs, small profile: generic/op **1.0000 -> 0.1250** (512 B),
+0.1667 (513), 0.2500 (1024); churn 195 -> 24/32/49 per 100k. Timing, 32-bit
+host, ABBA, three reproductions: the 512-vs-513 step inverts +8.6% -> -36%,
+and 512 absolute 390,200 -> ~200,000 ns, ~1.9x. Default geometry byte-identical
+(the derived value IS the old literal; all-features asm moves one debug blob).
+
+**Measured on silicon** (XIAO ESP32-S3, main vs fix, one board, one session,
+identical floor 166 ns and identical checksums): pingpong 32 B 595 -> 518
+(13.0%), batch 64-mixed 833 -> 702 (15.7%), churn 8-512 B 1,011 -> 856 (15.3%),
+large 2,048 B 1,134 -> 1,121 (1.1%). 13-16% on every binned row, the same
+magnitude as the reported step; 2,048 B barely moving is the tell, since it is
+on the bin route this does not touch. Still open: the heap_4 A/B row is the
+consumer's to re-run, and the bin route enters generic on every op even now.
+
 ## SMALL-PATH STEP — not the prim, the POINTER WIDTH; the heartbeat knob bare metal could not reach (2026-09-10)
 
 `docs/plans/finished/fixed-prim-small-step.md`: the Kairos RTOS measured one
