@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.0](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-api-v2.0.5...rusty_alloc-api-v2.1.0) - 2026-09-10
+
+### Other
+
+- release v2.1.0
+
 ## [2.0.5](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-api-v2.0.4...rusty_alloc-api-v2.0.5) - 2026-09-09
 
 ### Other
