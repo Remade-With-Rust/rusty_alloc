@@ -73,9 +73,13 @@ host, ABBA, three reproductions: the 512-vs-513 step inverts +8.6% -> -36%,
 and 512 absolute 390,200 -> ~200,000 ns, ~1.9x. Default geometry byte-identical
 (the derived value IS the old literal; all-features asm moves one debug blob).
 
-**Not measured on silicon** -- that rig is the consumer's, and the prediction to
-falsify is that 256-512 stops being the only range losing to heap_4. Also still
-open: the bin route enters generic on every op even after this.
+**Measured on silicon** (XIAO ESP32-S3, main vs fix, one board, one session,
+identical floor 166 ns and identical checksums): pingpong 32 B 595 -> 518
+(13.0%), batch 64-mixed 833 -> 702 (15.7%), churn 8-512 B 1,011 -> 856 (15.3%),
+large 2,048 B 1,134 -> 1,121 (1.1%). 13-16% on every binned row, the same
+magnitude as the reported step; 2,048 B barely moving is the tell, since it is
+on the bin route this does not touch. Still open: the heap_4 A/B row is the
+consumer's to re-run, and the bin route enters generic on every op even now.
 
 ## SMALL-PATH STEP — not the prim, the POINTER WIDTH; the heartbeat knob bare metal could not reach (2026-09-10)
 

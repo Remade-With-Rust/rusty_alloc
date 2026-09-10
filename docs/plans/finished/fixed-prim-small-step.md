@@ -428,6 +428,31 @@ old literal, so the constant is identical there; the all-features x86-64
 assembly diff against `main` changes exactly one symbol, the debug-record blob,
 with no executable function touched.
 
+### Measured on silicon after all (2026-09-10)
+
+The "not measured on silicon" caveat above is withdrawn: it is measured, on our
+own XIAO ESP32-S3, `main` against this fix in one session on one board. Same
+192 KiB region, same 166 ns/op no-allocator floor, and **identical checksums on
+every row**, so the two arms did identical work.
+
+| workload | `main` | with the fix | |
+|---|---:|---:|---|
+| pingpong, 32 B | 595 | **518** | **13.0 % faster** |
+| batch, 64 mixed 8-512 B | 833 | **702** | **15.7 % faster** |
+| churn, 64 live 8-512 B | 1,011 | **856** | **15.3 % faster** |
+| large, 2,048 B | 1,134 | 1,121 | 1.1 % |
+
+ns per alloc/free pair, net of the floor. **13-16 % on every binned workload**,
+which is the same magnitude as the 16 % step this report opened with — and
+2,048 B barely moving is the tell that it is the same mechanism, because that
+size is on the bin route, which still enters `malloc_generic` on every
+operation and is untouched by this fix.
+
+What this does NOT settle is §7's `heap_4` row. That is a different harness
+(direct calls, 64 KiB, one live block) and a different question; whether
+256-512 stops being the only range `rusty_alloc` loses is still the consumer's
+run to make.
+
 ### What this does and does not settle for the report
 
 It closes the 512-byte step and it should take a large bite out of §0's 24×

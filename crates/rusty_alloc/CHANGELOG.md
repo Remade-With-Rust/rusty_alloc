@@ -21,7 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per op: **512 B 1.0000 -> 0.1250, 513 B 1.0000 -> 0.1667, 1 KiB 1.0000 ->
   0.2500**, with page carve-and-retire churn falling from 195 per 100,000 to
   24/32/49. On a 32-bit host the 512-vs-513 step inverts from +8.6 % (slower)
-  to −36 % (faster), about **1.9× faster at 512**. Found by the Kairos RTOS
+  to −36 % (faster), about **1.9× faster at 512**. **Measured on silicon** too
+  — a XIAO ESP32-S3, `main` against the fix on one board with identical
+  checksums and floor: **13.0 % faster** on 32 B ping-pong, **15.7 %** on a
+  64-block mixed batch, **15.3 %** on 8-512 B churn, and 1.1 % at 2,048 B,
+  which is on the bin route this does not touch. Found by the Kairos RTOS
   report (`docs/plans/finished/fixed-prim-small-step.md` §8.7).
   **The default geometry is unchanged** — the derived constant equals the old
   literal there, and the all-features x86-64 assembly diff moves no executable
