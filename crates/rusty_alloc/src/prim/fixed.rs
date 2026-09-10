@@ -57,7 +57,19 @@
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
-use super::{Alloc, MemConfig, PrimError, TlsDtor, align_up};
+use super::{Alloc, MemConfig, TlsDtor, align_up};
+
+/// The error type every fallible entry point here returns, re-exported so the
+/// whole fixed-region recipe is reachable from ONE path.
+///
+/// It has always been public as [`crate::prim::PrimError`], but only from the
+/// parent module — so a seam re-exporting this API in one `pub use` could name
+/// `Region`, `good_region_size`, `init_region` and the `FERR_*` values but not
+/// the type they fail with. The Kairos RTOS allocator seam hit exactly that
+/// and carried a "arrives with the next release" comment for it
+/// (`rusty_rtos_alloc::small_metal`, `rusty_RTOS/docs/plans/build-me-bare.md`
+/// B3). Same type, one more path.
+pub use super::PrimError;
 
 /// Synthetic error code. The backends surface no errno, so any non-zero
 /// sentinel does; this one is distinct from wasm's `0xBEEF` and the mock's.

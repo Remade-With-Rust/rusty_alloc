@@ -27,6 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compile time, instead of leaving a firmware to discover it on silicon.
   `region_for_allocs` also counts the segment the first small allocation claims,
   which is what took the reporting firmware from two blocks to one.
+- **`prim::fixed::PrimError`**, re-exported so the whole fixed-region recipe is
+  reachable from one path. The type has always been public as
+  `prim::PrimError`, but only from the parent module, so a seam re-exporting
+  this API in a single `pub use` could name `Region`, `good_region_size`,
+  `init_region` and the `FERR_*` values but not the type they fail with. The
+  Kairos RTOS allocator seam hit exactly that and carried an "arrives with the
+  next release" comment for it. Same type, one more path.
 - **`prim::fixed::region_capacity() -> (free_segments, largest_servable)`.**
   `region_stats` reports free BYTES, and free bytes hide this failure: the
   refused allocation above had 126,976 bytes free and read
