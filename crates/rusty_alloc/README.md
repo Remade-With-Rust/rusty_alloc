@@ -124,6 +124,21 @@ roughly fixed, so it amortises as the working set grows. Reach for `esp-alloc`
 when the budget is tight, and for this when throughput or fragmentation under
 churn is what hurts.
 
+**That model covers small objects only, and inverts once your unit approaches
+the segment.** A segment's slice 0 is its header, so the largest object that
+can share one is `SEGMENT_SIZE - SEGMENT_SLICE_SIZE` — 61,440 bytes at the
+default small profile (`prim::fixed::LARGEST_SHARED_ALLOC`). One byte over and
+the request takes a dedicated run of segments, and because no allocation of
+`SEGMENT_SIZE` can share a segment with its own metadata, a 64 KiB block costs
+**two** segments: a firmware allocating 64 KiB match tables got one of them out
+of a 256 KiB region with 192 KiB unused. For segment-sized blocks the cost is a
+granularity tax that scales with how many are live, not a floor that amortises.
+Size such a region with `prim::fixed::region_for_allocs(size, count)`, ask
+`region_capacity()` when an allocation fails with bytes to spare, and set
+**`--cfg ra_segment_size="256k"`** if your unit is tens of KB — it packs three
+64 KiB blocks into one segment instead of one, measured on the board. The full
+account is in `docs/plans/finished/esp32-large-alloc-ceiling.md`.
+
 **It also costs flash and static RAM, measured on the linked ELF of one
 firmware built both ways:** about **+3.2 KB of flash** and **+0.3 KB of
 static RAM**, down from +16.6 KB and +3.1 KB two releases earlier —

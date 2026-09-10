@@ -4,6 +4,50 @@ One entry per milestone/brick: what landed, the numbers with their method lines,
 what was reverted and **which kind** of revert (measured-worse vs within-noise).
 Newest first.
 
+## LARGE-ALLOCATION CEILING — a 64 KiB block cost two segments; a geometry knob takes 1 block to 3 (2026-09-09)
+
+`docs/plans/finished/esp32-large-alloc-ceiling.md`, reported from the
+`rusty_zstd` bare-metal work: in a 256 KiB region `rusty_alloc` served ONE
+64 KiB allocation and refused the second with 192 KiB free.
+
+**Confirmed on the board, and their hypothesis was right.** A segment's slice 0
+is its header, so `LARGE_OBJ_SIZE_MAX = SEGMENT_SIZE - SEGMENT_SLICE_SIZE` =
+61,440; one byte over and `huge_alloc` reserves `4 KiB + size` on a
+`SEGMENT_SIZE` stride, spanning two segments. Structural — no allocation of
+`SEGMENT_SIZE` can share a segment with its own metadata. The sweep they asked
+for puts the cliff at 61,440 exactly. Their 50 % estimate read 25 % on silicon
+because of a cost they could not see: **the first small allocation claims a
+whole segment** (`used=135168` = 69,632 + 65,536 for a `Vec` spine).
+
+**Fix: `--cfg ra_segment_size="256k"`** (8 KiB slice x 32), which raises
+`LARGEST_SHARED_ALLOC` to 253,952 so a 64 KiB request is a span three of which
+pack into one segment. Same board, same 256 KiB region: **1 block -> 3**, 25 %
+-> 75 % utilisation. Their kill test ("at least 3") passes, and "no region size
+works on an S3" is no longer true. Opt-in: it doubles the page floor
+`(classes touched) x slice` that a small-object workload pays.
+
+Also shipped, because the report's second ask was diagnosability:
+`LARGEST_SHARED_ALLOC`, `dedicated_segments(size)`, `region_for_allocs(size,
+count)` (which counts the small-allocation segment), and
+`region_capacity() -> (free_segments, largest_servable)` — on the failing call
+`(1, 61440)` against 126,976 free bytes. The README's floor model said the cost
+"amortises as the working set grows"; that is true for small objects and
+inverts for segment-sized ones, and now says so.
+
+**A rung built and withdrawn.** 4 KiB x 32 (128 KiB) buys a 64 KiB consumer
+NOTHING — one 16-slice span in a 31-slice segment is still 128 KiB per block,
+the default's cost by another route. The lever is
+`LARGEST_SHARED_ALLOC / size`, not `SEGMENT_SIZE`. It also segfaulted 11/12
+under the concurrent host battery where the default and 256k are 0/40 and 0/12;
+real, geometry-specific, and NOT root-caused. Kept out of the shipped set and
+written down in §9.5 in case it is latent rather than local.
+
+**Gates.** 20 suites green at both shipped geometries; CI runs the whole suite
+at 256k rather than building it; gate-selftest 11/11 (new: drop the header
+slice from `dedicated_segments` and the sizing test goes red); the reproduction
+is a permanent property-based test against the real extent allocator. Unsafe
++4, all `#[cfg(test)]` — the fix is arithmetic and adds none to shipped code.
+
 ## REGION ALIGNMENT DISSOLVED — segments stride from the base; 24,144 B of stack back, +3 instructions per free, one knob (2026-09-09)
 
 `docs/plans/finished/region-alignment-dissolve.md`: the Janus firmware's

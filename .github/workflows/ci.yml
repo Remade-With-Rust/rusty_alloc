@@ -214,6 +214,16 @@ jobs:
           cargo clippy -p rusty_alloc --all-targets -- -D warnings
         env:
           RUSTFLAGS: --cfg ra_small_profile --cfg ra_single_threaded --cfg ra_aligned_region
+      # `ra_segment_size="256k"` is the geometry a large-allocation consumer
+      # runs (docs/plans/finished/esp32-large-alloc-ceiling.md). It moves
+      # SEGMENT_SIZE, LARGE_OBJ_SIZE_MAX and every sizing rule, so the WHOLE
+      # suite runs there -- a geometry that only builds is a geometry that rots.
+      - name: test + clippy (256k segment geometry)
+        run: |
+          cargo test -p rusty_alloc
+          cargo clippy -p rusty_alloc --all-targets -- -D warnings
+        env:
+          RUSTFLAGS: --cfg ra_small_profile --cfg ra_segment_size="256k"
       # The no_std build REFUSES to compile without `ra_single_threaded`: its
       # soundness rests on there being exactly one thread, and that has to be
       # opted into rather than inherited. The gate's negative case is asserted
