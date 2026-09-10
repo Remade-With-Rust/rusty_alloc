@@ -338,3 +338,42 @@ same part is the one-line experiment, and the counter half of it
 
 Nothing here changes the default. A firmware that has measured its own workload
 can now move it; one that has not should not.
+
+### 8.6 A lead worth more than the knob: every reclaimed page has `capacity = 1`
+
+Tracing the reclaim itself (a temporary `eprintln` in `collect_inner`'s
+`page_all_free` branch, 100,000 pairs per size on x86-64) gives the churn a
+face, and one column of it was not expected:
+
+```text
+    200 RECLAIM bin=24 block_size=1024 used=0 capacity=1
+    200 RECLAIM bin=21 block_size=640  used=0 capacity=1
+    199 RECLAIM bin=20 block_size=512  used=0 capacity=1
+      1 RECLAIM bin=28 block_size=2048 used=0 capacity=1
+      1 RECLAIM bin=25 block_size=1280 used=0 capacity=1
+```
+
+Two things. The route boundary is exact — bins 20/21/24 are the `direct[]`
+sizes (512, 640, 1024 at `SMALL_SIZE_MAX = 1024` on this host) and churn ~200
+times each; bins 25 and 28 are just above it and churn **once**, at the
+transition between probe rows. And **`capacity = 1` on every one of them.**
+
+`page_extend` links a 4 KiB *payload* bound per extend, so a 512-byte class
+should come back with 8 blocks and a 1,024-byte class with 4. A page holding
+ONE block is exhausted by the allocation that follows it, which is the missing
+half of why `generic` reads exactly **1.0000 per op** in §8.2 — the fast path
+cannot hit a page that has no second block. Whether `reserved` is being
+clamped to 1 for these classes, or the extend is not running at all, is not
+established here.
+
+**This is the lead to pull next, and it is not the heartbeat.** The knob in
+§8.3 changes how often an empty page is reclaimed; this asks why the page was
+worth so little in the first place. If a `direct[]`-route page came back with
+its full block count, the fast path would hit, `generic` would fall well below
+1.0/op, and the sweep would find the page in use rather than empty — the step
+would close from the other side, with no knob and no default moved.
+
+Recorded rather than chased because it is a hot-path change (`page_extend` and
+`page_fresh`) that needs the full instruction-count battery, not a session's
+tail. The reproducer is three lines of `eprintln` in `collect_inner` and the
+counter probe in §8.2.
