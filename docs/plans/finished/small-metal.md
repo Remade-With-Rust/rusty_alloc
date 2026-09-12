@@ -25,7 +25,7 @@ because this may end in a documented "no" and that is a fine outcome.
 | **P5** — the ESP-IDF track | ← next; needs the IDF track, not more allocator work | — |
 
 Numbers, methods and the bucket tables are in
-[`docs/LEDGER.md`](../LEDGER.md). Two headlines worth carrying: the first
+[`docs/LEDGER.md`](../../LEDGER.md). Two headlines worth carrying: the first
 riscv build reports **224 errors** of which **183 are one root** (no
 `#![no_std]` ⇒ no prelude), so the real debt was **55**; and P1 closed the
 whole of bucket A (16 → 0) while every other bucket moved **+0** and the
@@ -101,7 +101,7 @@ proposes loosening any of it.
 
 Four when this was written; **six after P0**, and the two it added (§2.5,
 §2.6) are the cheap ones. Each block quoted `> **P0:**` is what the compiler
-said on 2026-09-07 — see [`docs/LEDGER.md`](../LEDGER.md) for the method.
+said on 2026-09-07 — see [`docs/LEDGER.md`](../../LEDGER.md) for the method.
 
 These are ordered by how likely they are to end the project. Each names the
 file that establishes it.
@@ -1014,7 +1014,7 @@ crate for it. Do not fix anything; collect the error list.
 wrong and needs rewriting before any code moves.
 
 **Verdict: PASSED — the plan stands, amended.** Full numbers and method in
-[`docs/LEDGER.md`](../LEDGER.md). 224 errors reported, **183 of them one
+[`docs/LEDGER.md`](../../LEDGER.md). 224 errors reported, **183 of them one
 root** (no `#![no_std]` ⇒ no prelude); the real debt is **55 in four
 buckets**:
 
@@ -1062,7 +1062,7 @@ over once — and the fifth arm in `prim/mod.rs`. Always compiled, selected only
 where no platform arm matches. **Zero unsafe dereferences added to the shipped
 crate** (6 `unsafe fn` signatures with safe bodies, 11 in tests; `UNSAFE.md`
 updated, ratchet re-baselined 864 → 881). Full numbers in
-[`docs/LEDGER.md`](../LEDGER.md).
+[`docs/LEDGER.md`](../../LEDGER.md).
 
 | bucket | P0 | P1 |
 |---|---:|---:|
@@ -1123,7 +1123,7 @@ what `blink-fs`, P4's own target, declares. Note also §2.6: `segment_map::MAP`
 is 1 MiB of BSS independent of `SEGMENT_SIZE`, so parameterising the geometry
 alone does not make the crate fit. Both have to move in this phase.
 
-**Verdict: PASSED.** Full numbers in [`docs/LEDGER.md`](../LEDGER.md).
+**Verdict: PASSED.** Full numbers in [`docs/LEDGER.md`](../../LEDGER.md).
 
 - **The geometry is a `--cfg`.** `ra_small_profile` selects
   `SEGMENT_SLICE_SIZE` 8 KiB / `SLICES_PER_SEGMENT` 8 / `MEDIUM_PAGE_SLICES` 4
@@ -1165,7 +1165,7 @@ for the Xtensa target the Janus toolchain provides, and the host battery is
 unchanged.
 
 **Verdict: PASSED, on every target and both geometries.** Full numbers in
-[`docs/LEDGER.md`](../LEDGER.md).
+[`docs/LEDGER.md`](../../LEDGER.md).
 
 | target | geometry | result |
 |---|---|---|
