@@ -274,7 +274,9 @@ pub(crate) const fn align_up(n: usize, align: usize) -> usize {
 }
 
 /// Checked sibling of [`align_up`]. `None` when `n + align - 1` overflows
-/// (OH-rusty_alloc-29).
+/// (OH-rusty_alloc-29). Only the Windows backend's large-page path rounds a
+/// caller size up by an OS-reported unit; the others add before they align.
+#[cfg(all(windows, not(miri)))]
 #[inline]
 pub(crate) fn align_up_checked(n: usize, align: usize) -> Option<usize> {
     debug_assert!(align.is_power_of_two());

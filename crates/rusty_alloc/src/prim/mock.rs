@@ -95,7 +95,7 @@ pub(super) fn range_is_reserved(ptr: *const u8, size: usize) -> bool {
     };
     let mut a = start;
     while a < end {
-        let Some((&base, layout)) = reg.iter().find(|(&b, l)| a >= b && a - b < l.size()) else {
+        let Some((&base, layout)) = reg.iter().find(|&(&b, l)| a >= b && a - b < l.size()) else {
             return false;
         };
         a = base.saturating_add(layout.size());

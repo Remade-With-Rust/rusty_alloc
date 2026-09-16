@@ -215,6 +215,9 @@ pub(super) fn range_is_reserved(ptr: *const u8, size: usize) -> bool {
     for i in 0..npages {
         let p = aligned + i * page;
         let mut vec = 0u8;
+        // SAFETY: `p` is page-aligned and `page` is one page, so the out
+        // vector needs one byte, which `vec` is; `mincore` reads the mapping
+        // table and writes only that byte.
         let r = unsafe { libc::mincore(p as *mut libc::c_void, page, &mut vec) };
         if r != 0 {
             return false;
