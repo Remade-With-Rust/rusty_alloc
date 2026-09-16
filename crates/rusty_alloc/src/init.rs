@@ -200,6 +200,35 @@ fn heaps_unregister(hb: *mut HeapBox) {
     heaps_unlock();
 }
 
+/// Unlink and return one live heap box owned by `tid`, or null.
+///
+/// The lock is released before return so the caller can abandon the heap
+/// without re-entering `HEAPS_LOCK` (abandon walks pages and can allocate).
+fn take_heap_owned_by(tid: usize) -> *mut HeapBox {
+    heaps_lock();
+    let mut prev: *mut HeapBox = ptr::null_mut();
+    let mut cur = HEAPS_HEAD.load(Ordering::Relaxed);
+    while !cur.is_null() {
+        // SAFETY: links and boxes are live under the lock.
+        unsafe {
+            let nxt = (*cur).next_box.load(Ordering::Relaxed);
+            if (*cur).owner_tid == tid {
+                if prev.is_null() {
+                    HEAPS_HEAD.store(nxt, Ordering::Relaxed);
+                } else {
+                    (*prev).next_box.store(nxt, Ordering::Relaxed);
+                }
+                heaps_unlock();
+                return cur;
+            }
+            prev = cur;
+            cur = nxt;
+        }
+    }
+    heaps_unlock();
+    ptr::null_mut()
+}
+
 /// Storage for the calling thread's default-heap pointer.
 ///
 /// On x86-64 Linux this is a RAW ELF TLS symbol reached with the
@@ -545,6 +574,19 @@ pub fn ensure_heap(hb: *mut HeapBox) -> *mut HeapBox {
 /// upstream returns NULL from `mi_heap_new` for the same reason (H-18/R-003
 /// in the hardening audit).
 pub fn create_heap(tag: i32, allow_destroy: bool, arena_id: i32) -> *mut HeapBox {
+    // First-class heaps are not stored in `done_slot`. A thread that only
+    // ever called `mi_heap_new` / `heap_malloc` never ran `init_thread_heap`,
+    // so the TLS destructor never fired and leftover heaps stayed DELAYED
+    // (OH-rusty_alloc-13). Bootstrap the backing heap (and the exit hook)
+    // first. `init_thread_heap` calls `create_heap_uninstalled`, not this
+    // function, so there is no recursion.
+    if !crate::ONE_THREAD && heap_tls::get() == empty_heap_box_ptr() {
+        let _ = heap_box();
+    }
+    create_heap_uninstalled(tag, allow_destroy, arena_id)
+}
+
+fn create_heap_uninstalled(tag: i32, allow_destroy: bool, arena_id: i32) -> *mut HeapBox {
     let size = core::mem::size_of::<HeapBox>();
     // On a one-region target the FIRST descriptor is a static of the fixed
     // backend's, so that a firmware's region is whole segments and needs no
@@ -627,7 +669,7 @@ pub fn create_heap(tag: i32, allow_destroy: bool, arena_id: i32) -> *mut HeapBox
 
 #[cold]
 fn init_thread_heap() -> *mut HeapBox {
-    let hb = create_heap(0, false, -1);
+    let hb = create_heap_uninstalled(0, false, -1);
     if hb.is_null() {
         // OOM: install nothing — the TLS slot keeps the sentinel, so the
         // NEXT allocation retries creation instead of dereferencing null.
@@ -732,6 +774,41 @@ unsafe extern "C" fn thread_done_cb(v: *mut c_void) {
 /// # Safety
 /// Must run on the dying thread with `hb` its live heap box, exactly once.
 pub unsafe fn thread_done(hb: *mut HeapBox) {
+    // SAFETY: per contract `hb` is this thread's live box; `owner_tid` is a
+    // plain field.
+    let tid = unsafe { (*hb).owner_tid };
+    // SAFETY: per contract we are the owner and this runs exactly once;
+    // sequencing per the model.
+    unsafe { thread_done_one(hb) };
+    // Back to the SENTINEL, not null — the slot is never null, so a
+    // post-teardown malloc re-enters the generic path and re-initialises.
+    heap_tls::set(empty_heap_box_ptr());
+    // First-class heaps this thread created are not stored in `done_slot`
+    // (`set_default_heap` does not update it). Leaving them DELAYED meant a
+    // second remote free after thread exit returned (OH-rusty_alloc-13).
+    // Abandon every remaining heap we still own so pages go NEVER. Iterative:
+    // a dying thread can own many first-class heaps; do not recurse.
+    if !crate::ONE_THREAD {
+        // Stall guard: a dying thread that keeps re-initialising (empty TLS
+        // malloc) must not loop forever. Same order as `collect_inner`'s
+        // `MAX_RECLAIM`.
+        const MAX_OWNED_HEAPS: usize = 1 << 20;
+        for _ in 0..MAX_OWNED_HEAPS {
+            let extra = take_heap_owned_by(tid);
+            if extra.is_null() {
+                break;
+            }
+            // SAFETY: extra is a live box this dying thread still owns.
+            unsafe { thread_done_one(extra) };
+        }
+    }
+}
+
+/// Abandon one heap box (NEVER + delayed drain + unregister + free the box).
+///
+/// # Safety
+/// `hb` is a live heap box owned by the calling thread, not used again.
+unsafe fn thread_done_one(hb: *mut HeapBox) {
     // SAFETY: per contract we are the owner; sequencing per the model.
     unsafe {
         // Read the subprocess tag from the BOX, not from `my_subproc()`. We are
@@ -831,9 +908,6 @@ pub unsafe fn thread_done(hb: *mut HeapBox) {
             let _ = os::free(blockdesc);
         }
     }
-    // Back to the SENTINEL, not null — the slot is never null, so a
-    // post-teardown malloc re-enters the generic path and re-initialises.
-    heap_tls::set(empty_heap_box_ptr());
 }
 
 /// `mi_heap_delete`: free the heap structure, MIGRATING its live pages and
@@ -1008,10 +1082,21 @@ pub fn subproc_main() -> usize {
 }
 
 /// `mi_subproc_new`: allocate a fresh subprocess id.
+///
+/// Exhaustion is an invalid id (`MAX_SUBPROCS`), not an assert (OH-rusty_alloc-21).
 pub fn subproc_new() -> usize {
-    let id = SUBPROC_NEXT.fetch_add(1, Ordering::AcqRel);
-    assert!(id < MAX_SUBPROCS, "out of subprocess ids");
-    id
+    loop {
+        let id = SUBPROC_NEXT.load(Ordering::Acquire);
+        if id >= MAX_SUBPROCS {
+            return MAX_SUBPROCS;
+        }
+        if SUBPROC_NEXT
+            .compare_exchange_weak(id, id + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return id;
+        }
+    }
 }
 
 /// `mi_subproc_delete`: ids are not recycled in v1; abandoned segments of the
@@ -1036,7 +1121,9 @@ pub fn subproc_delete(id: usize) {
 
 /// `mi_subproc_add_current_thread`.
 pub fn subproc_add_current_thread(id: usize) {
-    assert!(id < MAX_SUBPROCS);
+    if id >= MAX_SUBPROCS {
+        return;
+    }
     SUBPROC.with(|c| c.set(id));
     // Mirror onto this thread's backing heap so TEARDOWN can read the tag
     // without touching the thread-local (see `HeapBox::subproc`). Tagging

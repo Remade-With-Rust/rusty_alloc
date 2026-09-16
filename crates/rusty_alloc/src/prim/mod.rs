@@ -110,7 +110,13 @@ pub unsafe fn alloc(
     commit: bool,
     allow_large: bool,
 ) -> Result<Alloc, PrimError> {
-    // SAFETY: forwarded contract.
+    // A non-power-of-two (or zero) alignment is Err, not `align_up`'s
+    // `debug_assert!` (OH-rusty_alloc-38). `os::alloc_aligned` already
+    // refuses; this public lower seam did not.
+    if !try_alignment.is_power_of_two() {
+        return Err(22);
+    }
+    // SAFETY: forwarded contract; alignment is a power of two.
     unsafe { sys::alloc(size, try_alignment, commit, allow_large) }
 }
 
@@ -130,7 +136,13 @@ pub unsafe fn free(ptr: *mut u8, size: usize) -> Result<(), PrimError> {
 /// # Safety
 /// Range must lie inside a live [`alloc`] mapping, page-aligned.
 pub unsafe fn commit(ptr: *mut u8, size: usize) -> Result<bool, PrimError> {
-    // SAFETY: forwarded contract.
+    // A null range is Err, not a fresh OS allocation (OH-rusty_alloc-60).
+    // Windows `VirtualAlloc(NULL, size, MEM_COMMIT)` treats a null address as
+    // "pick anywhere" and returns Ok with an untracked mapping.
+    if ptr.is_null() {
+        return Err(22);
+    }
+    // SAFETY: forwarded contract; base is non-null.
     unsafe { sys::commit(ptr, size) }
 }
 
@@ -140,7 +152,10 @@ pub unsafe fn commit(ptr: *mut u8, size: usize) -> Result<bool, PrimError> {
 /// # Safety
 /// Range must lie inside a live [`alloc`] mapping, page-aligned; contents lost.
 pub unsafe fn decommit(ptr: *mut u8, size: usize) -> Result<bool, PrimError> {
-    // SAFETY: forwarded contract.
+    if ptr.is_null() {
+        return Err(22);
+    }
+    // SAFETY: forwarded contract; base is non-null.
     unsafe { sys::decommit(ptr, size) }
 }
 
@@ -150,7 +165,10 @@ pub unsafe fn decommit(ptr: *mut u8, size: usize) -> Result<bool, PrimError> {
 /// # Safety
 /// Range must lie inside a live, committed mapping, page-aligned.
 pub unsafe fn reset(ptr: *mut u8, size: usize) -> Result<(), PrimError> {
-    // SAFETY: forwarded contract.
+    if ptr.is_null() {
+        return Err(22);
+    }
+    // SAFETY: forwarded contract; base is non-null.
     unsafe { sys::reset(ptr, size) }
 }
 
@@ -160,8 +178,22 @@ pub unsafe fn reset(ptr: *mut u8, size: usize) -> Result<(), PrimError> {
 /// Range must lie inside a live, committed mapping; caller must not touch a
 /// protected range until unprotected.
 pub unsafe fn protect(ptr: *mut u8, size: usize, protect: bool) -> Result<(), PrimError> {
-    // SAFETY: forwarded contract.
+    if ptr.is_null() {
+        return Err(22);
+    }
+    // SAFETY: forwarded contract; base is non-null.
     unsafe { sys::protect(ptr, size, protect) }
+}
+
+/// Whether `[ptr, ptr+size)` is reserved or committed by the OS.
+///
+/// Used by `manage_os_memory_ex` so an unmapped lie cannot become an arena
+/// (OH-rusty_alloc-201). Best-effort: a racing unmap can flip the answer.
+pub fn range_is_reserved(ptr: *const u8, size: usize) -> bool {
+    if ptr.is_null() || size == 0 {
+        return false;
+    }
+    sys::range_is_reserved(ptr, size)
 }
 
 /// Number of NUMA nodes (≥ 1). M1 returns the real count on Windows, 1 on
@@ -239,4 +271,14 @@ unsafe impl Sync for TlsSlot {}
 pub(crate) const fn align_up(n: usize, align: usize) -> usize {
     debug_assert!(align.is_power_of_two());
     (n + align - 1) & !(align - 1)
+}
+
+/// Checked sibling of [`align_up`]. `None` when `n + align - 1` overflows
+/// (OH-rusty_alloc-29). Only the Windows backend's large-page path rounds a
+/// caller size up by an OS-reported unit; the others add before they align.
+#[cfg(all(windows, not(miri)))]
+#[inline]
+pub(crate) fn align_up_checked(n: usize, align: usize) -> Option<usize> {
+    debug_assert!(align.is_power_of_two());
+    n.checked_add(align - 1).map(|s| s & !(align - 1))
 }

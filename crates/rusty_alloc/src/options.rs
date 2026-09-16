@@ -7,6 +7,7 @@
 //! option access. Values follow mimalloc: booleans accept 1/0/true/false/
 //! yes/no/on/off; sizes are plain integers (`_size` options are KiB).
 
+use core::cell::Cell;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
@@ -428,15 +429,20 @@ pub fn is_enabled(option: usize) -> bool {
 }
 
 /// `mi_option_get_clamp`.
+///
+/// Inverted bounds (`min > max`) are swapped, not a panic from `i64::clamp`
+/// (OH-rusty_alloc-18).
 pub fn get_clamp(option: usize, min: i64, max: i64) -> i64 {
-    get(option).clamp(min, max)
+    get(option).clamp(min.min(max), min.max(max))
 }
 
 /// `mi_option_get_size`: `_size` options are stored in KiB.
 pub fn get_size(option: usize) -> usize {
     let v = get(option).max(0) as usize;
     match option {
-        9 | 23 => v * 1024, // reserve_os_memory, arena_reserve
+        // Overflow is "unrepresentable", not a wrapped small reserve
+        // (OH-rusty_alloc-19).
+        9 | 23 => v.saturating_mul(1024),
         _ => v,
     }
 }
@@ -469,6 +475,22 @@ static OUTPUT_FUN: AtomicUsize2 = AtomicUsize2::new();
 static ERROR_FUN: AtomicUsize2 = AtomicUsize2::new();
 static DEFERRED_FUN: AtomicUsize2 = AtomicUsize2::new();
 static HEARTBEAT: AtomicU64 = AtomicU64::new(0);
+
+ra_thread_local! {
+    static IN_DEFERRED: Cell<bool> = const { Cell::new(false) };
+    static IN_ERROR: Cell<bool> = const { Cell::new(false) };
+    static IN_OUTPUT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Re-arms one of the in-hook flags above on scope exit, so a hook that
+/// returns early — or unwinds, in a debug build — still clears its guard.
+struct HookExit(fn());
+
+impl Drop for HookExit {
+    fn drop(&mut self) {
+        (self.0)();
+    }
+}
 
 /// (fn ptr, arg) pair stored as two atomics (registration is set-once-ish;
 /// tearing between the two reads yields a stale-but-valid pair).
@@ -539,6 +561,13 @@ pub fn out_fmt(msg: &str) {
         }
         return;
     }
+    // A hook that calls `out_fmt` again recurses until the stack dies
+    // (OH-rusty_alloc-24).
+    if IN_OUTPUT.with(|c| c.get()) {
+        return;
+    }
+    IN_OUTPUT.with(|c| c.set(true));
+    let _clear = HookExit(|| IN_OUTPUT.with(|c| c.set(false)));
     // NUL-terminate on the stack for the C hook (bounded copy).
     let bytes = msg.as_bytes();
     let mut buf = [0u8; 512];
@@ -604,6 +633,12 @@ pub fn deferred_free(force: bool) {
     if DEFERRED_FUN.load_fun().is_null() {
         return;
     }
+    // A hook that allocates re-enters `malloc_generic` → `deferred_free`.
+    // Without a per-thread guard that recurses until the stack dies
+    // (OH-rusty_alloc-17).
+    if IN_DEFERRED.with(|c| c.get()) {
+        return;
+    }
     fire_deferred(force);
 }
 
@@ -617,6 +652,8 @@ pub fn deferred_free(force: bool) {
 #[cold]
 #[inline(never)]
 fn fire_deferred(force: bool) {
+    IN_DEFERRED.with(|c| c.set(true));
+    let _clear = HookExit(|| IN_DEFERRED.with(|c| c.set(false)));
     let (f, a) = DEFERRED_FUN.load();
     if !f.is_null() {
         let hb = HEARTBEAT.fetch_add(1, Ordering::Relaxed);
@@ -632,6 +669,13 @@ fn fire_deferred(force: bool) {
 pub fn error(err: i32) {
     let (f, a) = ERROR_FUN.load();
     if !f.is_null() {
+        // A hook that calls `error` again recurses until the stack dies
+        // (OH-rusty_alloc-23).
+        if IN_ERROR.with(|c| c.get()) {
+            return;
+        }
+        IN_ERROR.with(|c| c.set(true));
+        let _clear = HookExit(|| IN_ERROR.with(|c| c.set(false)));
         // SAFETY: registered with the documented signature.
         unsafe {
             let fun: ErrorFun = core::mem::transmute::<*mut c_void, ErrorFun>(f);

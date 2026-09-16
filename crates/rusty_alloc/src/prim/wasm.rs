@@ -73,7 +73,10 @@ pub(super) unsafe fn alloc(
     // takes one around sbrk.)
     let cur = memory_end();
     let pad = align_up(cur, align) - cur;
-    let pages = (pad + size).div_ceil(WASM_PAGE);
+    let Some(need) = pad.checked_add(size) else {
+        return Err(WERR);
+    };
+    let pages = need.div_ceil(WASM_PAGE);
 
     let prev = core::arch::wasm32::memory_grow::<0>(pages);
     if prev == usize::MAX {
@@ -145,6 +148,15 @@ pub(super) unsafe fn reset(_ptr: *mut u8, _size: usize) -> Result<(), PrimError>
 /// provide.
 pub(super) unsafe fn protect(_ptr: *mut u8, _size: usize, _on: bool) -> Result<(), PrimError> {
     Err(WERR)
+}
+
+pub(super) fn range_is_reserved(ptr: *const u8, size: usize) -> bool {
+    let start = ptr as usize;
+    let Some(end) = start.checked_add(size) else {
+        return false;
+    };
+    let lim = memory_end();
+    start < lim && end <= lim
 }
 
 pub(super) fn numa_node_count() -> usize {

@@ -4,6 +4,77 @@ One entry per milestone/brick: what landed, the numbers with their method lines,
 what was reverted and **which kind** of revert (measured-worse vs within-noise).
 Newest first.
 
+## OPENHEIMER, SPLIT — 202 findings, 139 withdrawn as hot-path tax; the one fix the log claimed and never wrote (2026-09-16)
+
+`docs/plans/openheimer-run.md`, from the campaign's red log
+(`openheimer/docs/results/rusty_alloc_openheimer_results.md`, 202 findings,
+140 rated High, 1,395 lines of uncommitted diff). The brief was: keep what
+stops a hostile request at the door, drop what taxes the allocator.
+
+**What the log was.** 63 findings are real: checked arithmetic on a size,
+alignment, offset or option value a caller can choose (OH-5..34, 42..45);
+`manage_os_memory` adopting null / wrapped / unmapped / already-ours ranges
+(OH-15, 201, 202); hook re-entry (OH-17, 23, 24); `debug_checks` compiled out
+of the build it exists for (OH-7); C-ABI out-pointers, strings and handles
+(OH-16, 26, 54, 58, 65, 66, 97..102); thread exit leaking first-class heaps
+(OH-13). The other 139 are ONE probe — an internal `unsafe fn` handed null,
+`0x1`, or `floor + 8` — chased through 25 helpers and up a ladder of six
+floors, then "closed" with a segment-map membership lookup on every internal
+handle. OH-103..200 are that ladder: the same probe re-filed per constant.
+
+**Why they were withdrawn, with the numbers the campaign never took.** Those
+guards check contracts the caller in this crate already upholds and duplicate
+R-001 (release `free` trusts its window). At the campaign's stopping point,
+x86-64 release assembly against 2.2.0: `free` **+27**, `realloc` **+164**,
+`page_extend` **+68** instructions — `box_of_xheap` walked the heap registry
+under a global lock on the free path. Three of its High-severity regression
+tests failed on its own branch (exit 97: the second free RETURNED), because
+the OH-11 fix the log describes was never written (`git diff | grep -c
+xthread_free` = 0).
+
+**What landed, measured.** Method: `cargo rustc --release --lib -- --emit asm`
+for main (a worktree) and the branch, same toolchain, per-symbol instruction
+counts, Windows x86-64 and `x86_64-unknown-linux-gnu`.
+
+| symbol | main → branch (win) | (linux) | where the delta is |
+|---|---:|---:|---|
+| `alloc::free` | 62 → 66 | 63 → 67 | two `cmp; je` on the cross-thread arm; local path byte-identical, no frame |
+| `alloc::malloc` / `malloc_aligned_at` | 0 / 0 | 0 / 0 | untouched |
+| `alloc::realloc` | +7 | +6 | inlined `free`'s remote arm |
+| `alloc::realloc_aligned_at` | +1 | +1 | was +43 until `is_aligned_to` stopped using `is_power_of_two()` (a SWAR popcount without `popcnt`) |
+| `page::page_extend` / `usable_size` | 0 / 0 | 0 / 0 | untouched |
+| `page::remote_free` | +4 | +4 | the two compares |
+| `segment::huge_alloc` | +29 | −14 | cold: align check, checked `header + size`, checked placement |
+
+**The fix that was owed (OH-11), and what it turned up.** The README says a
+double free aborts on both paths. The cross-thread arm compared the drained
+chain's length against `used` AFTER walking the chain — and a remote double
+free makes the chain CYCLIC, so the walk never returned: the owner's next
+collect hung, and on an abandoned page the next reclaim did. That check was
+unreachable for the one input it named. Now: `remote_free` refuses a block
+that is already the chain head (push time, consecutive case), and the collect
+walk aborts once `n > used` (interleaved A-B-A). Getting the push-time check
+onto `free` for free took three tries, recorded in `page::remote_double_free`:
+a diverging callee is `call; ud2`, and one `call` pins a frame to the top of
+`free` on Windows x64 (SEH cannot describe a prologue elsewhere, so
+shrink-wrapping is off) — +2 on EVERY local free. Hoisting the call out of
+the CAS loop did not help; a may-return cold callee in tail position is a
+`je` straight to it, and does.
+
+**Tests.** `tests/double_free.rs` +4 child-process regressions (abandoned
+page; `set_default_heap` then exit; first-class heap then exit; interleaved
+A-B-A), green under default, `secure`, `blockmap`, both. `tests/openheimer.rs`
+kept 37 of the campaign's 95 (every lie-input test went with its guard, and
+one that asserted a `cfg!` constant went for being vacuous);
+the FFI pack kept 8 of 16, two rewritten to null / misaligned inputs after
+the 64 KiB out-pointer floor was dropped — it would have refused legitimate
+out-pointers on wasm32, where static data starts at 1 KiB. Full suite green at
+default and `ra_small_profile`; gate-selftest, wasm-size, unsafe census
+(909 → 928, every site rowed in `UNSAFE.md`).
+
+**Not measured on hardware.** Instruction counts only; the icount farm
+(`bench/icount-arms.sh`, scheduled) is where the mimalloc ratio gets re-read.
+
 ## LARGE-ALLOCATION CEILING — a 64 KiB block cost two segments; a geometry knob takes 1 block to 3 (2026-09-09)
 
 `docs/plans/finished/esp32-large-alloc-ceiling.md`, reported from the

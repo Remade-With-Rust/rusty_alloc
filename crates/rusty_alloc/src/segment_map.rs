@@ -133,7 +133,13 @@ mod range_table {
         for i in 0..MAX_RANGES {
             if END[i].load(Ordering::Relaxed) == 0 {
                 BASE[i].store(base, Ordering::Relaxed);
-                END[i].store(base + size.max(1), Ordering::Release);
+                // A range that wraps the address space cannot be recorded;
+                // latch the same fail-closed flag a full table does.
+                let Some(end) = base.checked_add(size.max(1)) else {
+                    OVERFLOWED.store(true, Ordering::Release);
+                    return;
+                };
+                END[i].store(end, Ordering::Release);
                 return;
             }
         }
@@ -155,7 +161,7 @@ mod range_table {
     /// Forget `[base, base+size)`. Matches on the base, so an unregister that
     /// was never registered is a no-op.
     pub(super) fn clear(base: usize, size: usize) {
-        let end = base + size.max(1);
+        let end = base.saturating_add(size.max(1));
         let _g = Guard::acquire();
         for i in 0..MAX_RANGES {
             if BASE[i].load(Ordering::Relaxed) == base && END[i].load(Ordering::Relaxed) == end {
@@ -204,7 +210,10 @@ mod base_table {
 
     fn slots(base: usize, size: usize) -> core::ops::Range<usize> {
         let start = base >> SLICE_SHIFT;
-        let end = (base + size.max(1)).div_ceil(1 << SLICE_SHIFT).min(SLOTS);
+        let end = base
+            .saturating_add(size.max(1))
+            .div_ceil(1 << SLICE_SHIFT)
+            .min(SLOTS);
         start.min(SLOTS)..end
     }
 
@@ -257,6 +266,28 @@ pub fn register(seg: *mut Segment) {
     register_range(seg.addr(), SEGMENT_SIZE);
 }
 
+/// Walk every representable window of `[base, base+size)`. Stops at the
+/// first address the bitmap cannot name (above `ADDR_BITS`) and on
+/// `checked_add` overflow: a range ending within one window of the top of
+/// the address space used to wrap `a` back to 0 and walk the whole map
+/// (OH-rusty_alloc-30). Reachable from a caller-supplied `manage_os_memory`
+/// range, so bounded here as well as there.
+#[cfg(all(not(ra_small_profile), not(all(target_arch = "wasm32", not(miri)))))]
+fn walk_windows(base: usize, size: usize, mut op: impl FnMut(usize, u32)) {
+    let mut a = base;
+    let end = base.saturating_add(size.max(1));
+    while a < end {
+        match locate(a) {
+            Some((w, bit)) => op(w, bit),
+            None => break,
+        }
+        match a.checked_add(SEGMENT_SIZE) {
+            Some(n) => a = n,
+            None => break,
+        }
+    }
+}
+
 /// Register every 32 MiB window overlapped by `[base, base+size)`
 /// (on wasm: every 64 KiB slice, in the base table).
 pub fn register_range(base: usize, size: usize) {
@@ -277,14 +308,9 @@ pub fn register_range(base: usize, size: usize) {
     }
     #[cfg(all(not(ra_small_profile), not(all(target_arch = "wasm32", not(miri)))))]
     {
-        let mut a = base;
-        let end = base + size.max(1);
-        while a < end {
-            if let Some((w, bit)) = locate(a) {
-                MAP[w].fetch_or(bit, Ordering::Release);
-            }
-            a += SEGMENT_SIZE;
-        }
+        walk_windows(base, size, |w, bit| {
+            MAP[w].fetch_or(bit, Ordering::Release);
+        });
     }
 }
 
@@ -308,14 +334,9 @@ pub fn unregister_range(base: usize, size: usize) {
     }
     #[cfg(all(not(ra_small_profile), not(all(target_arch = "wasm32", not(miri)))))]
     {
-        let mut a = base;
-        let end = base + size.max(1);
-        while a < end {
-            if let Some((w, bit)) = locate(a) {
-                MAP[w].fetch_and(!bit, Ordering::Release);
-            }
-            a += SEGMENT_SIZE;
-        }
+        walk_windows(base, size, |w, bit| {
+            MAP[w].fetch_and(!bit, Ordering::Release);
+        });
     }
 }
 

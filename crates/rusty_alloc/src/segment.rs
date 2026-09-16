@@ -810,7 +810,12 @@ pub fn huge_alloc(
     offset: usize,
     arena_id: i32,
 ) -> Result<(*mut Segment, *mut u8), PrimError> {
-    debug_assert!(align.is_power_of_two() && align <= SEGMENT_SIZE / 2);
+    // A garbage alignment is EINVAL, not a `debug_assert!`: this is a safe
+    // `pub fn`, and the mask arithmetic below is only sound for a power of
+    // two. Cold path (dedicated segment), so the two compares are free.
+    if !align.is_power_of_two() || align > SEGMENT_SIZE / 2 {
+        return Err(22);
+    }
     let header = SEGMENT_SLICE_SIZE;
     // Worst-case room for placing the block within the reservation. Hosted,
     // the area is slice-aligned, so only larger alignments — or offsets that
@@ -832,7 +837,15 @@ pub fn huge_alloc(
     } else {
         0
     };
-    let want = os::page_align_up(header + size + extra);
+    // An unsatisfiable reservation (`malloc(usize::MAX)`) is an error, not a
+    // `header + size` debug overflow or a wrapped small reservation.
+    let Some(raw) = header.checked_add(size).and_then(|s| s.checked_add(extra)) else {
+        return Err(0);
+    };
+    let want = os::page_align_up(raw);
+    if want < raw {
+        return Err(0);
+    }
     // Huge blocks recycle through arenas too (contiguous chunks) — without
     // this, every huge alloc/free cycle is an OS round-trip (the Tier-A
     // malloc-large gate measured 3–4× slower before this path).
@@ -845,8 +858,11 @@ pub fn huge_alloc(
     // (`mi_segment_huge_page_alloc`, oracle segment.c:1671/1683); we did not.
     // See `tests/heaps.rs::exclusive_arena_confines_huge_allocations`.
     let chunks = want.div_ceil(SEGMENT_SIZE);
+    let Some(chunk_bytes) = chunks.checked_mul(SEGMENT_SIZE) else {
+        return Err(0);
+    };
     let (bptr, total, mem_zero) = match crate::arena::chunk_alloc_n(arena_id, chunks) {
-        Some((p, zero)) => (p, chunks * SEGMENT_SIZE, zero),
+        Some((p, zero)) => (p, chunk_bytes, zero),
         None => {
             if arena_id >= 0 {
                 return Err(0); // exclusive-arena heap and its arena is full
@@ -883,7 +899,19 @@ pub fn huge_alloc(
         (*seg).free_spans = ptr::null_mut();
         let area = b.ptr.add(header);
         // (block + offset) aligned: round (area + offset) up, subtract offset.
-        let block = area.with_addr(((area.addr() + offset + align - 1) & !(align - 1)) - offset);
+        // `area + offset + align` can wrap for a caller-chosen offset; that is
+        // an unsatisfiable request, not a block placed by wrapped arithmetic.
+        let Some(addr) = crate::bins::aligned_at_from(area.addr(), offset, align) else {
+            // SAFETY: the reservation is registered and unused; no block escaped.
+            let _ = huge_free(seg);
+            return Err(0);
+        };
+        if addr < area.addr() {
+            // SAFETY: as the overflow arm.
+            let _ = huge_free(seg);
+            return Err(0);
+        }
+        let block = area.with_addr(addr);
         debug_assert!(block.addr() >= area.addr() && (block.addr() + offset).is_multiple_of(align));
         // The single page lives in slot 1; every reachable interior slice
         // offsets back to it (only slices 1..512 are addressable via the mask

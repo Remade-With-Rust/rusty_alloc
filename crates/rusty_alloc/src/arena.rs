@@ -97,13 +97,25 @@ fn arena_register(
         (*a).owned = owned;
         (*a).numa_node = numa_node;
     }
-    let id = ARENA_COUNT.fetch_add(1, Ordering::AcqRel);
-    if id >= MAX_ARENAS {
-        ARENA_COUNT.fetch_sub(1, Ordering::AcqRel);
-        return Err(());
+    // CAS so `ARENA_COUNT` never exceeds `MAX_ARENAS` (no transient `ARENAS[32]`
+    // window for `arena_area`, and the overflow path frees the descriptor
+    // instead of leaking it).
+    loop {
+        let id = ARENA_COUNT.load(Ordering::Acquire);
+        if id >= MAX_ARENAS {
+            // SAFETY: `desc` is the descriptor mapping allocated above and
+            // never published (no `ARENAS` slot names it).
+            let _ = unsafe { os::free(desc) };
+            return Err(());
+        }
+        if ARENA_COUNT
+            .compare_exchange(id, id + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            ARENAS[id].store(a, Ordering::Release);
+            return Ok(id as i32);
+        }
     }
-    ARENAS[id].store(a, Ordering::Release);
-    Ok(id as i32)
 }
 
 /// `mi_reserve_os_memory_ex`: reserve (and commit) fresh OS memory as an
@@ -126,11 +138,24 @@ pub fn reserve_os_memory_ex(
     if crate::FIXED_REGION {
         return Err(());
     }
-    let total = size.div_ceil(SEGMENT_SIZE) * SEGMENT_SIZE;
+    // Unsatisfiable size (e.g. usize::MAX) is Err, not `chunks * SEGMENT_SIZE`
+    // overflow (OH-rusty_alloc-12).
+    let chunks = size.div_ceil(SEGMENT_SIZE);
+    let Some(total) = chunks.checked_mul(SEGMENT_SIZE) else {
+        return Err(());
+    };
     // Eager commit (our segment model); `_commit=false` still reserves+commits
     // in v1 — recorded divergence, matches how segments consume chunks.
     let b = os::alloc_aligned(total, SEGMENT_SIZE, true, allow_large).map_err(|_| ())?;
-    arena_register(b.ptr, total, exclusive, true, -1)
+    match arena_register(b.ptr, total, exclusive, true, -1) {
+        Ok(id) => Ok(id),
+        Err(()) => {
+            // SAFETY: `b` is the reservation made two lines up; a refused
+            // register never recorded it, so nothing else can reach it.
+            let _ = unsafe { os::free(b) };
+            Err(())
+        }
+    }
 }
 
 /// `mi_manage_os_memory_ex`: adopt caller-provided memory (never freed by us).
@@ -154,12 +179,33 @@ pub fn manage_os_memory_ex(
     if crate::FIXED_REGION {
         return Err(());
     }
-    let lo_addr = (start.addr() + SEGMENT_SIZE - 1) & !(SEGMENT_SIZE - 1);
-    let hi = (start.addr() + size) & !(SEGMENT_SIZE - 1);
+    // Null / overflowing ranges are Err, not `addr + size` debug overflow or a
+    // registry covering the address space (OH-rusty_alloc-15). Whether the
+    // range is real memory is the OS's answer (`range_is_reserved`, below),
+    // not an address floor's.
+    if start.is_null() {
+        return Err(());
+    }
+    let Some(end) = start.addr().checked_add(size) else {
+        return Err(());
+    };
+    let Some(lo_raw) = start.addr().checked_add(SEGMENT_SIZE - 1) else {
+        return Err(());
+    };
+    let lo_addr = lo_raw & !(SEGMENT_SIZE - 1);
+    let hi = end & !(SEGMENT_SIZE - 1);
     if hi <= lo_addr {
         return Err(());
     }
     let lo = start.with_addr(lo_addr);
+    let span = hi - lo_addr;
+    // A window we already named is live heap, not caller memory
+    // (OH-rusty_alloc-202). An unmapped lie must not become an arena
+    // (OH-rusty_alloc-201) — the next default malloc would write a Segment
+    // there.
+    if crate::segment_map::contains(lo) || !crate::os::range_is_reserved(lo, span) {
+        return Err(());
+    }
     // Conservative: treat managed memory as dirty (not-zero) — the dirty
     // bitmap starts clear, so mark it at first alloc instead; simplest is to
     // pre-mark every chunk dirty.
@@ -340,6 +386,11 @@ pub fn chunk_alloc_n(restrict_id: i32, n: usize) -> Option<(*mut u8, bool)> {
     if crate::FIXED_REGION {
         return None;
     }
+    if n == 0 {
+        // Zero chunks is None, not `run == 0` on a used bit handing out a
+        // pointer with no claim (OH-rusty_alloc-22).
+        return None;
+    }
     if n == 1 {
         return chunk_alloc(restrict_id);
     }
@@ -442,6 +493,11 @@ pub fn chunk_free_n(p: *mut u8, n: usize) -> bool {
     if crate::FIXED_REGION {
         return false; // nothing came from an arena, so nothing returns to one
     }
+    // Zero / overflowing `n` is false, not `start..start+n` OOB on the bitmap
+    // (OH-rusty_alloc-25).
+    if n == 0 {
+        return false;
+    }
     let addr = p.addr();
     let count = ARENA_COUNT.load(Ordering::Acquire).min(MAX_ARENAS);
     for id in 0..count {
@@ -449,17 +505,35 @@ pub fn chunk_free_n(p: *mut u8, n: usize) -> bool {
         if a.is_null() {
             continue;
         }
-        // SAFETY: live descriptor; bounded indices per the range check.
+        // SAFETY: live descriptor; indices clamped to live chunks.
         unsafe {
-            if addr >= (*a).base.addr()
-                && addr < (*a).base.addr() + (*a).chunks_live.load(Ordering::Acquire) * SEGMENT_SIZE
-            {
-                let start = (addr - (*a).base.addr()) / SEGMENT_SIZE;
-                for j in start..start + n {
-                    (*a).used[j / WORD_BITS].fetch_and(!(1 << (j % WORD_BITS)), Ordering::AcqRel);
-                }
-                return true;
+            let chunks = (*a).chunks_live.load(Ordering::Acquire);
+            let Some(span) = chunks.checked_mul(SEGMENT_SIZE) else {
+                continue;
+            };
+            let Some(end_addr) = (*a).base.addr().checked_add(span) else {
+                continue;
+            };
+            if addr < (*a).base.addr() || addr >= end_addr {
+                continue;
             }
+            let off = addr - (*a).base.addr();
+            // Interior pointers are false, not a successful free of the
+            // containing chunk (OH-rusty_alloc-27).
+            if !off.is_multiple_of(SEGMENT_SIZE) {
+                return false;
+            }
+            let start = off / SEGMENT_SIZE;
+            let Some(end) = start.checked_add(n) else {
+                return false;
+            };
+            if end > chunks {
+                return false;
+            }
+            for j in start..end {
+                (*a).used[j / WORD_BITS].fetch_and(!(1 << (j % WORD_BITS)), Ordering::AcqRel);
+            }
+            return true;
         }
     }
     false
@@ -480,10 +554,21 @@ pub fn chunk_free(p: *mut u8) -> bool {
         }
         // SAFETY: live descriptor; bit index bounded by the range check.
         unsafe {
-            if addr >= (*a).base.addr()
-                && addr < (*a).base.addr() + (*a).chunks_live.load(Ordering::Acquire) * SEGMENT_SIZE
-            {
-                let idx = (addr - (*a).base.addr()) / SEGMENT_SIZE;
+            let chunks = (*a).chunks_live.load(Ordering::Acquire);
+            let Some(span) = chunks.checked_mul(SEGMENT_SIZE) else {
+                continue;
+            };
+            let Some(end_addr) = (*a).base.addr().checked_add(span) else {
+                continue;
+            };
+            if addr >= (*a).base.addr() && addr < end_addr {
+                let off = addr - (*a).base.addr();
+                // Interior pointers are false, not a successful free of the
+                // containing chunk (OH-rusty_alloc-27).
+                if !off.is_multiple_of(SEGMENT_SIZE) {
+                    return false;
+                }
+                let idx = off / SEGMENT_SIZE;
                 (*a).used[idx / WORD_BITS].fetch_and(!(1 << (idx % WORD_BITS)), Ordering::AcqRel);
                 return true;
             }
@@ -589,7 +674,9 @@ pub(crate) fn adopt_os_block(ptr: *mut u8, size: usize) -> Option<i32> {
 
 /// `mi_arena_area`: the arena's base and size, or null.
 pub fn arena_area(id: i32) -> (*mut u8, usize) {
-    if crate::FIXED_REGION || id < 0 || id as usize >= ARENA_COUNT.load(Ordering::Acquire) {
+    // Index by the table bound, not a count that can race past it
+    // (`ARENAS` is `MAX_ARENAS` slots).
+    if crate::FIXED_REGION || id < 0 || (id as usize) >= MAX_ARENAS {
         return (ptr::null_mut(), 0);
     }
     let a = ARENAS[id as usize].load(Ordering::Acquire);
@@ -598,10 +685,8 @@ pub fn arena_area(id: i32) -> (*mut u8, usize) {
     }
     // SAFETY: live descriptor.
     unsafe {
-        (
-            (*a).base,
-            (*a).chunks_live.load(Ordering::Acquire) * SEGMENT_SIZE,
-        )
+        let chunks = (*a).chunks_live.load(Ordering::Acquire);
+        ((*a).base, chunks.checked_mul(SEGMENT_SIZE).unwrap_or(0))
     }
 }
 

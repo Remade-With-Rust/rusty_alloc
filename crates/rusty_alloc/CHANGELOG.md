@@ -7,6 +7,105 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A cross-thread double free could hang the next collect instead of
+  aborting.** The README says a double free aborts "on both the local and the
+  cross-thread path". The cross-thread arm of that check lived in
+  `page_collect` and compared the drained chain's length against `used` —
+  AFTER walking the chain. A block freed twice from another thread is linked
+  onto `xthread_free` twice, which makes the chain CYCLIC, so the walk never
+  reached the compare: the owner's next collect, or on an abandoned page the
+  next reclaim, spun forever, and nothing aborted. Now `remote_free` refuses a
+  block that is already the chain head — one compare on the cross-thread arm,
+  and the local path is byte-identical, checked on the x86-64 release
+  assembly for Windows and Linux — and the collect walk is bounded by `used`,
+  so the interleaved case (A, B, A) aborts on the first collect instead of
+  hanging. Four child-process regressions in `tests/double_free.rs` (a block
+  abandoned by a dying thread; `set_default_heap` then exit; a first-class
+  heap then exit; interleaved A-B-A), green under `secure`, `blockmap` and
+  both. Found by the Openheimer campaign as OH-rusty_alloc-11, whose log
+  claimed a fix that had never been written.
+- **Thread exit abandoned only the heap in `done_slot`.** A first-class heap
+  never `heap_delete`d before its thread exited, or one installed with
+  `set_default_heap`, stayed DELAYED under a dead owner: its blocks could be
+  freed any number of times onto a delayed list no thread would ever drain,
+  and a thread that only ever called `create_heap` had no exit hook at all.
+  `create_heap` now bootstraps the thread first and exit abandons every heap
+  the thread still owns; upstream deletes non-backing heaps at thread exit
+  for the same reason (OH-rusty_alloc-13).
+- **Integer wraps a caller could reach with a size, alignment, offset or
+  option value, all on cold paths:** `malloc(usize::MAX)` overflowed
+  `header + size` in `huge_alloc`; a huge `offset` to `malloc_aligned_at` or
+  `realloc_aligned_at` wrapped `p + offset` (debug panic, release wild
+  pointer); guarded `malloc(MAX)` wrapped `payload + page`; `os::page_align_up`
+  and `os::alloc_aligned` on an unrepresentable size or a garbage alignment;
+  `bin_size` of a garbage index; `page_under_utilized` with a huge percentage;
+  `options::get_size` KiB scaling; `get_clamp` with inverted bounds;
+  `reserve_huge_os_pages` `pages * 1 GiB`; `prim::fixed::dedicated_segments`
+  and `region_for` at `usize::MAX`; `segment_map::register_range` within one
+  window of the top of the address space (the window walk is bounded);
+  `subproc_new` exhaustion and `subproc_add_current_thread` out of range,
+  which were `assert!`s on public entries; and `is_aligned_to(x, 0)`, which
+  was true for every `x`. Each returns null, `Err`, `false` or a refused id
+  instead (OH-rusty_alloc-5, 6, 8, 9, 10, 14, 18–21, 28–34, 42–45).
+- **`manage_os_memory` adopted anything it was handed.** Null, a range that
+  wrapped, an unmapped address, or a window this allocator already owns all
+  became an arena, and the next default `malloc` wrote a `Segment` header
+  there. The range must now be non-null, non-wrapping, mapped (`mincore` /
+  `VirtualQuery` behind `prim::range_is_reserved`) and not already a
+  registered window; a real OS reservation still adopts. `arena_register`
+  claims its slot with a CAS and frees the descriptor and the mapping when
+  refused; `chunk_alloc_n(0)` is `None`, and `chunk_free_n` / `chunk_free`
+  refuse a count past the bitmap or an interior pointer instead of releasing
+  a live chunk (OH-rusty_alloc-12, 15, 22, 25, 27, 201, 202).
+- **Hook re-entry.** A deferred-free, error or output hook that allocated,
+  printed or errored re-entered itself until the stack was gone; each hook
+  now runs under a thread-local in-hook flag (OH-rusty_alloc-17, 23, 24).
+- **`--release --features debug_checks` did not check.** The foreign-pointer
+  guard was a `debug_assert!` inside the `debug_checks` cfg, compiled out of
+  the one build a consumer enables the feature for. It is an `assert!`
+  (OH-rusty_alloc-7). `malloc_small` / `zalloc_small` forward an oversize
+  request instead of `debug_assert!`ing on it (OH-62).
+- **OS wrappers on a lie.** `prim::alloc` with a garbage alignment and
+  `prim::commit` of null are `Err`; the latter used to hand Windows an
+  untracked mapping (OH-rusty_alloc-38, 60).
+- **C ABI.** `mi_dupenv_s` / `mi_wdupenv_s` clear the caller's out-pointers
+  on EINVAL as the CRT contract says; `mi_realpath` never writes past
+  `PATH_MAX`; every out-parameter write refuses a null or misaligned pointer;
+  a null, misaligned or immortal-empty heap handle is "no heap" for every
+  `mi_heap_*` entry rather than a dereference, and `mi_heap_set_default`
+  refuses such a handle instead of installing it (OH-rusty_alloc-16, 26, 54,
+  58, 65, 66, 97–102).
+
+### Changed
+
+- **What was NOT taken from the Openheimer campaign, and why.** The
+  campaign's log carries 202 findings; 139 of them are one probe — an
+  internal `unsafe fn` handed null, `0x1`, or an address just past a
+  constant "floor" — chased through 25 helpers and up a ladder of floors
+  (`0x1000`, `0x10000`, `SEGMENT_SIZE`, then 2×, 3×, 4× that) and finally
+  answered with a segment-map membership lookup on every internal handle:
+  `page_of`, `page_index`, `page_area`, `free_local`, `retire_emptied`,
+  `box_of_xheap` (a registry walk under a global lock, on the free path) and
+  twenty more. Those guards validated contracts the caller inside this crate
+  already upholds, duplicated the residual the threat model accepts for `free`
+  (R-001: release `free` trusts its pointer's window), and taxed the hot path
+  — `free` +27, `realloc` +164, `page_extend` +68 instructions when the
+  campaign stopped, which it never measured. None of it landed. What did:
+  every check on a value a caller can actually choose — sizes, counts,
+  alignments, offsets, option values, out-pointers, C strings, heap handles at
+  the C ABI, `manage_os_memory` ranges — on paths that are cold or, for
+  `free`, cost the local path nothing. x86-64 release assembly against 2.2.0,
+  Windows / Linux: `free` +4 / +4 (both on the cross-thread arm; no frame),
+  `malloc` 0 / 0, `malloc_aligned_at` 0 / 0, `realloc` +7 / +6,
+  `realloc_aligned_at` +1 / +1, `page_extend` 0 / 0, `usable_size` 0 / 0.
+  The disposition, finding by finding, is `docs/plans/openheimer-run.md`.
+- `bins::is_aligned_to` spells its power-of-two test as
+  `align & (align - 1) == 0` rather than `is_power_of_two()`: without `popcnt`
+  in the target features the latter was emitted as a 20-instruction SWAR bit
+  count inside `realloc_aligned_at` (+43 on that function, now +1).
+
 ## [2.2.0](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.1.0...rusty_alloc-v2.2.0) - 2026-09-10
 
 ### Fixed

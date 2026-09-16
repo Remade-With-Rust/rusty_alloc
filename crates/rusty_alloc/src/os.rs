@@ -86,25 +86,39 @@ pub fn page_align_up(size: usize) -> usize {
     // On any real platform `1 << ps.trailing_zeros() == ps`, so this is the
     // same round-up it always was, for one `tzcnt` and one `shl`.
     let mask = (1usize << (ps.trailing_zeros() & 63)) - 1;
-    (size.max(1) + mask) & !mask
+    let base = size.max(1);
+    // Checked add: wrapping here is a silent shrink (OH-rusty_alloc-10).
+    // `usize::MAX + 4095` wraps to a small page-aligned value in release, so
+    // `good_size(usize::MAX)` would promise 0. Unrepresentable round-up keeps
+    // `base` — never shrinks, never panics. "Never 0": `size == 0` uses base 1.
+    match base.checked_add(mask) {
+        Some(s) => s & !mask,
+        None => base,
+    }
 }
 
 /// Reserve (and optionally commit) an aligned block of OS memory.
 ///
 /// `alignment` must be a power of two ≥ page size; `size` is rounded up to
-/// pages. This is what segments (M3) and arenas (M6) sit on.
+/// pages. This is what segments (M3) and arenas (M6) sit on. A non-power-of-two
+/// (or zero) alignment is `Err`, not `assert!` (OH-rusty_alloc-28).
 pub fn alloc_aligned(
     size: usize,
     alignment: usize,
     commit: bool,
     allow_large: bool,
 ) -> Result<OsBlock, PrimError> {
-    assert!(
-        alignment.is_power_of_two(),
-        "alignment must be a power of two"
-    );
+    // EINVAL: hostile / mistaken callers hit the `Result`, not a panic.
+    if !alignment.is_power_of_two() {
+        return Err(22);
+    }
     let alignment = alignment.max(page_size());
     let size = page_align_up(size);
+    // Unrepresentable `size + alignment` is Err, not `size + try_alignment`
+    // debug overflow in the prim aligned-reserve dance (OH-rusty_alloc-29).
+    if size.checked_add(alignment).is_none() {
+        return Err(12);
+    }
     // On a platform whose `free` cannot return memory (wasm), a freed block's
     // only afterlife is adoption as SEGMENT_SIZE arena chunks (see [`free`]).
     // A segment-aligned block with a ragged size would leave a sub-chunk tail
@@ -116,7 +130,8 @@ pub fn alloc_aligned(
     // `alignment >= SEGMENT_SIZE` is precisely the segment/huge reservation
     // paths; descriptor-sized allocations keep their page granularity.
     let size = if !prim::FREE_RETURNS_MEMORY && alignment >= crate::types::SEGMENT_SIZE {
-        size.next_multiple_of(crate::types::SEGMENT_SIZE)
+        size.checked_next_multiple_of(crate::types::SEGMENT_SIZE)
+            .ok_or(12u32)?
     } else {
         size
     };
@@ -144,6 +159,11 @@ pub fn alloc_aligned(
         is_large: a.is_large,
         is_zero: a.is_zero,
     })
+}
+
+/// Whether `[ptr, ptr+size)` is reserved or committed by the OS.
+pub fn range_is_reserved(ptr: *const u8, size: usize) -> bool {
+    prim::range_is_reserved(ptr, size)
 }
 
 /// Release a block from [`alloc_aligned`].

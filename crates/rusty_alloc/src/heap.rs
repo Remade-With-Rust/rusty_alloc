@@ -930,8 +930,17 @@ impl Heap {
     fn guarded_alloc(&mut self, size: usize) -> (*mut u8, bool) {
         let ps = crate::os::page_size();
         let payload = crate::os::page_align_up(size.max(1));
+        // An unsatisfiable payload (`page_align_up` saturated, or the guard
+        // page does not fit) is null, not `payload + page` wrapped into a
+        // small guarded object.
+        if payload < size.max(1) {
+            return (ptr::null_mut(), false);
+        }
+        let Some(need) = payload.checked_add(ps) else {
+            return (ptr::null_mut(), false);
+        };
         // huge_alloc gives us a dedicated segment with a page-aligned block.
-        let (block, _z) = self.huge_alloc(payload + ps, ps, 0);
+        let (block, _z) = self.huge_alloc(need, ps, 0);
         if block.is_null() {
             return (ptr::null_mut(), false);
         }
@@ -1096,7 +1105,11 @@ impl Heap {
             // immortal empty-page sentinel; reading `free` is the same access
             // `page_pop` performs.
             let b = unsafe { (*p).free };
-            if !b.is_null() && b.addr() & (align - 1) == 0 {
+            // `wrapping_sub`: `align == 0` reaches this peek (the power-of-two
+            // test admits it), and the mask must then be `usize::MAX` — which
+            // fails for any non-null `b` and takes the refusing slow path —
+            // not a debug overflow. Identical release codegen.
+            if !b.is_null() && b.addr() & align.wrapping_sub(1) == 0 {
                 // SAFETY: as `Heap::malloc` — pop from this thread's own page.
                 let b = unsafe { crate::page::page_pop(p) };
                 debug_assert!(!b.is_null());
@@ -1174,7 +1187,19 @@ impl Heap {
         if block.is_null() {
             return (ptr::null_mut(), false);
         }
-        let p = block.with_addr(((block.addr() + offset + align - 1) & !(align - 1)) - offset);
+        // `block + offset + align` can wrap for a caller-chosen offset: that
+        // is an unsatisfiable request, and the block goes back, not out.
+        let Some(addr) = bins::aligned_at_from(block.addr(), offset, align) else {
+            // SAFETY: `block` was just allocated on this thread and has not escaped.
+            unsafe { self.free_local(block) };
+            return (ptr::null_mut(), false);
+        };
+        if addr < block.addr() {
+            // SAFETY: as the overflow arm — block is ours and has not escaped.
+            unsafe { self.free_local(block) };
+            return (ptr::null_mut(), false);
+        }
+        let p = block.with_addr(addr);
         debug_assert!((p.addr() + offset).is_multiple_of(align));
         if p != block {
             // SAFETY: block is ours, just allocated on this thread; marking
@@ -1831,7 +1856,10 @@ impl Heap {
         unsafe {
             let pg = segment::page_of(seg, p);
             page_collect(pg);
-            ((*pg).used as usize) * 100 < ((*pg).capacity as usize) * perc
+            // Saturating: a huge caller `perc` is "always under", not a debug
+            // overflow or a wrapped comparison.
+            ((*pg).used as usize).saturating_mul(100)
+                < ((*pg).capacity as usize).saturating_mul(perc)
         }
     }
 

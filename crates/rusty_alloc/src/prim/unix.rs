@@ -82,7 +82,11 @@ pub(super) unsafe fn alloc(
     }
 
     // Over-allocate and trim the unaligned head/tail (partial free is allowed).
-    let over = size + try_alignment;
+    // Unrepresentable `size + alignment` is Err, not a debug add overflow
+    // (OH-rusty_alloc-29).
+    let Some(over) = size.checked_add(try_alignment) else {
+        return Err(12);
+    };
     // SAFETY: forwarded contract.
     let raw = unsafe { mmap_anon(ptr::null_mut(), over, commit)? };
     let base = raw as usize;
@@ -194,6 +198,32 @@ pub(super) unsafe fn protect(ptr_: *mut u8, size: usize, on: bool) -> Result<(),
     // SAFETY: caller guarantees a live mapping.
     let r = unsafe { libc::mprotect(ptr_.cast(), size, prot) };
     if r == 0 { Ok(()) } else { Err(errno()) }
+}
+
+/// Whether `[ptr, ptr+size)` is mapped (`mincore` succeeds on every page).
+pub(super) fn range_is_reserved(ptr: *const u8, size: usize) -> bool {
+    if ptr.is_null() || size == 0 {
+        return false;
+    }
+    let page = mem_init().page_size.max(1);
+    let start = ptr as usize;
+    let aligned = start & !(page - 1);
+    let Some(span) = size.checked_add(start - aligned) else {
+        return false;
+    };
+    let npages = span.div_ceil(page);
+    for i in 0..npages {
+        let p = aligned + i * page;
+        let mut vec = 0u8;
+        // SAFETY: `p` is page-aligned and `page` is one page, so the out
+        // vector needs one byte, which `vec` is; `mincore` reads the mapping
+        // table and writes only that byte.
+        let r = unsafe { libc::mincore(p as *mut libc::c_void, page, &mut vec) };
+        if r != 0 {
+            return false;
+        }
+    }
+    true
 }
 
 pub(super) fn numa_node_count() -> usize {
