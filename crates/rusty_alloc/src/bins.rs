@@ -42,13 +42,23 @@ pub fn bin(size: usize) -> usize {
 #[inline]
 pub const fn bin_size(bin: usize) -> usize {
     if bin <= 8 {
-        bin * INTPTR_SIZE
-    } else {
-        // bin = (b<<2) + m - 3  with block wsize = (5+m) << (b-2)
-        let t = bin + 3;
-        let b = t >> 2;
-        let m = t & 3;
-        ((5 + m) << (b - 2)) * INTPTR_SIZE
+        return bin * INTPTR_SIZE;
+    }
+    // Garbage indices (`usize::MAX`) are 0, not `bin + 3` debug overflow or a
+    // wrapping shift into a tiny class (OH-rusty_alloc-32). Meaningless for
+    // [`BIN_HUGE`]/[`BIN_FULL`] as before; those still take this arm when
+    // they fit the formula.
+    let Some(t) = bin.checked_add(3) else {
+        return 0;
+    };
+    let b = t >> 2;
+    if b < 2 {
+        return 0;
+    }
+    let shift = b - 2;
+    match (5 + (t & 3)).checked_shl(shift as u32) {
+        Some(w) => w.saturating_mul(INTPTR_SIZE),
+        None => 0,
     }
 }
 
@@ -76,10 +86,43 @@ pub fn good_size(size: usize) -> usize {
 /// is the CONSERVATIVE answer at every call site — each one falls back to the
 /// general path rather than taking an in-place or same-bin shortcut. A mask
 /// alone would be unsound there (`4 & (3-1) == 0` says "aligned to 3").
+///
+/// `align == 0` is not a power of two, so this returns `false`. Do **not**
+/// lift zero to 1 first: that made every address report as aligned-to-zero
+/// (Openheimer `oh_f04_is_aligned_to_is_total`, 2026-09-15) while
+/// `malloc_aligned(_, 0)` correctly returns null.
 #[inline(always)]
 pub fn is_aligned_to(x: usize, align: usize) -> bool {
-    let a = align.max(1);
-    a.is_power_of_two() && (x & (a - 1)) == 0
+    // The power-of-two test is spelled out rather than `is_power_of_two()`:
+    // that is a popcount, and without `popcnt` in the target features LLVM
+    // emitted it as a 20-instruction SWAR bit count inside
+    // `realloc_aligned_at` (measured 2026-09-16). `align & (align - 1) == 0`
+    // is the same predicate in three instructions, and `align != 0` keeps
+    // zero out — `0 & MAX == 0` would otherwise admit it (OH-rusty_alloc-5).
+    let m = align.wrapping_sub(1);
+    align != 0 && align & m == 0 && x & m == 0
+}
+
+/// `(addr + offset)` is aligned to `align`. Overflow of the add is `false`,
+/// not a debug panic (OH-rusty_alloc-42 / OH-43).
+#[inline]
+pub fn is_aligned_at(addr: usize, offset: usize, align: usize) -> bool {
+    match addr.checked_add(offset) {
+        Some(s) => is_aligned_to(s, align),
+        None => false,
+    }
+}
+
+/// First address `p >= base` such that `(p + offset) % align == 0`.
+///
+/// `None` when the add overflows. Wrapping here would hand out a wild
+/// interior pointer; the callers refuse with null instead (OH-rusty_alloc-6).
+#[inline]
+pub(crate) fn aligned_at_from(base: usize, offset: usize, align: usize) -> Option<usize> {
+    debug_assert!(align.is_power_of_two() && align > 0);
+    let sum = base.checked_add(offset)?.checked_add(align - 1)?;
+    let rounded = sum & !(align - 1);
+    rounded.checked_sub(offset)
 }
 
 /// `ceil(2^32 / odd)` for the four odd parts a bin size can have, indexed by
@@ -186,6 +229,14 @@ pub(crate) fn exact_div_by_block_size(n: usize, bsize: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aligned_at_from_refuses_overflow() {
+        assert!(aligned_at_from(0x1000, usize::MAX, 8).is_none());
+        assert_eq!(aligned_at_from(0x1000, 16, 64), Some(0x1030));
+        assert_eq!(bin_size(usize::MAX), 0);
+        assert_eq!(bin_size(0), 0);
+    }
 
     #[test]
     fn bin_size_inverts_bin() {

@@ -779,7 +779,10 @@ pub unsafe fn remote_free(page: *mut Page, block: *mut Block) {
     if crate::ONE_THREAD {
         unreachable!("a cross-thread free on a build that asserted a single thread");
     }
-    loop {
+    // Both arms below detect a double free with one compare and `break` to
+    // the single abort AFTER the loop; see `remote_double_free` for why that
+    // abort is a tail call and not a diverging one.
+    'push: loop {
         // SAFETY: xthread_free/xheap are the designed cross-thread fields.
         let x = unsafe { (*page).xthread_free.load(Ordering::Acquire) };
         match x & XMASK {
@@ -805,6 +808,12 @@ pub unsafe fn remote_free(page: *mut Page, block: *mut Block) {
                         debug_assert!(!dl.is_null(), "DELAYED page without an owner heap");
                         loop {
                             let head = (*dl).head.load(Ordering::Acquire);
+                            // A block that is already the list head is being
+                            // freed a second time: abort, do not link it to
+                            // itself (OH-rusty_alloc-11).
+                            if head == block as usize {
+                                break 'push;
+                            }
                             // Delayed-list links are heap-scoped: encoding
                             // them would need the owner's page keys here, so
                             // they stay plain even in secure builds.
@@ -846,6 +855,17 @@ pub unsafe fn remote_free(page: *mut Page, block: *mut Block) {
             XFLAG_FREEING => core::hint::spin_loop(),
             flag => {
                 // NORMAL or NEVER: push onto the page's own list.
+                //
+                // A block that is already the chain head is being freed a
+                // second time. Linking it would make the chain CYCLIC
+                // (`block -> block`), which the owner's collect could never
+                // finish walking; on a NEVER page there is no owner at all,
+                // so the cycle sat there until a reclaim hung on it. One
+                // compare against a value already in a register, on the
+                // cross-thread path only (OH-rusty_alloc-11).
+                if (x & !XMASK) == block as usize {
+                    break 'push;
+                }
                 // SAFETY: block is dead memory we own; link write is the
                 // free-list representation.
                 unsafe {
@@ -865,6 +885,28 @@ pub unsafe fn remote_free(page: *mut Page, block: *mut Block) {
                 }
             }
         }
+    }
+    remote_double_free()
+}
+
+/// A double free was detected on the cross-thread path ([`remote_free`]).
+///
+/// This is deliberately NOT `-> !`, and the `black_box` is load-bearing.
+/// `remote_free` is inlined into `alloc::free`, a leaf with no stack frame.
+/// A callee LLVM can prove diverging is emitted as `call; ud2`, and on
+/// Windows x64 that one `call` pins a frame to the TOP of `free` (SEH unwind
+/// info cannot describe a prologue anywhere else, so shrink-wrapping is off)
+/// — two instructions on every LOCAL free, for a check that only runs on the
+/// remote arm. A callee that may return, in tail position, is a `jmp`: the
+/// same shape as `alloc::retire_or_abort`, and the local path stays
+/// byte-identical to the build without the check. `black_box(true)` is what
+/// keeps the "may return" path visible to attribute inference; it is always
+/// true, and the function never returns in practice.
+#[cold]
+#[inline(never)]
+fn remote_double_free() {
+    if core::hint::black_box(true) {
+        double_free_abort();
     }
 }
 
@@ -995,9 +1037,28 @@ unsafe fn page_collect_impl<const SET_FLAG: bool>(page: *mut Page, flag: usize) 
             // One `block_next` per element, not two: the original loop called
             // it in the condition AND the body, doubling the decode (and, in
             // `secure`, the bound check) on every element of the walk.
+            //
+            // The CROSS-THREAD arm of the double-free check `page_push_local`
+            // performs, and the walk is BOUNDED by it. A block freed twice
+            // from another thread is linked onto `xthread_free` twice, and
+            // its second link points back into the chain it is already on:
+            // the chain is CYCLIC, so an unbounded walk here never returns —
+            // the post-walk `n > used` test this used to rely on was
+            // unreachable for the very case it named. No legitimate chain is
+            // longer than the number of live blocks, so `n > used` inside the
+            // walk turns the hang into the same abort the local path gives.
+            // `remote_free` refuses the consecutive case at push time; this
+            // catches the interleaved one (A, B, A) — OH-rusty_alloc-11.
+            //
+            // One register compare per drained element, on the heartbeat,
+            // not on any per-free path.
+            let used = (*page).used;
             let mut tail = head;
             let mut n = 1u32;
             loop {
+                if n > used {
+                    double_free_abort();
+                }
                 #[cfg(feature = "blockmap")]
                 blockmap_transition(page, tail.cast(), false);
                 let nxt = block_next(page, tail);
@@ -1009,18 +1070,8 @@ unsafe fn page_collect_impl<const SET_FLAG: bool>(page: *mut Page, flag: usize) 
             }
             block_set_next(page, tail, (*page).free);
             (*page).free = head;
-            // The CROSS-THREAD arm of the same double-free check that
-            // `page_push_local` performs. A block freed twice from another
-            // thread lands on `xthread_free` twice, so the chain length `n`
-            // counted here exceeds the number of live blocks and `used` wraps
-            // — the identical silent corruption, reached by the remote path.
-            //
-            // Free to check: `page_collect` runs on the heartbeat, not on
-            // every free, so this costs nothing on any hot path.
-            if n > (*page).used {
-                double_free_abort();
-            }
-            (*page).used -= n;
+            // `n <= used` here: the walk aborted otherwise.
+            (*page).used = used - n;
             break;
         }
         // Reached only by breaking out of the steal arm above, i.e. a

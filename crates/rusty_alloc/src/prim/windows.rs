@@ -14,8 +14,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::System::Memory::{
-    GetLargePageMinimum, MEM_COMMIT, MEM_DECOMMIT, MEM_LARGE_PAGES, MEM_RELEASE, MEM_RESERVE,
-    MEM_RESET, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect,
+    GetLargePageMinimum, MEM_COMMIT, MEM_DECOMMIT, MEM_FREE, MEM_LARGE_PAGES, MEM_RELEASE,
+    MEM_RESERVE, MEM_RESET, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+    VirtualFree, VirtualProtect, VirtualQuery,
 };
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
@@ -62,27 +63,30 @@ pub(super) unsafe fn alloc(
         // SAFETY: no preconditions.
         let large_min = unsafe { GetLargePageMinimum() };
         if large_min > 0 && try_alignment <= large_min && size >= large_min {
-            let lsize = align_up(size, large_min);
-            // SAFETY: NULL base + valid flags; failure returns null, handled.
-            let p = unsafe {
-                VirtualAlloc(ptr::null(), lsize, flags | MEM_LARGE_PAGES, PAGE_READWRITE)
-            };
-            // `is_multiple_of` on a RUNTIME divisor is a modulo, i.e. a real
-            // `div`. Same substitution as D7/D12/D19; this site was missed
-            // because it is Windows-only and every scan in that campaign read
-            // the Linux `.so`. `is_aligned_to`'s conservative direction is the
-            // safe one here: a `false` falls through to the aligned-reservation
-            // retry below rather than accepting a block.
-            if !p.is_null() && crate::bins::is_aligned_to(p as usize, try_alignment) {
-                return Ok(Alloc {
-                    ptr: p.cast(),
-                    is_large: true,
-                    is_zero: true,
-                });
-            }
-            if !p.is_null() {
-                // SAFETY: p is a whole mapping we just made and never exposed.
-                unsafe { VirtualFree(p, 0, MEM_RELEASE) };
+            // Unrepresentable large-page round-up falls through to normal pages
+            // (OH-rusty_alloc-29).
+            if let Some(lsize) = super::align_up_checked(size, large_min) {
+                // SAFETY: NULL base + valid flags; failure returns null, handled.
+                let p = unsafe {
+                    VirtualAlloc(ptr::null(), lsize, flags | MEM_LARGE_PAGES, PAGE_READWRITE)
+                };
+                // `is_multiple_of` on a RUNTIME divisor is a modulo, i.e. a real
+                // `div`. Same substitution as D7/D12/D19; this site was missed
+                // because it is Windows-only and every scan in that campaign read
+                // the Linux `.so`. `is_aligned_to`'s conservative direction is the
+                // safe one here: a `false` falls through to the aligned-reservation
+                // retry below rather than accepting a block.
+                if !p.is_null() && crate::bins::is_aligned_to(p as usize, try_alignment) {
+                    return Ok(Alloc {
+                        ptr: p.cast(),
+                        is_large: true,
+                        is_zero: true,
+                    });
+                }
+                if !p.is_null() {
+                    // SAFETY: p is a whole mapping we just made and never exposed.
+                    unsafe { VirtualFree(p, 0, MEM_RELEASE) };
+                }
             }
             // fall through to normal pages
         }
@@ -107,15 +111,11 @@ pub(super) unsafe fn alloc(
     // re-reserve exactly there. Another thread can steal the range between the
     // two calls, hence the retry loop (upstream uses 3 tries as well).
     for _ in 0..3 {
-        // SAFETY: reserve-only of an oversized range; failure handled.
-        let probe = unsafe {
-            VirtualAlloc(
-                ptr::null(),
-                size + try_alignment,
-                MEM_RESERVE,
-                PAGE_NOACCESS,
-            )
+        let Some(over) = size.checked_add(try_alignment) else {
+            return Err(12); // ENOMEM: unrepresentable aligned-reserve (OH-rusty_alloc-29)
         };
+        // SAFETY: reserve-only of an oversized range; failure handled.
+        let probe = unsafe { VirtualAlloc(ptr::null(), over, MEM_RESERVE, PAGE_NOACCESS) };
         if probe.is_null() {
             return Err(last_error());
         }
@@ -153,6 +153,15 @@ pub(super) unsafe fn commit(ptr_: *mut u8, size: usize) -> Result<bool, PrimErro
     if p.is_null() {
         return Err(last_error());
     }
+    // `VirtualAlloc(NULL, …, MEM_COMMIT)` allocates a *new* region. If the
+    // OS did not commit exactly the requested address, release the stray
+    // mapping and refuse (OH-rusty_alloc-60).
+    if p != ptr_.cast() {
+        // SAFETY: `p` is a mapping the call above just created and nothing
+        // else has seen; releasing it whole is the only correct disposal.
+        let _ = unsafe { VirtualFree(p, 0, MEM_RELEASE) };
+        return Err(22);
+    }
     // Conservative: the range may include already-committed pages whose
     // contents persist, so we cannot promise zero (fresh pages ARE zero).
     Ok(false)
@@ -182,6 +191,40 @@ pub(super) unsafe fn protect(ptr_: *mut u8, size: usize, on: bool) -> Result<(),
     // is a valid local.
     let ok = unsafe { VirtualProtect(ptr_.cast(), size, new, &mut old) };
     if ok != 0 { Ok(()) } else { Err(last_error()) }
+}
+
+/// Whether `[ptr, ptr+size)` is reserved or committed (not `MEM_FREE`).
+pub(super) fn range_is_reserved(ptr: *const u8, size: usize) -> bool {
+    if ptr.is_null() || size == 0 {
+        return false;
+    }
+    let mut addr = ptr as usize;
+    let Some(end) = addr.checked_add(size) else {
+        return false;
+    };
+    while addr < end {
+        // SAFETY: `MEMORY_BASIC_INFORMATION` is plain data (pointers and
+        // integers); all-zero is a valid value of it.
+        let mut mbi = unsafe { core::mem::zeroed::<MEMORY_BASIC_INFORMATION>() };
+        // SAFETY: read-only query; the out-pointer is a live local of exactly
+        // the length passed.
+        let n = unsafe {
+            VirtualQuery(
+                addr as *const c_void,
+                &mut mbi,
+                core::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if n == 0 || mbi.State == MEM_FREE || mbi.RegionSize == 0 {
+            return false;
+        }
+        let region_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+        if region_end <= addr {
+            return false;
+        }
+        addr = region_end;
+    }
+    true
 }
 
 pub(super) fn numa_node_count() -> usize {

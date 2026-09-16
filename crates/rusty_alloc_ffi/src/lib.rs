@@ -23,6 +23,24 @@ use core::ffi::{c_int, c_void};
 
 use rusty_alloc::alloc;
 
+/// A null or misaligned out-parameter is not caller storage: a write through
+/// it is UB, so the call refuses it instead (OH-rusty_alloc-97…). Shape only —
+/// what a well-formed pointer points at is the C caller's, as for `free`.
+#[inline]
+fn out_mut<T>(p: *mut T) -> *mut T {
+    if p.is_null() || p.addr() & (core::mem::align_of::<T>() - 1) != 0 {
+        core::ptr::null_mut()
+    } else {
+        p
+    }
+}
+
+/// A null / misaligned C string is not readable input (OH-rusty_alloc-105…).
+#[inline]
+fn cstr_in<T>(p: *const T) -> *const T {
+    out_mut(p.cast_mut()).cast_const()
+}
+
 /// mimalloc ABI: `int mi_version(void)` — 20405 = v2.4.5 compatibility.
 #[unsafe(no_mangle)]
 pub extern "C" fn mi_version() -> c_int {
@@ -166,6 +184,7 @@ pub unsafe extern "C" fn mi_expand(p: *mut c_void, newsize: usize) -> *mut c_voi
 /// C contract: `s` is null or a valid NUL-terminated string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mi_strdup(s: *const core::ffi::c_char) -> *mut core::ffi::c_char {
+    let s = cstr_in(s);
     if s.is_null() {
         return core::ptr::null_mut();
     }
@@ -190,6 +209,7 @@ pub unsafe extern "C" fn mi_strndup(
     s: *const core::ffi::c_char,
     n: usize,
 ) -> *mut core::ffi::c_char {
+    let s = cstr_in(s);
     if s.is_null() {
         return core::ptr::null_mut();
     }
@@ -413,8 +433,10 @@ pub unsafe extern "C" fn mi_recalloc_aligned_at(
 // ---------------------------------------------------------------------------
 
 unsafe fn store_bs(out: *mut usize, p: *mut u8) {
+    let out = out_mut(out);
     if !out.is_null() {
-        // SAFETY: caller passed a valid out-pointer (C contract); p null → 0.
+        // SAFETY: out is plausible caller storage; p null → 0.
+        // A first-page lie used to AV (OH-rusty_alloc-99).
         unsafe {
             out.write(if p.is_null() {
                 0
@@ -466,6 +488,7 @@ pub unsafe extern "C" fn mi_urealloc(
 ) -> *mut c_void {
     // SAFETY: forwarded C contract throughout.
     unsafe {
+        let block_size_pre = out_mut(block_size_pre);
         if !block_size_pre.is_null() {
             block_size_pre.write(alloc::usable_size(p.cast()));
         }
@@ -483,6 +506,7 @@ pub unsafe extern "C" fn mi_urealloc(
 pub unsafe extern "C" fn mi_ufree(p: *mut c_void, block_size: *mut usize) {
     // SAFETY: forwarded C contract; usable read before the free.
     unsafe {
+        let block_size = out_mut(block_size);
         if !block_size.is_null() {
             block_size.write(alloc::usable_size(p.cast()));
         }
@@ -645,7 +669,10 @@ pub unsafe fn posix_memalign_impl(out: *mut *mut c_void, alignment: usize, size:
     // `x & (x - 1)` test; establishing `alignment >= size_of::<*mut _>()`
     // first makes the non-zero half redundant, so the second test reduces to
     // the single `and`. Same predicate, measured cheaper.
+    let out = out_mut(out);
     if out.is_null() || alignment < core::mem::size_of::<*mut c_void>() {
+        // A first-page lie used to malloc then write through 0x8
+        // (OH-rusty_alloc-97).
         return einval();
     }
     if alignment & (alignment - 1) != 0 {
@@ -701,10 +728,11 @@ pub unsafe extern "C" fn mi_reallocarray(p: *mut c_void, count: usize, size: usi
 /// `ptrp` must be a valid pointer-to-pointer; `*ptrp` as [`mi_realloc`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mi_reallocarr(ptrp: *mut c_void, count: usize, size: usize) -> c_int {
-    if ptrp.is_null() {
+    let slot: *mut *mut c_void = out_mut(ptrp.cast());
+    if slot.is_null() {
+        // A first-page lie used to read/write through 0x8 (OH-rusty_alloc-98).
         return 22; // EINVAL
     }
-    let slot: *mut *mut c_void = ptrp.cast();
     // SAFETY: slot valid per contract; realloc contract forwarded.
     unsafe {
         let np = alloc::reallocn((*slot).cast(), count, size);
@@ -747,18 +775,18 @@ pub unsafe extern "C" fn mi_aligned_offset_recalloc(
     unsafe { alloc::recalloc_aligned_at(p.cast(), newcount, size, alignment, offset).cast() }
 }
 
-/// `mi_free_size(p, size)` — sized free (fast-path exploitation is an M8
-/// brick; the size is verified under debug).
+/// `mi_free_size(p, size)` — sized free (the size is unused for the actual
+/// free; a lie is ignored, not an abort — OH-rusty_alloc-65).
 ///
 /// # Safety
 /// As [`mi_free`]; `size` ≤ the block's usable size.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mi_free_size(p: *mut c_void, size: usize) {
+    let _ = size;
+    // A lying size is ignored, not a debug_assert abort across extern "C"
+    // (OH-rusty_alloc-65). The size is unused for the actual free.
     // SAFETY: forwarded C contract.
-    unsafe {
-        debug_assert!(p.is_null() || size <= alloc::usable_size(p.cast()));
-        alloc::free(p.cast());
-    }
+    unsafe { alloc::free(p.cast()) };
 }
 
 /// `mi_free_size_aligned`.
@@ -767,8 +795,9 @@ pub unsafe extern "C" fn mi_free_size(p: *mut c_void, size: usize) {
 /// As [`mi_free_size`]; `p` must satisfy the alignment.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mi_free_size_aligned(p: *mut c_void, size: usize, alignment: usize) {
-    debug_assert!(p.is_null() || (p as usize).is_multiple_of(alignment.max(1)));
-    // SAFETY: forwarded C contract.
+    let _ = alignment;
+    // SAFETY: forwarded C contract. Alignment is unused for the free
+    // (OH-rusty_alloc-66).
     unsafe { mi_free_size(p, size) };
 }
 
@@ -778,7 +807,9 @@ pub unsafe extern "C" fn mi_free_size_aligned(p: *mut c_void, size: usize, align
 /// As [`mi_free`]; `p` must satisfy the alignment.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mi_free_aligned(p: *mut c_void, alignment: usize) {
-    debug_assert!(p.is_null() || (p as usize).is_multiple_of(alignment.max(1)));
+    let _ = alignment;
+    // A garbage alignment is a free, not a debug_assert abort across
+    // extern "C" (OH-rusty_alloc-66).
     // SAFETY: forwarded C contract.
     unsafe { alloc::free(p.cast()) };
 }
@@ -844,6 +875,12 @@ pub unsafe extern "C" fn mi_heap_destroy(heap: *mut MiHeap) {
 /// `heap` live and owned by the calling thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mi_heap_set_default(heap: *mut MiHeap) -> *mut MiHeap {
+    // A null / misaligned handle or the immortal empty box is refused, not
+    // installed: the next `malloc` on this thread would dereference it.
+    let heap = out_mut(heap);
+    if heap.is_null() || heap == rusty_alloc::init::empty_heap_box_ptr() {
+        return rusty_alloc::init::heap_box();
+    }
     // SAFETY: forwarded C contract.
     unsafe { rusty_alloc::init::set_default_heap(heap) }
 }
@@ -1005,6 +1042,7 @@ pub unsafe extern "C" fn mi_heap_strdup(
     heap: *mut MiHeap,
     s: *const core::ffi::c_char,
 ) -> *mut core::ffi::c_char {
+    let s = cstr_in(s);
     if s.is_null() {
         return core::ptr::null_mut();
     }
@@ -1029,6 +1067,7 @@ pub unsafe extern "C" fn mi_heap_strndup(
     s: *const core::ffi::c_char,
     n: usize,
 ) -> *mut core::ffi::c_char {
+    let s = cstr_in(s);
     if s.is_null() {
         return core::ptr::null_mut();
     }
@@ -1178,7 +1217,7 @@ pub unsafe extern "C" fn mi_heap_realloc_aligned_at(
         let usable = alloc::usable_size(p.cast());
         if newsize <= usable
             && newsize >= usable / 2
-            && rusty_alloc::bins::is_aligned_to(p as usize + offset, alignment)
+            && rusty_alloc::bins::is_aligned_at(p as usize, offset, alignment)
         {
             return p;
         }
@@ -1263,7 +1302,7 @@ pub unsafe extern "C" fn mi_heap_rezalloc_aligned_at(
         let usable = alloc::usable_size(p.cast());
         if newsize <= usable
             && newsize >= usable / 2
-            && rusty_alloc::bins::is_aligned_to(p as usize + offset, alignment)
+            && rusty_alloc::bins::is_aligned_at(p as usize, offset, alignment)
         {
             return p;
         }
@@ -1425,6 +1464,21 @@ fn area_to_c(a: &rusty_alloc::heap::AreaInfo) -> MiHeapArea {
     }
 }
 
+/// Null / misaligned / the empty sentinel is not a heap
+/// (OH-rusty_alloc-58 / 77).
+#[inline]
+unsafe fn heap_ptr(heap: *mut MiHeap) -> *mut rusty_alloc::heap::Heap {
+    // Null, misaligned, or the immortal empty box is "no heap". A well-formed
+    // handle is the caller's live heap per the C contract — the same trust
+    // `free` extends to a pointer it is handed.
+    let heap = out_mut(heap);
+    if heap.is_null() || heap == rusty_alloc::init::empty_heap_box_ptr() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: non-null, aligned, not the immortal empty box.
+    unsafe { (*heap).heap.get() }
+}
+
 /// `mi_heap_visit_blocks`.
 ///
 /// # Safety
@@ -1438,9 +1492,12 @@ pub unsafe extern "C" fn mi_heap_visit_blocks(
 ) -> bool {
     let Some(vf) = visitor else { return true };
     // SAFETY: forwarded C contracts; adapter re-wraps areas per call.
+    // A null / empty heap is "walk finished", not an abort (OH-rusty_alloc-58).
     unsafe {
-        let h = (*heap.cast_mut()).heap.get();
-        (*h).visit_blocks(visit_blocks, &mut |area, block, bsize| {
+        let Some(h) = heap_ptr(heap.cast_mut()).as_mut() else {
+            return true;
+        };
+        h.visit_blocks(visit_blocks, &mut |area, block, bsize| {
             let ca = area_to_c(area);
             vf(heap, &ca, block.cast(), bsize, arg)
         })
@@ -1482,8 +1539,13 @@ pub unsafe extern "C" fn mi_unsafe_heap_page_is_under_utilized(
     p: *mut c_void,
     perc_threshold: usize,
 ) -> bool {
-    // SAFETY: forwarded C contract.
-    unsafe { (*(*heap).heap.get()).page_under_utilized(p.cast(), perc_threshold) }
+    // SAFETY: forwarded C contract. Null / empty is false (OH-rusty_alloc-58).
+    unsafe {
+        let Some(h) = heap_ptr(heap).as_mut() else {
+            return false;
+        };
+        h.page_under_utilized(p.cast(), perc_threshold)
+    }
 }
 
 /// `mi_reserve_os_memory` / `_ex`.
@@ -1509,8 +1571,9 @@ pub unsafe extern "C" fn mi_reserve_os_memory_ex(
 ) -> c_int {
     match rusty_alloc::arena::reserve_os_memory_ex(size, commit, allow_large, exclusive) {
         Ok(id) => {
+            let arena_id = out_mut(arena_id);
             if !arena_id.is_null() {
-                // SAFETY: out-pointer valid per contract.
+                // SAFETY: out-pointer is plausible caller storage.
                 unsafe { arena_id.write(id) };
             }
             0
@@ -1570,8 +1633,9 @@ pub unsafe extern "C" fn mi_manage_os_memory_ex(
         exclusive,
     ) {
         Ok(id) => {
+            let arena_id = out_mut(arena_id);
             if !arena_id.is_null() {
-                // SAFETY: out-pointer valid per contract.
+                // SAFETY: out-pointer is plausible caller storage.
                 unsafe { arena_id.write(id) };
             }
             true
@@ -1587,22 +1651,34 @@ pub unsafe extern "C" fn mi_manage_os_memory_ex(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mi_arena_area(arena_id: c_int, size: *mut usize) -> *mut c_void {
     let (p, s) = rusty_alloc::arena::arena_area(arena_id);
+    let size = out_mut(size);
     if !size.is_null() {
-        // SAFETY: out-pointer valid per contract.
+        // SAFETY: out-pointer is plausible caller storage
+        // (OH-rusty_alloc-100).
         unsafe { size.write(s) };
     }
     p.cast()
 }
 
+const HUGE_OS_PAGE: usize = 1 << 30;
+
+fn huge_os_pages_bytes(pages: usize) -> Option<usize> {
+    pages.checked_mul(HUGE_OS_PAGE)
+}
+
 /// `mi_reserve_huge_os_pages_at` (+ `_ex`, `_interleave`, deprecated form):
 /// large-page arena reservations; NUMA placement recorded, not enforced (v1).
+/// Unsatisfiable `pages` is ENOMEM, not `pages * 1GiB` overflow (OH-rusty_alloc-14).
 #[unsafe(no_mangle)]
 pub extern "C" fn mi_reserve_huge_os_pages_at(
     pages: usize,
     _numa_node: c_int,
     _timeout_msecs: usize,
 ) -> c_int {
-    mi_reserve_os_memory(pages * (1 << 30), true, true)
+    match huge_os_pages_bytes(pages) {
+        Some(n) => mi_reserve_os_memory(n, true, true),
+        None => 12,
+    }
 }
 
 /// `mi_reserve_huge_os_pages_at_ex`.
@@ -1617,8 +1693,11 @@ pub unsafe extern "C" fn mi_reserve_huge_os_pages_at_ex(
     exclusive: bool,
     arena_id: *mut c_int,
 ) -> c_int {
-    // SAFETY: forwarded out-pointer contract.
-    unsafe { mi_reserve_os_memory_ex(pages * (1 << 30), true, true, exclusive, arena_id) }
+    match huge_os_pages_bytes(pages) {
+        // SAFETY: forwarded out-pointer contract.
+        Some(n) => unsafe { mi_reserve_os_memory_ex(n, true, true, exclusive, arena_id) },
+        None => 12,
+    }
 }
 
 /// `mi_reserve_huge_os_pages_interleave`.
@@ -1628,7 +1707,10 @@ pub extern "C" fn mi_reserve_huge_os_pages_interleave(
     _numa_nodes: usize,
     _timeout: usize,
 ) -> c_int {
-    mi_reserve_os_memory(pages * (1 << 30), true, true)
+    match huge_os_pages_bytes(pages) {
+        Some(n) => mi_reserve_os_memory(n, true, true),
+        None => 12,
+    }
 }
 
 /// deprecated `mi_reserve_huge_os_pages`.
@@ -1641,9 +1723,14 @@ pub unsafe extern "C" fn mi_reserve_huge_os_pages(
     _max_secs: f64,
     pages_reserved: *mut usize,
 ) -> c_int {
-    let r = mi_reserve_os_memory(pages * (1 << 30), true, true);
+    let r = match huge_os_pages_bytes(pages) {
+        Some(n) => mi_reserve_os_memory(n, true, true),
+        None => 12,
+    };
+    let pages_reserved = out_mut(pages_reserved);
     if !pages_reserved.is_null() {
-        // SAFETY: out-pointer valid per contract.
+        // SAFETY: out-pointer is plausible caller storage
+        // (OH-rusty_alloc-102).
         unsafe { pages_reserved.write(if r == 0 { pages } else { 0 }) };
     }
     r
@@ -1885,6 +1972,7 @@ pub unsafe extern "C" fn mi_process_info(
     // SAFETY: each out-pointer valid-or-null per contract.
     unsafe {
         let w = |p: *mut usize, v: usize| {
+            let p = out_mut(p);
             if !p.is_null() {
                 p.write(v)
             }
@@ -1910,8 +1998,12 @@ pub unsafe extern "C" fn mi_heap_guarded_set_sample_rate(
     sample_rate: usize,
     seed: usize,
 ) {
-    // SAFETY: forwarded C contract.
-    unsafe { (*(*heap).heap.get()).guarded_set_sample_rate(sample_rate, seed) };
+    // SAFETY: forwarded C contract. Null / empty is a no-op (OH-rusty_alloc-58).
+    unsafe {
+        if let Some(h) = heap_ptr(heap).as_mut() {
+            h.guarded_set_sample_rate(sample_rate, seed);
+        }
+    }
 }
 
 /// `mi_heap_guarded_set_size_bound`.
@@ -1920,8 +2012,12 @@ pub unsafe extern "C" fn mi_heap_guarded_set_sample_rate(
 /// `heap` live and owned by the calling thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mi_heap_guarded_set_size_bound(heap: *mut MiHeap, min: usize, max: usize) {
-    // SAFETY: forwarded C contract.
-    unsafe { (*(*heap).heap.get()).guarded_set_size_bound(min, max) };
+    // SAFETY: forwarded C contract. Null / empty is a no-op (OH-rusty_alloc-58).
+    unsafe {
+        if let Some(h) = heap_ptr(heap).as_mut() {
+            h.guarded_set_size_bound(min, max);
+        }
+    }
 }
 
 /// `mi_is_redirected` (Windows redirection is post-v1).
@@ -2054,6 +2150,11 @@ pub unsafe extern "C" fn mi_new_reallocn(
     }
 }
 
+/// Caller-provided `mi_realpath` storage is PATH_MAX bytes (MAX_PATH on
+/// Windows). A longer canonical path, or a smash past a short slot, is null —
+/// never an unbounded copy (OH-rusty_alloc-26).
+const REALPATH_MAX: usize = if cfg!(windows) { 260 } else { 4096 };
+
 /// `mi_realpath`: resolve to an absolute canonical path into allocated (or
 /// caller-provided) storage.
 ///
@@ -2065,7 +2166,11 @@ pub unsafe extern "C" fn mi_realpath(
     fname: *const core::ffi::c_char,
     resolved_name: *mut core::ffi::c_char,
 ) -> *mut core::ffi::c_char {
-    if fname.is_null() {
+    let fname = cstr_in(fname);
+    let raw_out = resolved_name;
+    let resolved_name = out_mut(resolved_name);
+    if fname.is_null() || (!raw_out.is_null() && resolved_name.is_null()) {
+        // Lying fname / out used to AV (OH-rusty_alloc-111 / 112).
         return core::ptr::null_mut();
     }
     // SAFETY: fname NUL-terminated per contract.
@@ -2076,6 +2181,9 @@ pub unsafe extern "C" fn mi_realpath(
         return core::ptr::null_mut();
     };
     let bytes = canon.to_string_lossy().into_owned().into_bytes();
+    if !resolved_name.is_null() && bytes.len() >= REALPATH_MAX {
+        return core::ptr::null_mut();
+    }
     let out = if resolved_name.is_null() {
         alloc::malloc(bytes.len() + 1)
     } else {
@@ -2103,7 +2211,21 @@ pub unsafe extern "C" fn mi_dupenv_s(
     size: *mut usize,
     name: *const core::ffi::c_char,
 ) -> c_int {
+    let buf = out_mut(buf);
+    let size = out_mut(size);
+    let name = cstr_in(name);
     if buf.is_null() || name.is_null() {
+        // Fail-closed outs on EINVAL (OH-rusty_alloc-16).
+        // A first-page name used to AV in CStr::from_ptr (OH-rusty_alloc-113).
+        if !buf.is_null() {
+            // SAFETY: `buf` passed `out_mut` (non-null, aligned); the CRT
+            // contract makes it writable.
+            unsafe { buf.write(core::ptr::null_mut()) };
+        }
+        if !size.is_null() {
+            // SAFETY: as `buf`.
+            unsafe { size.write(0) };
+        }
         return 22;
     }
     // SAFETY: name NUL-terminated per contract; out-pointers valid.
@@ -2141,6 +2263,7 @@ pub unsafe extern "C" fn mi_dupenv_s(
 /// `s` null or NUL-terminated wide string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mi_wcsdup(s: *const u16) -> *mut u16 {
+    let s = cstr_in(s);
     if s.is_null() {
         return core::ptr::null_mut();
     }
@@ -2177,7 +2300,19 @@ pub unsafe extern "C" fn mi_wdupenv_s(
     size: *mut usize,
     name: *const u16,
 ) -> c_int {
+    let buf = out_mut(buf);
+    let size = out_mut(size);
+    let name = cstr_in(name);
     if buf.is_null() || name.is_null() {
+        if !buf.is_null() {
+            // SAFETY: `buf` passed `out_mut` (non-null, aligned); the CRT
+            // contract makes it writable.
+            unsafe { buf.write(core::ptr::null_mut()) };
+        }
+        if !size.is_null() {
+            // SAFETY: as `buf`.
+            unsafe { size.write(0) };
+        }
         return 22;
     }
     // SAFETY: contracts as documented.

@@ -399,7 +399,12 @@ pub const fn good_region_size(budget: usize) -> usize {
 pub const fn region_for(usable: usize) -> usize {
     let seg = crate::types::SEGMENT_SIZE;
     let segments = if usable == 0 { 1 } else { usable.div_ceil(seg) };
-    segments * seg
+    // Unrepresentable `usable` is 0, matching [`region_for_allocs`]. A region
+    // of 0 is refused by [`init_region`].
+    match segments.checked_mul(seg) {
+        Some(bytes) => bytes,
+        None => 0,
+    }
 }
 
 /// What one allocation of a given size costs, and which path serves it —
@@ -449,9 +454,18 @@ pub const fn shape_of(size: usize) -> Shape {
         MEDIUM_PAGE_SIZE
     } else if size <= LARGE_OBJ_SIZE_MAX {
         // Its own span of whole slices inside a shared segment.
-        size.div_ceil(SEGMENT_SLICE_SIZE) * SEGMENT_SLICE_SIZE
+        match size
+            .div_ceil(SEGMENT_SLICE_SIZE)
+            .checked_mul(SEGMENT_SLICE_SIZE)
+        {
+            Some(n) => n,
+            None => 0,
+        }
     } else {
-        dedicated * crate::types::SEGMENT_SIZE
+        match dedicated.checked_mul(crate::types::SEGMENT_SIZE) {
+            Some(n) => n,
+            None => 0,
+        }
     };
     Shape {
         page_bytes,
@@ -495,7 +509,16 @@ pub const fn dedicated_segments(size: usize) -> usize {
     // rounded up to whole segments because the reservation must start on a
     // segment stride. Page-rounding inside `huge_alloc` cannot change this
     // count, since a segment is a whole number of pages.
-    (crate::types::SEGMENT_SLICE_SIZE + size).div_ceil(crate::types::SEGMENT_SIZE)
+    //
+    // Overflow is `usize::MAX`, not 0: 0 already means "shares", and a
+    // firmware `assert!(dedicated_segments(size) <= 1)` must fail closed on
+    // an unrepresentable size (OH-rusty_alloc-33).
+    let slice = crate::types::SEGMENT_SLICE_SIZE;
+    let seg = crate::types::SEGMENT_SIZE;
+    match slice.checked_add(size) {
+        Some(need) => need.div_ceil(seg),
+        None => usize::MAX,
+    }
 }
 
 /// The smallest region that can hold `count` simultaneously-live allocations
@@ -1228,6 +1251,14 @@ pub(super) unsafe fn reset(_ptr: *mut u8, _size: usize) -> Result<(), PrimError>
 /// No MMU. Fail loudly rather than pretend — same reasoning as the wasm arm.
 pub(super) unsafe fn protect(_ptr: *mut u8, _size: usize, _on: bool) -> Result<(), PrimError> {
     Err(FERR)
+}
+
+pub(super) fn range_is_reserved(ptr: *const u8, size: usize) -> bool {
+    let start = ptr as usize;
+    let Some(last) = start.checked_add(size.saturating_sub(1)) else {
+        return false;
+    };
+    region_contains(start) && region_contains(last)
 }
 
 pub(super) fn numa_node_count() -> usize {

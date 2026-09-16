@@ -135,11 +135,16 @@ fn my_heap() -> *mut Heap {
 /// What it buys: every test, every Miri run, every fuzz iteration and every
 /// debug-built consumer now turns "mysterious corruption later" into "this
 /// pointer was not ours, at this call". That is where the bug is findable.
+///
+/// The check is `assert!`, not `debug_assert!`. A `debug_assert!` inside this
+/// cfg compiles OUT of `--release --features debug_checks`, which made the
+/// feature vacuous in exactly the build a consumer enables it for
+/// (OH-rusty_alloc-7).
 #[inline(always)]
 fn debug_foreign_pointer_guard(p: *mut u8) {
     #[cfg(any(debug_assertions, feature = "debug_checks"))]
     {
-        debug_assert!(
+        assert!(
             crate::segment_map::contains(p),
             "rusty_alloc: free() called on a pointer this allocator never returned \
              ({p:p} is not in any registered segment window). A foreign pointer here \
@@ -406,15 +411,15 @@ pub fn mallocn(count: usize, size: usize) -> *mut u8 {
     }
 }
 
-/// Small-size fast entry (`mi_malloc_small`): caller guarantees ≤ 1 KiB.
+/// Small-size fast entry (`mi_malloc_small`): the caller promises ≤ 1 KiB.
+/// An oversize request is a full `malloc`, not a `debug_assert!` — this is a
+/// public entry, and `heap_malloc_small` already forwarded (OH-rusty_alloc-62).
 pub fn malloc_small(size: usize) -> *mut u8 {
-    debug_assert!(size <= SMALL_SIZE_MAX);
     malloc(size)
 }
 
-/// Zeroed small-size fast entry (`mi_zalloc_small`).
+/// Zeroed small-size fast entry (`mi_zalloc_small`). As [`malloc_small`].
 pub fn zalloc_small(size: usize) -> *mut u8 {
-    debug_assert!(size <= SMALL_SIZE_MAX);
     zalloc(size)
 }
 
@@ -642,7 +647,7 @@ pub unsafe fn realloc_aligned_at(
     let usable = unsafe { usable_size(p) };
     if newsize <= usable
         && newsize >= usable / 2
-        && crate::bins::is_aligned_to(p.addr() + offset, align)
+        && crate::bins::is_aligned_at(p.addr(), offset, align)
     {
         stat_realloc(true);
         return p;
@@ -715,7 +720,7 @@ pub unsafe fn rezalloc_aligned_at(
     let usable = unsafe { usable_size(p) };
     if newsize <= usable
         && newsize >= usable / 2
-        && crate::bins::is_aligned_to(p.addr() + offset, align)
+        && crate::bins::is_aligned_at(p.addr(), offset, align)
     {
         stat_realloc(true);
         return p;

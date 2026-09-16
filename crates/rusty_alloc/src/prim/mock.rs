@@ -85,6 +85,27 @@ pub(super) unsafe fn protect(_ptr: *mut u8, _size: usize, _on: bool) -> Result<(
     Ok(())
 }
 
+pub(super) fn range_is_reserved(ptr: *const u8, size: usize) -> bool {
+    let start = ptr as usize;
+    let Some(end) = start.checked_add(size) else {
+        return false;
+    };
+    let Ok(reg) = registry().lock() else {
+        return false;
+    };
+    let mut a = start;
+    while a < end {
+        let Some((&base, layout)) = reg.iter().find(|(&b, l)| a >= b && a - b < l.size()) else {
+            return false;
+        };
+        a = base.saturating_add(layout.size());
+        if a <= start {
+            return false;
+        }
+    }
+    true
+}
+
 pub(super) fn numa_node_count() -> usize {
     1
 }
