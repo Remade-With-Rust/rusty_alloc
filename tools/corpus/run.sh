@@ -23,6 +23,18 @@
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 work="${TMPDIR:-/tmp}/ra-corpus"
+# The copies must live OUTSIDE this repository, for two reasons that each made
+# a run lie (2026-09-25, with TMPDIR under this repo's `target/`): `repoint`
+# skips every path containing `/target/`, so no manifest was rewritten and the
+# candidates quietly built the crates.io allocator and PASSED; and a copy with
+# no workspace root of its own walked up into this repo's `[workspace]` and
+# failed to build at all.
+mkdir -p "$work"
+case "$(cd "$(dirname "$work")" 2>/dev/null && pwd -P)/" in
+  "$(cd "$root" && pwd -P)"/*)
+    echo "refusing: work dir $work is inside $root -- set TMPDIR elsewhere" >&2
+    exit 2 ;;
+esac
 mode="check"
 [ "${1:-}" = "--test" ] && mode="test"
 
@@ -47,6 +59,11 @@ orig = s
 # `name = { version = "...", ... }` -> keep the rest, swap in a path
 def patch(m):
     name, body = m.group(1), m.group(2)
+    # `{ workspace = true }` inherits from the root, which is rewritten on its
+    # own; adding a `path` here makes an entry cargo should reject (seen on
+    # rusty_maplibre's rmap-alloc, 2026-09-25).
+    if re.search(r'\bworkspace\s*=\s*true', body):
+        return m.group(0)
     tgt = api if 'api' in name else alloc
     body = re.sub(r'version\s*=\s*"[^"]*"\s*,?\s*', '', body)
     body = body.strip().strip(',').strip()
@@ -60,6 +77,44 @@ if s != orig:
     open(path, 'w', encoding='utf-8').write(s)
 PY
     done
+}
+
+# Consumers that reach us THROUGH the `rusty_alloc_default` shim (rusty_zstd)
+# name no `rusty_alloc*` crate themselves, so `repoint` leaves them on the
+# published shim — and the published shim pins the crates.io allocator. Until
+# 2026-09-25 their candidate therefore tested the release, not this tree. Patch
+# the shim to a copy of the local checkout that IS repointed. A
+# `[patch.crates-io]` is legal here: the local shim carries the same version.
+SHIM_SRC="${RA_SHIM_SRC:-$root/../rusty_alloc_default}"
+patch_shim() {
+  local tree="$1"
+  grep -rqsE --include=Cargo.toml --exclude-dir=target '^rusty_alloc_default\s*=' "$tree" || return 0
+  # The shim is a consumer in its own right; it is repointed directly.
+  grep -qE '^name\s*=\s*"rusty_alloc_default"' "$tree/Cargo.toml" 2>/dev/null && return 0
+  local shim="$work/_shim"
+  if [ ! -d "$shim" ]; then
+    [ -d "$SHIM_SRC" ] || { echo "  (no $SHIM_SRC to patch the shim with)" >&2; return 0; }
+    mkdir -p "$shim"
+    (cd "$SHIM_SRC" && tar -cf - --exclude=./target --exclude=./.git .) | (cd "$shim" && tar -xf -)
+    repoint "$shim"
+  fi
+  local p; p="$(cygpath -m "$shim" 2>/dev/null || echo "$shim")"
+  if grep -q '^\[patch.crates-io\]' "$tree/Cargo.toml"; then
+    sed -i "/^\[patch.crates-io\]/a rusty_alloc_default = { path = \"$p\" }" "$tree/Cargo.toml"
+  else
+    printf '\n[patch.crates-io]\nrusty_alloc_default = { path = "%s" }\n' "$p" >> "$tree/Cargo.toml"
+  fi
+}
+
+# Did the candidate actually build THIS tree? A registry `source` on any
+# rusty_alloc crate in its lock means no — and such a row used to PASS.
+resolved_from_registry() {
+  local lock="$1/Cargo.lock"
+  [ -f "$lock" ] || return 1
+  awk '/^name = "rusty_alloc(-api)?"$/ { n = 1; next }
+       n && /^source = "registry/ { bad = 1 }
+       /^$/ { n = 0 }
+       END { exit !bad }' "$lock"
 }
 
 # Some consumers live in a workspace whose ROOT is not in this checkout --
@@ -141,9 +196,17 @@ run_one() {
   copy_tree "$dst"
   [ "${synth:-}" = "yes" ] && synth_workspace "$dst"
   repoint "$dst"
+  patch_shim "$dst"
   local cand_out cand_rc
   cand_out="$(cd "$dst" && cargo "$mode" --quiet "${fargs[@]}" 2>&1)"
   cand_rc=$?
+
+  if resolved_from_registry "$dst"; then
+    echo "  NOT-REPOINTED  the candidate resolved rusty_alloc from crates.io -- this row tests nothing"
+    ROWS+=("NOT-REPOINTED|$name|candidate still built the crates.io allocator")
+    fail=$((fail + 1))
+    return
+  fi
 
   if grep -q "failed to find a workspace root" <<<"$base_out"; then
     echo "  SKIP  workspace root absent from this checkout -- cannot answer here"
