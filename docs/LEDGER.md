@@ -4,6 +4,567 @@ One entry per milestone/brick: what landed, the numbers with their method lines,
 what was reverted and **which kind** of revert (measured-worse vs within-noise).
 Newest first.
 
+## DOWNSTREAM CORPUS — real consumers on this tree after four curiosity rounds (2026-09-25)
+
+Every consumer below built against THIS working tree, verified per row from
+the candidate's `Cargo.lock` (`rusty_alloc` 2.2.0 by path, no registry
+source) — a check the harness did not have, and whose absence had let two
+rows pass while testing the crates.io allocator (`tools/corpus/README.md`,
+lessons 5–7).
+
+| check | platform | result |
+|---|---|---|
+| `tools/corpus/run.sh --test`: spacedb-sdk, spacedb-sdk `secure`, rusty_alloc_default, rusty_zstd, spacedb published mirror | Windows | **5 PASS** |
+| same: rusty_maplibre | Windows | FAIL on the known 2.0.0 `no_std` break; with the documented migration, **1,199 passed, 0 failed** |
+| spacedb-sdk and `secure`, rusty_zstd (C cross tests vs zstd 1.5.7) | Linux | 12 + 12 + **174 passed, 0 failed** |
+| SpaceDB whole workspace, this tree `LD_PRELOAD`ed into every test binary | Linux | **314 passed, 0 failed** |
+| rusty_zstd whole workspace (lib/bins/tests), preloaded | Linux | **194 passed, 0 failed** |
+| Silesia, 12 files × levels 1/3/9/19 plus `-T4`, through `rzstd` | Windows and Linux | **60 + 60 cases, 0 failures** |
+
+The Silesia check, per file and level: this tree's `rzstd` compresses
+**byte-identically** to the same CLI on the published allocator (2.0.5), its
+frame decodes to the original through itself and through C zstd, and it
+decodes C zstd's own frame. The `-T4` runs put cross-thread frees under a
+real multi-threaded workload.
+
+Not ours, reported for the owners: rusty_zstd's ignored
+`encode::tests::size_table_silesia` panics at `encode/tables.rs:850`, a
+`debug_assert!` on the 24-bit position field of a packed chain head, when a
+debug build reaches the 51 MB `mozilla`. It fails identically on the system
+allocator (control run), and release builds, which skip the assertion,
+round-trip `mozilla` at every level above. SpaceDB's ignored set is five
+README snippets marked `ignore`, not runtime tests.
+
+## CURIOSITY, ROUND FOUR — five more, and the allocator column that saw a quarter of the allocator (2026-09-25)
+
+**The instrument first, because it changes how every earlier entry reads.**
+The "allocator-only Ir" column that rounds one to three quote summed the
+lines of `callgrind_annotate` that carry the library's `[object]` tag — and
+annotate prints that tag only on a function's FIRST line. Code inlined from
+another source file (`page.rs` into `malloc`, `init.rs`'s TLS read, the
+`page_extend` loop inside `grow_front`) prints untagged and was never
+counted. On perl the column read 6.62 M; the allocator's real self cost is
+**24.66 M**. The column is now an exact sum over the raw callgrind file by
+each function's object (`objir.awk`: object names are compressed and may
+first appear on a `cob=` line; the inclusive line after each `calls=` is
+skipped), and it agreed to the instruction with whole-program Ir on the
+brick that exposed it (perl −26,655 both ways, where the old column read
++0). Consequences for the earlier entries: every allocator-only DELTA quoted
+there was a real saving but a subset of the true one, and every percentage
+was taken against a base about 3–4x too small — lua's "40 % lighter" in
+round one, lua −3.8 % and jq −2.4 % in round two. The whole-program columns,
+which decided perl, sqlite and python, are unaffected.
+
+| instrument | before | after | Δ |
+|---|---:|---:|---:|
+| opscan `aligned` | 92.13 | 83.69 | **−9.2 %** |
+| opscan `big` / `large` | 95.50 | 92.00 | −3.7 % |
+| opscan `mixed` | 95.58 | 92.70 | −3.0 % |
+| C++ `alignednew` (new, `bench/alignednew.cpp`) | 149.04 | 145.16 | −2.6 % |
+| Rust `overaligned` (new), per 20,000 steps | 1,784,927 | 1,349,905 | **−24.4 %** |
+| one-line `sort`, whole process | 1,371,706 | 1,349,222 | −1.6 % |
+
+| program | exact allocator Δ | whole-program Δ |
+|---|---:|---:|
+| perl | −35,612 | −53,352 |
+| sqlite | −12,128 | −29,628 |
+| python | −9,858 | −25,651 |
+| gawk | −9,390 | −27,548 |
+| lua | −9,002 | (moves run to run) |
+| jq | −8,992 | (moves run to run) |
+
+**The five:**
+
+1. **The options pass walks the environment once** (`options.rs`,
+   `prim::env_for_each`, Linux). 38 options under two prefixes were 76
+   `getenv` calls, each walking the whole environment: 27,011 instructions
+   on the first allocation of every process, 17,372 of them inside libc — 2 %
+   of a one-line `sort`, and 77 % of all the allocator work that process did.
+   One walk that looks only at entries starting with either prefix keeps the
+   old semantics exactly (first occurrence wins, a value too long for the
+   buffer reads as unset and falls back to `MIMALLOC_`, an unparsable
+   `RUSTY_ALLOC_` value keeps the default); `tests/options_env.rs` now pins
+   those three, on the old path (Windows) and the new one (Linux). The saving
+   grows with the environment: this box's shell has 21 variables.
+2. **`malloc_aligned_pow2` is `#[inline]`**, so `posix_memalign` and
+   `GlobalAlloc` carry its fast path instead of calling it: `aligned` −8.44.
+3. **The medium arm pops before it collects** (`heap.rs`). When the front
+   page's free list is non-empty the collect changed nothing the pop needed,
+   but it tested the list, read the cross-thread word and re-loaded the list
+   first — eight instructions on every medium hit. `malloc`'s own fast path
+   already pops without collecting; remote frees are still collected, and the
+   latch still set, when the list runs dry. `big`/`large` −3.50, `mixed`
+   −2.88, perl −26,655.
+4. **C++ aligned `new` takes the pow2 fast path** (`rusty_alloc_ffi`):
+   `align_val_t` must be a power of two, tested the cheap way (`x & (x-1)`;
+   `is_power_of_two()` is a SWAR popcount without `popcnt`), with anything
+   else keeping the old checked route and its error. `alignednew` −3.88.
+5. **`GlobalAlloc::realloc` above two words keeps a block in place** when
+   the new size fits and at least half stays — `realloc`'s own rule, which
+   `mi_realloc_aligned` applies too. It used to allocate, copy and free every
+   time; when it must move it still copies only the layout's live bytes.
+   `overaligned` −24.4 %; `tests/natural_align.rs` walks a block through
+   twelve sizes at 64- and 4096-byte alignment checking alignment and bytes.
+
+**Refuted:** moving `collect_inner`'s per-queue body out of line so the bin
+scan keeps its pointer in a register (inlined, the body's calls spill it and
+every EMPTY queue pays a reload and a store — nine instructions per bin, twice
+per thread exit). The new `threads` workload gained 272 per thread, but the
+split changed inlining around the generic path's periodic collect and every
+opscan op got worse (`big`/`large` +4.00, `mixed` +2.89, perl +45,287,
+python +79,035). Noted at the site.
+
+**Looked at and left:** a recycled segment's 47 KB header `memset` is 76 %
+of a thread-churn workload's Ir, but glibc zeroes that size with `rep
+stosb`, which callgrind counts once per byte — an instrument inflation, not
+a target, and upstream zeroes the same header. jq retires ~700 emptied pages
+and re-carves them; upstream retires non-sole empty pages immediately too, so
+that is a memory policy, not a finding.
+
+**Gates:** Windows core suites at default, `debug_checks`, `secure` (144/0
+each), `blockmap` (146/0) and the small profile (143/0); api 8/0 on x86-64
+and on `i686-pc-windows-msvc`; ffi 8/0; Linux suites at default,
+`debug_checks` and `secure` (141/0 each) and the thread-heavy tests ten times
+each in release (0 failures); fmt clean; clippy clean on Windows and Linux
+apart from the known `ra_small_wsize` cfg warnings; unsafe census 963 (+16,
+each in `UNSAFE.md`).
+
+## CURIOSITY, ROUND THREE — five more, and the entry point no instrument could see (2026-09-24)
+
+Same discipline, one new instrument. Every instrument in this repository
+drives the allocator through its C ABI, but every Rust deliverable reaches it
+through `GlobalAlloc` — `__rust_alloc` and friends, generated in the crate that
+declares `#[global_allocator]` — and nothing measured that path. Two
+deterministic Rust workloads now do (`bench/rust-globalalloc.sh`: `maps`, hash
+maps plus B-trees plus strings; `trees`, boxed trees plus buffers plus `Rc`),
+read as whole-program Ir by the two-point estimator, with a checksum that must
+match between arms. The mimalloc oracle build was also scanned: it is slower
+than ours on every opscan op, so every target below came from our own code.
+
+| opscan | before | after | Δ |
+|---|---:|---:|---:|
+| **huge** | 629.00 | **293.00** | **−53.4 %** |
+| big / large | 100.00 | 95.50 | −4.5 % |
+| every other op | | | ±0.01 |
+
+| program | measure | before | after | Δ |
+|---|---|---:|---:|---:|
+| perl | whole | 772,938,946 | 772,484,781 | **−454,165** |
+| sqlite | whole | 316,086,544 | 316,030,456 | −56,088 |
+| python | whole | 512,666,763 | 512,625,101 | −41,662 |
+| jq | allocator | 5,563,583 | 5,523,229 | −40,354 |
+| Rust `trees` | whole, per 20,000 steps | 23,340,202 | 18,436,920 | **−21.0 %** (+2,080 B text) |
+| Rust `maps` | whole, per 20,000 steps | 28,164,304 | 26,820,518 | **−4.8 %** (+2,976 B text) |
+
+**The five:**
+
+1. **`page_extend` links at least four blocks** (`page.rs`, `MIN_EXTEND`), as
+   upstream's `MI_MIN_EXTEND` does. Ours had an implicit floor of one, so every
+   class above 1 KiB was carved one to three blocks per extend — on perl 8,990
+   of 10,639 extends linked ONE block, each a full generic trip (the remainder
+   loop ran 8,996 times over 8,990 calls). perl −453,584, sqlite −53,052,
+   `big`/`large` −4.50. The raised byte bound this site refuted in August cost
+   last-level misses (+2.2 % to +6.4 %); this floor, measured with cachegrind:
+   perl +4,487 D1 misses and **+9** LL, sqlite +55 D1 and +94 LL.
+2. **`GlobalAlloc` serves alignment up to two words from the natural classes**
+   (`rusty_alloc_api`, `NATURAL_ALIGN`). `bins::bin` rounds to even word
+   counts, so every block of two words or more is two-word aligned — 16 bytes
+   on x86-64, which is what hashbrown asks for on every table. Those layouts
+   took the aligned path on every allocation and allocate-copy-free on every
+   realloc; now they are `malloc`/`realloc` with a one-word request raised to
+   two words. `tests/natural_align.rs` pins it for every size to 4,200 plus
+   medium, large and huge, through alloc, alloc_zeroed and a realloc walk; with
+   the raise removed it fails on the first size-0 request. On a 32-bit target
+   an align-8 layout of four bytes or less was previously given a one-word
+   (4-byte) block; the two-word rule covers it.
+3. **`dealloc` carries the free body inline** with the non-null fact stated,
+   instead of a `jmp` to `free` and its null test: `maps` −230,000 at 40,000
+   steps, about four instructions per drop.
+4. **The `GlobalAlloc` methods are `#[inline]`**, as the `mimalloc` crate's
+   are. Without it each `__rust_*` shim loaded `&self`, shuffled arguments and
+   jumped through the GOT into an out-of-line method. With it the fast paths
+   land in the shims and in their callers: most of the Rust columns above.
+   Measured whole-program because an allocator-only filter undercounts once
+   the paths inline into the program's own functions.
+5. **`span_mark` skips interior slices that already point home**
+   (`segment.rs`). Every slice of every span in a normal segment points back to
+   its span start (`span_mark` is the only writer; `debug_validate_segment`
+   checks it), so a span taken from the FRONT of a free span, or a freed span
+   that did not merge left, already carries every interior marker. The loop
+   rewrote them anyway — 31 of 31 slices, twice, per 2 MiB allocate-and-free.
+   Now only slices whose span start moved are written. This keeps the
+   invariant the August assessment declined to weaken (it only stops
+   re-storing values that already satisfy it). **`huge` −336.00 (−53 %).**
+
+**Refuted:** resolving the old block's free in `realloc`'s move arm before
+the `memcpy` so the opaque call would not force a re-derivation (five
+instructions per move). `free` stayed byte-identical, but LLVM re-loaded the
+page index anyway and holding four values across the call cost a sixth
+callee-saved register: `realloc` +8.00, lua +240,221, python +302,857. Noted
+at the site. **Not built:** `mi_strndup` measures its length with a byte loop
+where `strnlen` would do; no workload calls it, so no instrument could see a
+change.
+
+**Gates:** Windows core suites at default, `debug_checks`, `secure` (144/0
+each), `blockmap` (146/0) and the small profile (143/0); api 7/0, and 7/0
+again on `i686-pc-windows-msvc`, where two words is 8 bytes; ffi 8/0; wasm32
+builds clean;
+Linux suites at default, `debug_checks` and `secure` (141/0 each) and the
+thread-heavy tests ten times each in release (0 failures); fmt clean; clippy
+clean apart from the known `ra_small_wsize` cfg warnings; unsafe census 947,
+unchanged.
+
+## CURIOSITY, ROUND TWO — ten more, a protocol change back to upstream's, and the instrument that lied about a tail jump (2026-09-24)
+
+Same method as the round below, with the real-program gate widened: four
+more programs (Python with every object through malloc, jq, gawk, sort;
+fixtures seeded, in a persistent WSL directory — `/tmp` is wiped when the VM
+stops, which once handed jq a missing file and a 25x-too-small profile), two
+more opscan ops (`shbench`, the sized C++ churn driver), and — after brick 7
+— a whole-program column beside the allocator-only one.
+
+**Cumulative, round one's final tree → this one** (opscan Ir/op; real
+programs whole-program Ir, exact for perl/sqlite/python; allocator-only Ir
+for lua and jq, whose whole count moves run to run):
+
+| opscan | before | after | Δ |
+|---|---:|---:|---:|
+| **xthread** | 112.59 | **77.29** | **−31.4 %** |
+| realloc | 248.37 | 231.20 | −6.9 % |
+| aligned | 94.50 | 92.13 | −2.5 % |
+| calloc | 94.82 | 93.19 | −1.7 % |
+| huge | 638.00 | 629.00 | −1.4 % |
+| big / large / mixed | 101 / 101 / 96.54 | 100 / 100 / 95.58 | −1.0 % |
+| every other op | | | −0.0 … −0.7 %, `usable` flat |
+
+| program | measure | before | after | Δ |
+|---|---|---:|---:|---:|
+| perl | whole | 773,394,562 | 772,937,623 | **−456,939** |
+| python | whole | 513,051,186 | 512,661,300 | **−389,886** |
+| sqlite | whole | 316,142,142 | 316,086,572 | −55,570 |
+| lua | allocator | 9,485,488 | 9,120,942 | −364,546 (−3.8 %) |
+| jq | allocator | 5,700,261 | 5,562,891 | −137,370 (−2.4 %) |
+
+**The ten:**
+
+1. **The OOM retry test moved to the exits that can fail** (`heap.rs`): the
+   walk's fresh-page carve and the large/huge arms, instead of the epilogue
+   of `malloc_generic_once`, where it sat after arms that cannot return
+   null. All seven programs improved; `huge` +1 (its arm tests itself).
+2. **`realloc` decides a move in one compare, and each move knows its copy
+   length** (`alloc.rs`): the two-sided in-place test had compiled
+   branch-free (`setbe`/`shr`/`setae`), so every move paid all of it. Lua's
+   moves are growths, Python's are shrinks below half (60,100 of 60,669).
+   opscan `realloc` −16.31; lua −301,818, python −125,709 allocator Ir.
+3. **The generic-collect countdown is one decrement** whose wrap means "was
+   zero" — a memory-destination `sub` and one branch instead of load, test,
+   branch, decrement, store: every program −708 … −59,630.
+4. **A remote free to a parked page releases FREEING to NORMAL, as upstream
+   does** (`page.rs::remote_free`; upstream `_mi_free_block_mt` sets
+   `MI_NO_DELAYED_FREE`). We restored DELAYED, so every later remote free to
+   that page took the three-CAS delayed route and the owner freed each block
+   through `drain_delayed` + `free_local_at`; after NORMAL they are one CAS
+   onto the page's list, collected in bulk. Single-block pages (large, huge)
+   keep DELAYED — never scanned, the delayed list is their only route.
+   **opscan `xthread` −26.6 %**; single-threaded code byte-identical. Gates:
+   the loom protocol model updated to mirror it plus a new
+   `delayed_then_normal_vs_owner` model (a parked page takes a delayed push
+   and then a list push while the owner drains and collects — no block lost,
+   page left scannable), all five models green; Linux suites at default,
+   `debug_checks` and `secure`, and the thread-heavy tests (`double_free`,
+   `stress_mt`, `abandon_rss`, `heaps`, `openheimer`, `teardown_reclaim`)
+   **ten times each in release, 0 failures**; Windows suites green.
+5. **`free_general` is frameless** (`alloc.rs`): `owner_heap`'s fallback —
+   `my_heap()`, which can create a heap — was a non-tail call inlined into
+   it, and that one call pinned a three-register frame on every general
+   free, remote ones included. The fallback is its own cold function
+   reached by a tail call: `xthread` −5.37, `huge` −6.
+6. **`Heap::huge_alloc` is out of line**: `segment::huge_alloc` returns its
+   `Result` through a stack slot, and inlined, that slot put `sub`/`add
+   %rsp` on EVERY generic trip. All seven programs improved (−104,976
+   allocator Ir).
+7. **`calloc`'s sentinel test moved into its miss** (`alloc.rs::zalloc`):
+   the fast path is `malloc`'s raw-read shape, where the sentinel's empty
+   direct table already routes to the slow path. `calloc` −1.31; python
+   **−110,119 whole-program**. See the instrument note below — the
+   allocator-only column read +300,948 for this brick.
+8. **The zero flag is a `u8` inside the generic chain** and a `bool` only at
+   `malloc_generic`: a `(*mut u8, bool)` pair return makes every caller
+   re-truncate the flag (`and $0x1,%dl`), which blocked the tail calls to
+   `grow_front` — the commonest generic outcome on a real program (jq:
+   10,307 of 11,229 trips) — and to the walk. perl −67,053, jq −65,005,
+   python −41,375, lua −21,826 whole-program; `aligned` +0.06 (its slow
+   path converts at the `Heap` boundary).
+9. **A medium miss grows the front page directly** (`heap.rs`): perl sent
+   7,707 generic trips into the medium arm and 7,693 missed — the front
+   page dry but not fully carved — and then ran the heartbeat, derived the
+   same bin again and collected the same page again before reaching
+   `grow_front`. **perl −317,649, jq −593,325, sqlite −35,351 whole-program;
+   opscan `big`/`large` +1.00, `mixed` +0.66** — a recorded trade, real
+   programs being the verdict when the two instruments disagree in sign
+   (round one reverted a split on the same rule). The first version computed
+   `wsize_from_size` for `grow_front` and cost the hit path +5; `w` is now
+   passed as "above the direct table", the only thing `grow_front` reads it
+   for.
+10. **`malloc_aligned_pow2`** for callers that have proven the alignment a
+    power of two — `posix_memalign` (which validates it for EINVAL) and
+    `GlobalAlloc` (whose `Layout` guarantees it): no second test. `aligned`
+    −2.00.
+
+**Refuted or not built this round:** `grow_front` as a tail call was first
+blocked by the pair-return truncation (#8 fixed that); a running-pointer
+`page_extend` is already a recorded refutation at the site; the span-marking
+split and the `bins::bin` rewrite stay refuted from round one; `stats.extends`
+stays live (release work-parity counter).
+
+**Instrument lesson — allocator-only Ir mis-attributes around a tail jump
+into another object.** Brick 7 moved `calloc`'s `jmp *memset` from
+`alloc::zalloc` into `alloc::calloc`; the per-object column then read python
+**+300,948** while per-instruction totals (1,401,231 → 1,290,107 on the
+calloc paths) and the whole-program count (−110,119) both said win.
+callgrind's call-stack bookkeeping charges instructions differently when a
+tail jump leaves the object. The gate now prints whole-program Ir beside the
+allocator column, and a brick whose two columns disagree is decided by the
+exact whole count.
+
+**Gates:** see the entry's commit. Also: the extended loom soak
+(`LOOM_EXTENDED=1`, two remotes vs the abandoner) does NOT pass — on this
+change or before it. It stops on loom's "Model exceeded maximum number of
+branches" (`max_branches = 100_000`) after 46 minutes with the new model and
+after 60 minutes with the committed one, so the overflow predates this
+change; no assertion (lost block, use-after-free) fired in either. A run of
+the new model with a tenfold budget was killed by the OS
+(`STATUS_IN_PAGE_ERROR`, a full system drive) before a verdict. No CI
+workflow runs loom at all; the test's comment claiming a nightly run was
+wrong and has been corrected. Open item: find why one execution runs past
+the budget (the two yield-spins on FREEING under a preemption bound are the
+suspect) and make the soak pass.
+
+## CURIOSITY — ten instruction wins, seven refutations, and lua's allocator 40 % lighter (2026-09-24)
+
+Hunted with the `rusty-curiosity` discipline: profile, descend one layer
+into the surprising number, read the siblings at the site, gate everything
+on an exact instrument. Built on top of the YOU SLOW, BRO entry below.
+
+**Instruments.** Both exact, both in WSL on this box (callgrind 3.26,
+rustc 1.97.1): the repo's `bench/opscan.c` two-point estimator, ra only, run
+three times identical to the hundredth before anything was measured; and the
+`icount-arms` real programs (perl and sqlite with the hash seed pinned, and
+lua) reduced to allocator-only self Ir by object — identical to the
+instruction across repeat runs, lua included. Per-instruction attribution
+came from `callgrind --dump-instr` joined to `objdump`. Every brick was
+built, scanned and put through the real-program gate before the next.
+
+**Cumulative, the tree at the start of this entry → the end:**
+
+| opscan op | before | after | Δ |
+|---|---:|---:|---:|
+| big / large | 121.00 | **101.00** | −16.5 % |
+| mixed | 110.81 | **96.54** | −12.9 % |
+| calloc | 107.57 | **94.82** | −11.9 % |
+| huge | 689.00 | **638.00** | −7.4 % |
+| med | 60.75 | 56.82 | −6.5 % |
+| realloc | 259.86 | 248.37 | −4.4 % |
+| small / small_touch | 54.39 / 60.39 | 52.27 / 58.27 | −3.9 % |
+| aligned | 97.88 | 94.50 | −3.5 % |
+| xthread, batch, liveset | | | −0.3 … −1.0 % |
+| usable | 22.00 | 22.00 | 0 |
+
+| real program, allocator Ir | before | after | Δ |
+|---|---:|---:|---:|
+| **lua** | 15,781,865 | **9,485,488** | **−39.9 %** |
+| perl | 7,124,383 | 7,002,677 | −1.7 % |
+| sqlite | 1,418,197 | 1,389,797 | −2.0 % |
+
+**The ten, in order kept** (each measured alone against the one before):
+
+1. **`options::get` swapped an atomic on every read** (`options.rs`). The
+   `huge` op showed 19 Ir/op in `ensure_init` — `span_free` reads
+   `purge_delay` per span, and every read was a locked `swap` behind a call.
+   Load-first, swap in the cold arm: `huge` −17.00.
+2. **A thread-local lookup hoisted above the test that guarded it**
+   (`options.rs`). `__tls_get_addr` on every slow-path allocation; the
+   disassembly loaded `DEFERRED_FUN` and called `__tls_get_addr` before
+   testing it. The re-entry guard moved into the cold hook caller: every op
+   improved, `huge` −20, `realloc` −3.44, `mixed` −2.50.
+3. **`malloc_slow` had lost its tail call** (`heap.rs`). Its own doc says
+   "this arm must stay a TAIL call"; the later reclaim-and-retry wrapper
+   tested the result, which put the call back in non-tail position (16 Ir
+   around a jump). The test moved into `malloc_generic_once`'s epilogue:
+   `big`/`large` −7, `mixed` −5.06, `calloc` −4.69.
+4. **`zalloc`'s miss pinned a frame on its hit path** (`heap.rs`). Out of
+   line and in tail position, the calloc fast path is a leaf ending in
+   `jmp memset`: `calloc` −4.56, perl −1,383.
+5. **The keep-one-warm test was three branches** (`alloc.rs`, the `free`
+   asm label block). `used | next | prev == 0` is one test: −2.00 on every
+   alloc/free pair op, `realloc` −6.00. The first attempt edited
+   `retire_or_abort` — the function the comment names — and was flat; the
+   profile showed the hot copy inline in the label block.
+6. **`realloc(NULL, n)` paid the move path's frame** (`alloc.rs`). Lua's
+   allocator routes EVERY allocation through `realloc`: 480,342 of 540,393
+   calls had a null pointer, and each pushed and popped five registers to
+   reach `malloc`. The null test now sits in front of the frame, with the
+   live-pointer body in `realloc_live(NonNull<u8>, ..)` — `NonNull` because
+   the raw-pointer split let two null tests back in (+11.84 on opscan
+   `realloc`). **lua allocator −6,233,185 (−39.6 %)**, opscan `realloc`
+   −0.16.
+7. **`span_free` read the purge option before testing the span length**
+   (`segment.rs`): `huge` −5, perl −924, lua −932, sqlite −296.
+8. **A constant flag materialised and re-tested** (`heap.rs`, the medium
+   collect-and-retry). `(stole, pop)` as a tuple made LLVM merge the collect
+   outcomes, then `xor`/`test` a flag that is constant on the hit path. The
+   latch is now stored inside the branch that knows it: `big`/`large` −5,
+   `mixed` −3.31, perl −23,085, sqlite −2,727.
+9. **The retry flag from #3 was a parameter** (`heap.rs`): a `mov $1` at the
+   call, a copy into a callee-saved register and a flag test before the null
+   test, on every generic trip. Now a thread-local read only on the OOM path:
+   every op improved (`huge` −6, `big`/`large` −4, `mixed` −2.89) and it
+   paid back #3's `aligned` +0.12; perl −56,937, lua −27,933, sqlite −10,020.
+10. **`stats.delayed_frees` was a release counter** (`heap.rs`): a
+    read-modify-write per drained cross-thread block that only the stats
+    printer reads. Debug-only, like `allocs`/`frees`: `xthread` −0.77.
+
+**Refuted, each recorded at its site with its number:**
+
+- **Frameless medium entry** (split the generic path so the medium
+  collect-and-retry skips the four-register frame): opscan `big`/`large`
+  −11, `mixed` −6.83 — and every other generic trip +8, so real programs
+  went WORSE: lua +31,945, perl +23,549, sqlite +15,997. The opscan table
+  alone would have shipped it.
+- **May-return abort in the collect walk**, to drop that entry's alignment
+  push: a call inside the loop keeps three values live; six-register frame,
+  `huge` +20. The trick only works in TAIL position.
+- **`(w | 1).leading_zeros()`** in `bins::bin` to drop the zero-input
+  fallback: LLVM keeps the `leading_zeros` form; `big` +1, `aligned` +0.69.
+- **Bin computed once** above both its uses in the generic path: live across
+  the heartbeat's calls, `big` +17, perl +101,962.
+- **Owner-table `fill`** split out of the span-marking loop: both loops got
+  cheaper and the function dearer (two unroll setups and remainders);
+  `huge` +28 with a sign flip by span length on real programs.
+- **A "table complete" flag** in `options::get` to skip the `i64::MIN`
+  sentinel: flat; the callers test the SIGN and LLVM already folds both into
+  one `js`.
+- **Debug-only `stats.extends`** — not built: the release bench prints it
+  as a work-parity counter (`rusty_alloc_bench` `COUNTERS`, the wasm speed
+  probe), the same reason `stats.generic` stays live. Likewise inlining
+  `malloc_aligned` into the C shims, already refuted at +4.56 (2026-08-21).
+
+**Instrument lessons.** Twice a library that was never rebuilt read "+0.00
+on every op": first the 9p mtimes from a Windows edit, then `cargo` not on
+`PATH` in a non-login shell, swallowed by `|| true`. The build helper now
+refuses to report unless the library file is newer, and prints a code
+checksum. And the per-instruction join is what found #2, #5, #6 and #8 —
+each was invisible at function granularity.
+
+**Gates.** See the commit; `cargo test -p rusty_alloc` at default,
+`debug_checks`, `secure`, `blockmap` and `--cfg ra_small_profile`;
+`rusty_alloc-api` (incl. the re-entrancy gate) and `rusty_alloc-ffi`;
+no_std `--cfg ra_single_threaded` check; clippy clean on the new code;
+fmt; unsafe census 931 → 934 (`realloc_live`'s signature and block, and the
+medium arm's collect/pop split into two blocks), each rowed in `UNSAFE.md`.
+**Not measured:** wall clock (a Windows box at 60–75 % foreign load), and
+mimalloc's arm — its opscan column is from earlier sessions.
+
+## YOU SLOW, BRO — a huge `realloc` copied its reservation, and 251 start-up allocations re-entered the allocator (2026-09-24)
+
+`docs/plans/youslowbro.md`, from `rusty_esp_sense` (a candle + rayon host
+pipeline) measuring `rusty_alloc-api` 2.2.0 against mimalloc 0.1.52 and the
+Windows heap on the patterns that pipeline produces: parity or better on 13 of
+16 workloads, one real loss, one start-up cost, two memory notes.
+
+**Finding 1 — `realloc` that MOVES a huge block: 1.41x / 1.23x mimalloc,
+0/6 pairs.** The report ruled out fresh huge allocation, reuse across sizes and
+several live huge blocks with its own probes, and left four candidates. It was
+B. `segment::huge_alloc` set the huge page's `block_size` to the whole
+chunk-rounded reservation minus the header — a 33 MB request lives in a 64 MiB
+chunk pair, a 64 MB one in 96 MiB — and `usable_size` is the length `realloc`
+copies when it moves. Growing 33 MB therefore copied, and first-touched on both
+sides, 64 MiB; growing 64 MB copied 96 MiB; `zalloc` on a recycled chunk
+zeroed the same. Pinned by a test before anything was timed:
+`tests/alloc_core.rs::huge_usable_size_is_the_request_not_the_reservation`
+(the usable size of a 33 MiB and a 64 MiB block is within one slice of the
+request, and a move preserves the whole of it). The fix is one line —
+`block_size = align_up(size, SEGMENT_SLICE_SIZE).min(capacity)`, upstream's
+`psize` — and the reservation is untouched, so nothing about placement,
+arena recycling or `huge_free` moves. Not A: the copy was `memcpy` on both
+sides. Not D: the paths were at parity in the report's own probe 3.
+
+**Static counts** (Windows x86-64 release, `cargo rustc --lib -- --emit asm`,
+HEAD worktree vs tree, instructions per symbol): `alloc::realloc` 163 → 163,
+`usable_size` 17 → 17, `free` 66 → 66, `page_extend` 42 → 42, `options::get`
+20 → 20; `segment::huge_alloc` 199 → 203 (cold; the `min` and the round-up);
+`options::ensure_init` 538 → 817 (runs once per process; the key-building loop
+is now inline where `format!` and `to_uppercase` were calls into `std`).
+
+**Timing, on the consumer's own probe** (`F:/janus-data/raprobe`, copied to
+scratch twice and patched through `[patch.crates-io]` to link the HEAD worktree
+and the tree; a third copy links mimalloc). Method: whole processes pinned to
+one core at High priority, ABBA with the leading arm swapped each round,
+best-of-N inside each run, median and minimum of the per-run bests, paired
+wins and z; the box sat at 62–76 % load from another process throughout, so
+the **null arm** (one binary in both arms, 6 rounds) is the floor: median
+ratios 0.89–1.03, no |z| ≥ 2. A verdict below needs |z| ≥ 2 AND a ratio
+outside ±10 %.
+
+| workload | HEAD | tree | ratio | tree wins | z |
+|---|---:|---:|---:|---:|---:|
+| realloc step 33 → 66 MB | 7.707 ms | **5.243 ms** | **0.680** | **8/8** | +2.83 |
+| realloc step 64 → 128 MB | 13.237 ms | **10.152 ms** | **0.767** | **8/8** | +2.83 |
+| `Vec` growth by push to 64 MB × 3 | 45.201 ms | **36.673 ms** | **0.811** | **6/6** | +2.45 |
+| realloc step 8 → 16 / 16 → 32 MB | | | 0.975 / 0.923 | 5/8, 6/8 | inside the floor |
+| fresh 16–128 MB buffers, per buffer | | | 0.97–1.06 | 1–4/6 | inside the floor (path untouched) |
+
+Against mimalloc afterwards, same method, 8 and 6 rounds: **33 → 66 MB 1.013
+(5/8, z +0.71) — parity, was 1.407 at 0/6; 64 → 128 MB 0.969 (7/8, z +2.12) —
+faster, was 1.233 at 0/6; `Vec` to 64 MB 1.015 (3/6) — parity, was 1.231 at
+0/6.** Fresh 30–64 MB buffers stay at 1.02–1.06 (the report's 1.01–1.04): the
+fix does not touch that path, and HEAD vs tree reads 3/6 there.
+
+**Finding 2 — 251 allocations through the global allocator on the first
+allocation of every process.** `options::ensure_init` built 38 x 2 environment
+keys with `to_uppercase` and `format!` and read them with `std::env::var`,
+each an owned `String`, inside the heap being set up. Now: the key is built in
+a stack buffer sized by the table (`KEY_CAP` is a `const` over
+`OPTION_NAMES`), read through the new `prim::getenv` — `libc::getenv` on unix,
+`GetEnvironmentVariableA` on Windows, the calls upstream's prim makes — into a
+64-byte stack buffer, and parsed in place; Miri and wasm32-wasip1 keep a
+`std::env` fallback, and wasm32-unknown-unknown keeps the pass compiled out so
+the size ratchet is unmoved by construction. **On the consumer's counting
+probe: 263 allocations at start-up → 12, and mimalloc reads 12 on the same
+probe.** Two tests: `tests/options_env.rs` (a child process with both
+prefixes, the precedence rule, the boolean grammar and KiB scaling set, read
+back through `options::get`) and `rusty_alloc_api/tests/reentrancy.rs` (a
+depth-counting `GlobalAlloc` around `RustyAlloc`: 395 calls, **0 re-entrant**;
+it would have read 251). Unsafe census 928 → 931: one FFI block per prim
+backend and one `set_var` in a test, each rowed in `UNSAFE.md`.
+
+**Not built, and why — `docs/opps.md` #10.** The old fat `usable_size` made a
+`realloc` that fit inside the reservation's slack free, and that went with
+the fix (upstream moves there too). Keeping it deliberately is a `HUGE_SEGMENT`
+test in the move arm: a load and a branch on EVERY moving `realloc`, which is
+the whole of the opscan `realloc` op, for a sub-2x grow of a block already
+above 32 MiB that no report has named — the doublings consumers hit never fit.
+Recorded with the hook, not built.
+
+**Memory notes (report §5).** README gained a *Memory* paragraph (freed memory
+stays committed by default, `purge_delay` = -1, the retained working set and
+how to purge). The consumer's `retain` probe reads identically before and
+after — 461 MB retained after freeing 456 MB of huge blocks, 492 MB with 45 MB
+of 224-byte blocks live, mimalloc 461 / 491 — and the mechanism is not a
+missing recycler: the chunks come back through the arena bitmap and a fresh
+segment takes one; what rises is first-touch of the pages a 38 MB block never
+wrote in its 64 MiB pair. Backlog as `docs/opps.md` #11.
+
+**Gates.** `cargo test -p rusty_alloc` 144 passed / 0 failed (default), plus
+`--features debug_checks` and `--features secure`; `rusty_alloc-api` tests
+including the new re-entrancy gate; clippy clean on the new code (the tree
+also carries `unexpected_cfgs` warnings for an unregistered `ra_small_wsize`
+knob from uncommitted work outside this campaign, in `types.rs` and
+`prim/fixed.rs`); `cargo fmt --check`; `tools/unsafe-census.sh --update`.
+**Not measured:** callgrind — this is a Windows box; the icount farm re-reads
+the opscan `realloc` and `huge` ops, where the static counts above predict
+0 and +4.
+
 ## OPENHEIMER, SPLIT — 202 findings, 139 withdrawn as hot-path tax; the one fix the log claimed and never wrote (2026-09-16)
 
 `docs/plans/openheimer-run.md`, from the campaign's red log

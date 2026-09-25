@@ -8,3 +8,6 @@
 .DS_Store
 /benchmark-*.txt
 /.claude/
+
+# Standalone bench crates (their own workspaces) build next to themselves.
+bench/*/target/

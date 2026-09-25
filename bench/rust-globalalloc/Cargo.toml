@@ -1,0 +1,18 @@
+# Deterministic Rust workloads for the `GlobalAlloc` entry points
+# (`rusty_alloc_api::RustyAlloc`), which no C instrument in this repository
+# reaches: `__rust_alloc` and friends, hashbrown's 16-byte-aligned tables,
+# over-aligned realloc, and the drop path. Standalone (its own workspace) so the
+# main build never compiles it. Run `bench/rust-globalalloc.sh` under WSL/Linux.
+[package]
+name = "rust-globalalloc"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+rusty_alloc-api = { path = "../../crates/rusty_alloc_api" }
+
+[profile.release]
+debug = true

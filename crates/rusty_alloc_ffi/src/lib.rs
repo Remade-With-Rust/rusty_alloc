@@ -678,7 +678,9 @@ pub unsafe fn posix_memalign_impl(out: *mut *mut c_void, alignment: usize, size:
     if alignment & (alignment - 1) != 0 {
         return einval(); // not a power of two
     }
-    let p = alloc::malloc_aligned(size, alignment);
+    // SAFETY: `alignment` was proven a power of two just above, which is the
+    // one precondition `malloc_aligned_pow2` adds — it skips re-testing it.
+    let p = unsafe { alloc::malloc_aligned_pow2(size, alignment) };
     if p.is_null() {
         return enomem();
     }
@@ -2082,7 +2084,21 @@ pub extern "C" fn mi_new_aligned(size: usize, alignment: usize) -> *mut c_void {
 /// Sibling of [`new_impl`].
 #[inline]
 pub fn new_aligned_impl(size: usize, alignment: usize) -> *mut c_void {
-    let p = alloc::malloc_aligned(size, alignment);
+    // C++ requires `align_val_t` to be a power of two; test it the cheap way
+    // (`x & (x - 1)`: `is_power_of_two()` is a SWAR popcount without
+    // `popcnt`) and take the inline `malloc_aligned_pow2` fast path, as
+    // `posix_memalign` does. Anything else keeps the old route and its error.
+    // Measured on `bench/alignednew.cpp`: see the LEDGER, CURIOSITY ROUND FOUR.
+    #[allow(
+        clippy::manual_is_power_of_two,
+        reason = "is_power_of_two() is a SWAR popcount here; see above"
+    )]
+    let p = if alignment != 0 && alignment & (alignment - 1) == 0 {
+        // SAFETY: `alignment` was just shown to be a power of two.
+        unsafe { alloc::malloc_aligned_pow2(size, alignment) }
+    } else {
+        alloc::malloc_aligned(size, alignment)
+    };
     if p.is_null() {
         new_aligned_oom();
     }

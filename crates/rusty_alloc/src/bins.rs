@@ -32,7 +32,16 @@ pub fn bin(size: usize) -> usize {
     } else {
         // Four bins per power of two: index by the top bit and the next two.
         let w = wsize - 1;
-        let b = (usize::BITS - 1 - w.leading_zeros()) as usize; // bsr(w)
+        // bsr(w).
+        //
+        // NOTE (2026-09-24, REFUTED): `(w | 1).leading_zeros()`, to let LLVM
+        // see a non-zero input and drop the zero-input fallback (`mov $0x7f`
+        // before the `bsr`) on the generic path's medium trip, removed the
+        // `mov` and added a register copy and the `or`; LLVM keeps the
+        // `leading_zeros` form either way (`bsr; xor $0x3f`) because the shift
+        // count and the bin index are both derived from it. Opscan `big`
+        // +1.00, `aligned` +0.69, `mixed` +0.72. Leave it as written.
+        let b = (usize::BITS - 1 - w.leading_zeros()) as usize;
         ((b << 2) + ((w >> (b - 2)) & 0x03)) - 3
     }
 }

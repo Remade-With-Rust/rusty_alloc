@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Growing a huge block with `realloc` copied its whole reservation.** A
+  huge segment's page reported its usable size as the chunk-rounded
+  reservation minus the header — 64 MiB for a 33 MB request, 96 MiB for a
+  64 MB one — and `realloc` copies `usable_size` bytes when it moves a block,
+  so growing a 33 MB block copied, and first-touched on both sides, twice what
+  the caller had written; `zalloc` on a recycled chunk zeroed the same extent.
+  A consumer measured the two `realloc` steps that cross the segment size at
+  **1.41x and 1.23x mimalloc, 0/6 pairs**, with every step below it faster
+  than mimalloc, and a `Vec` pushed to 64 MB at 1.23x
+  (`docs/plans/youslowbro.md` §3). The page now reports the request rounded
+  up to a slice — upstream's `psize`, and what `mi_usable_size` returns there
+  — while the reservation itself is unchanged. On the consumer's own
+  harness, pinned and ABBA-paired against the tree before the fix: see the
+  LEDGER entry for the numbers. `tests/alloc_core.rs::huge_usable_size_is_the_request_not_the_reservation`
+  pins the reported size and the bytes a move preserves.
+- **The options pass made 251 allocations through the global allocator on
+  the first allocation of every process.** `options::ensure_init` built its
+  38 x 2 environment keys with `to_uppercase` and `format!` and read them with
+  `std::env::var`, every one an owned `String` — inside the heap that was
+  still being set up, and on every short CLI run. mimalloc makes none. The
+  keys are now built in a stack buffer sized by the table and read through
+  `prim::getenv` (a raw `getenv` / `GetEnvironmentVariableA`, the calls
+  upstream's prim makes) into a second stack buffer, and the value grammar is
+  parsed in place. On the consumer's counting probe the process's start-up
+  went from **263 allocations to 12, which is exactly what mimalloc reads
+  there**. `tests/options_env.rs` proves the variables still arrive (both
+  prefixes, precedence, the boolean grammar, KiB scaling) from a child
+  process, and `rusty_alloc_api/tests/reentrancy.rs` fails the build if the
+  allocator ever allocates through the global allocator again while serving
+  a request (`docs/plans/youslowbro.md` §4).
 - **A cross-thread double free could hang the next collect instead of
   aborting.** The README says a double free aborts "on both the local and the
   cross-thread path". The cross-thread arm of that check lived in
@@ -78,8 +108,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refuses such a handle instead of installing it (OH-rusty_alloc-16, 26, 54,
   58, 65, 66, 97–102).
 
+### Performance
+
+- **Process start-up: the options pass walks the environment once** (Linux)
+  instead of calling `getenv` 76 times, each of which walked all of it —
+  about 25,000 fewer instructions on the first allocation of every process
+  (a one-line `sort` −1.6 % whole-process), more with a larger environment.
+  Same semantics, pinned by `tests/options_env.rs`.
+- **Four more instruction-count reductions**, CURIOSITY ROUND FOUR in
+  `docs/LEDGER.md`: `posix_memalign` and Rust's over-aligned `alloc` carry the
+  aligned fast path inline (opscan `aligned` −9.2 %); a medium allocation pops
+  its page before collecting it (`big`/`large` −3.7 %, `mixed` −3.0 %); C++17
+  aligned `new` takes the power-of-two fast path; and Rust `realloc` above
+  two words of alignment keeps a block in place when it fits instead of
+  always moving it (−27.3 % against 2.2.0 on an over-aligned buffer workload).
+- **Rust programs: the `GlobalAlloc` entry points were paying for a shim
+  and a detour on every call** (`rusty_alloc-api`). The trait methods are now
+  `#[inline]`, as the `mimalloc` crate's are, so `__rust_alloc` and friends
+  carry the fast paths instead of jumping through the GOT to them; `dealloc`
+  carries the free body with its null test folded away; and layouts aligned
+  up to two words (16 bytes on x86-64, what every hashbrown table asks for)
+  are served from the ordinary size classes, which are already aligned that
+  far, instead of the aligned path, and can now `realloc` in place instead of
+  always allocating, copying and freeing. Two deterministic Rust workloads
+  (`bench/rust-globalalloc.sh`), measured against 2.2.0: **−21.1 %** and **−5.8 %** whole-program
+  instructions, for about 2–3 KB of text. `tests/natural_align.rs` pins the
+  alignment for every size class through alloc, alloc_zeroed and realloc.
+- **Two more on the allocator core**, with the three above making up
+  CURIOSITY ROUND THREE in `docs/LEDGER.md`: the page-extend floor now matches upstream's
+  `MI_MIN_EXTEND` of four blocks (perl −454,165 whole-program, opscan
+  `big`/`large` −4.5 %), and span marking no longer rewrites interior slices
+  that already point to their span (opscan `huge` −53 %).
+- **Ten deterministic instruction-count reductions** on the allocation and
+  free paths, each measured alone under callgrind on opscan and on real
+  programs; `docs/LEDGER.md` (CURIOSITY) has every number and the seven
+  refutations. The largest: `realloc(NULL, n)` no longer pays the moving
+  path's five-register frame — Lua routes every allocation through
+  `realloc`, and its allocator instruction count fell **39.9 %** — and
+  `malloc_slow` is a tail call again, which with a leaf `calloc` fast path, a
+  single-branch keep-one-warm test, a load-first `options::get` and a
+  thread-local that LLVM had hoisted above its guard takes opscan
+  `big`/`large` −16.5 %, `mixed` −12.9 %, `calloc` −11.9 % and `huge` −7.4 %.
+  No op regressed. `stats.delayed_frees` is now counted in debug builds
+  only, like `allocs` and `frees`.
+- **Ten more, measured the same way plus Python, jq, gawk and sort**
+  (`docs/LEDGER.md`, CURIOSITY, ROUND TWO). Cross-thread frees are **31 %
+  cheaper** on opscan `xthread`: a remote free to a parked page now releases
+  the page to NORMAL after its one delayed-list push, as upstream mimalloc
+  does, so later remote frees are a single CAS onto the page's own list
+  instead of three CASes and a per-block drain by the owner (single-block
+  pages keep the delayed route; the loom model gained a case for it).
+  Also: `realloc` decides a move in one compare, a medium allocation whose
+  front page is dry grows it without re-running the heartbeat, the generic
+  path tail-calls page growth again, `free_general` needs no stack frame,
+  and `posix_memalign` / `GlobalAlloc` skip a power-of-two re-test through
+  the new `alloc::malloc_aligned_pow2`. perl −456,939 and Python −389,886
+  whole-program instructions; opscan `big`/`large`/`mixed` read +0.7…+1.0
+  on the medium-grow change against round one's intermediate state and are
+  still −1 % over the round.
+
 ### Changed
 
+- **`usable_size` (`mi_usable_size`) of a huge block is the request rounded
+  up to a slice, no longer the reservation.** Two behaviours follow from that
+  and both match upstream: a `realloc` that grows a huge block into what used
+  to be reported as slack now moves it instead of returning it in place, and
+  `expand` refuses such a growth. A shrink to at least half the request stays
+  in place, where before it could MOVE (a 33 MB block shrunk to 20 MB was
+  below half of the 64 MiB it reported). The address space reserved for a
+  huge block is exactly what it was.
 - **What was NOT taken from the Openheimer campaign, and why.** The
   campaign's log carries 202 findings; 139 of them are one probe — an
   internal `unsafe fn` handed null, `0x1`, or an address just past a

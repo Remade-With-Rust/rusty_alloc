@@ -230,6 +230,54 @@ pub(super) fn numa_node_count() -> usize {
     1 // sysfs/getcpu wiring lands with arenas (M6)
 }
 
+/// `_mi_prim_getenv`: the value of `name` into `out`, no allocation of ours.
+pub(super) fn getenv(name: &[u8], out: &mut [u8]) -> Option<usize> {
+    // SAFETY: `name` is NUL-terminated (checked by `prim::getenv`). `getenv`
+    // returns null or a pointer into the process environment block, which
+    // lives for the process and is read here once, byte by byte, stopping at
+    // its NUL or at `out.len()`; nothing is written through it. This is not
+    // safe against a concurrent `setenv`, which is the standing caveat on
+    // `std::env::set_var` as well, and the same call upstream's prim makes.
+    unsafe {
+        let v: *const u8 = libc::getenv(name.as_ptr().cast()).cast();
+        if v.is_null() {
+            return None;
+        }
+        let mut n = 0;
+        while n < out.len() {
+            let b = *v.add(n);
+            if b == 0 {
+                return Some(n);
+            }
+            out[n] = b;
+            n += 1;
+        }
+    }
+    None // longer than the buffer: not an option value
+}
+
+/// Every entry of `environ`, in order; see `prim::env_for_each`.
+#[cfg(target_os = "linux")]
+pub(super) fn env_for_each(mut f: impl FnMut(*const u8)) {
+    unsafe extern "C" {
+        static environ: *const *const u8;
+    }
+    // SAFETY: `environ` is the C runtime's NULL-terminated array of
+    // NUL-terminated `NAME=VALUE` strings, live for the process. It is only
+    // read here, and each entry is handed on as a pointer, not copied. As with
+    // `getenv` above, this is not safe against a concurrent `setenv`.
+    unsafe {
+        let mut p = environ;
+        if p.is_null() {
+            return;
+        }
+        while !(*p).is_null() {
+            f(*p);
+            p = p.add(1);
+        }
+    }
+}
+
 #[inline]
 pub(super) fn thread_id() -> usize {
     // SAFETY: no preconditions; pthread_self is async-signal-safe.

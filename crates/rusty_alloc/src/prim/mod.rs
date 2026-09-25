@@ -202,6 +202,43 @@ pub fn numa_node_count() -> usize {
     sys::numa_node_count().max(1)
 }
 
+/// Copy the value of the environment variable `name` — NUL-terminated ASCII —
+/// into `out`, **without allocating** (`_mi_prim_getenv`). `Some(len)` with the
+/// value's byte length when the variable is set and fits; `None` when it is
+/// unset, empty on Windows (the API reports both as 0 and upstream's prim
+/// treats both as unset), or longer than `out`.
+///
+/// This exists because `options.rs` read the environment through
+/// `std::env::var`, whose key and value are both owned `String`s: 38 options
+/// x 2 prefixes made **251 allocations through the global allocator on the
+/// first allocation of every process** — inside the heap that was being set
+/// up (`docs/plans/youslowbro.md` §4). Hosted platforms only: a firmware has
+/// no environment, wasm has no raw `getenv`, and Miri interprets `std::env`
+/// itself, so `options.rs` keeps a `std::env` fallback for those.
+#[cfg(all(any(windows, unix), not(miri)))]
+pub fn getenv(name: &[u8], out: &mut [u8]) -> Option<usize> {
+    debug_assert_eq!(name.last(), Some(&0), "getenv: name must be NUL-terminated");
+    if name.last() != Some(&0) || out.is_empty() {
+        return None;
+    }
+    sys::getenv(name, out)
+}
+
+/// Call `f` with a pointer to every `NAME=VALUE` entry of the process
+/// environment, in order, each NUL-terminated — one walk of `environ`, without
+/// allocating. Linux only (glibc and musl export `environ`; a macOS dylib has
+/// to go through `_NSGetEnviron`, and Windows has no such block of C strings).
+///
+/// For `options.rs`, which needs 38 options under two prefixes: as 76
+/// [`getenv`] calls that is 76 walks of the whole environment, 17,372
+/// instructions inside libc and 27,011 inclusive on the first allocation of
+/// every process — 2 % of a one-line `sort` (callgrind). One walk that looks
+/// only at entries starting with either prefix does the same job.
+#[cfg(all(target_os = "linux", not(miri)))]
+pub fn env_for_each(f: impl FnMut(*const u8)) {
+    sys::env_for_each(f);
+}
+
 /// Cheap unique id of the calling thread (the heap-ownership key from M4).
 #[inline]
 pub fn thread_id() -> usize {

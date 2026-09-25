@@ -455,9 +455,22 @@ pub unsafe fn segment_free(seg: *mut Segment) -> Result<(), PrimError> {
 /// Write the span markers for a span at `idx` of `len` slices: first slot
 /// offset 0, interior+last offsets pointing back.
 ///
+/// Interior slices below `from` are NOT rewritten: the caller knows they
+/// already point back to `idx` in both representations. That holds for every
+/// slice of every span in a normal segment (this is their only writer, and
+/// `debug_validate_segment` checks it), so a span taken from the FRONT of a
+/// free span, or a freed span that did not merge into its left neighbour,
+/// starts where its interiors already point. Rewriting them was the largest
+/// loop in both `span_alloc` and `span_free`, and it stored values that were
+/// already there: 31 of 31 interior slices, twice, per 2 MiB allocate-and-free
+/// (opscan `huge`, callgrind per instruction). `from == 1` marks everything.
+///
 /// # Safety
-/// `[idx, idx+len)` must lie in the carved region of `seg` under the heap lock.
-unsafe fn span_mark(seg: *mut Segment, idx: usize, len: usize) {
+/// `[idx, idx+len)` must lie in the carved region of `seg` under the heap lock;
+/// `from >= 1`, and slices `idx+1 .. idx+min(from, len)` must already point
+/// back to `idx`.
+unsafe fn span_mark(seg: *mut Segment, idx: usize, len: usize, from: usize) {
+    debug_assert!(from >= 1, "span_mark: slot 0 is the head, not an interior");
     // SAFETY: caller contract keeps every index in bounds.
     unsafe {
         (*seg).pages[idx].slice_offset = 0;
@@ -478,10 +491,17 @@ unsafe fn span_mark(seg: *mut Segment, idx: usize, len: usize) {
         let owner = page_off_for(idx);
         let tab: *mut u32 = (&raw mut (*seg).page_off).cast();
         *tab.wrapping_add(idx) = owner;
+        // NOTE (2026-09-24, REFUTED): splitting the owner-table stores into
+        // their own `slice::fill` pass, away from the stride-88 `slice_offset`
+        // stores, made both loops cheaper (151 -> 92 + 43 instructions for a
+        // 32-slice span) and the function DEARER: each loop brings its own
+        // unroll setup and scalar remainder. Opscan `huge` +28.00, perl +340,
+        // lua -8,327, sqlite -862 allocator Ir — a sign flip by span length,
+        // not a win. Same verdict as the fill `huge_alloc` measured flat.
         let base: *mut Page = (&raw mut (*seg).pages).cast();
-        let mut slot = base.wrapping_add(idx + 1);
-        let mut ent = tab.wrapping_add(idx + 1);
-        let mut j = 1;
+        let mut slot = base.wrapping_add(idx + from);
+        let mut ent = tab.wrapping_add(idx + from);
+        let mut j = from;
         while j < len {
             // SLICES back to the span start, not bytes — see Page::slice_offset.
             (*slot).slice_offset = j as u16;
@@ -516,10 +536,10 @@ unsafe fn span_mark(seg: *mut Segment, idx: usize, len: usize) {
 ///
 /// # Safety
 /// As [`span_mark`]; the span must not be in the free list already.
-unsafe fn span_mark_free(seg: *mut Segment, idx: usize, len: usize) {
+unsafe fn span_mark_free(seg: *mut Segment, idx: usize, len: usize, from: usize) {
     // SAFETY: caller contract.
     unsafe {
-        span_mark(seg, idx, len);
+        span_mark(seg, idx, len, from);
         let slot: *mut Page = &raw mut (*seg).pages[idx];
         (*slot).block_size = 0; // free marker
         (*slot).prev = ptr::null_mut();
@@ -642,9 +662,11 @@ pub unsafe fn span_alloc(seg: *mut Segment, slices: usize) -> (*mut Page, bool) 
                 // remainder inherits the (now cleared) purged state.
                 span_recommit(seg, idx, len);
                 if len > slices {
-                    span_mark_free(seg, idx + slices, len - slices);
+                    // The remainder starts at a new slice: re-mark all of it.
+                    span_mark_free(seg, idx + slices, len - slices, 1);
                 }
-                span_mark(seg, idx, slices);
+                // The FRONT of a free span: its interiors already point here.
+                span_mark(seg, idx, slices, slices);
                 (*seg).used_pages += 1;
                 return (s, false);
             }
@@ -659,7 +681,8 @@ pub unsafe fn span_alloc(seg: *mut Segment, slices: usize) -> (*mut Page, bool) 
         (*seg).next_free_slice = (idx + slices) as u32;
         (*seg).used_pages += 1;
         let start: *mut Page = &raw mut (*seg).pages[idx];
-        span_mark(seg, idx, slices);
+        // Never-carved slices: mark all of them.
+        span_mark(seg, idx, slices, 1);
         (start, (*seg).mem_is_zero)
     }
 }
@@ -683,6 +706,9 @@ pub unsafe fn span_free(seg: *mut Segment, page: *mut Page) -> bool {
     unsafe {
         let mut idx = page_index(seg, page);
         let mut len = (*page).slice_count as usize;
+        // Where the freed span sat before any merge: its interiors already
+        // point back to `freed_idx` (see `span_mark`).
+        let (freed_idx, freed_len) = (idx, len);
         (*seg).used_pages -= 1;
         // Scrub page state so a stale slot can't masquerade as live.
         (*page).block_size = 0;
@@ -718,15 +744,26 @@ pub unsafe fn span_free(seg: *mut Segment, page: *mut Page) -> bool {
                 idx = lstart_idx;
             }
         }
-        span_mark_free(seg, idx, len);
+        // Re-mark only what does not already point to `idx`: with no left
+        // merge the freed span itself starts here and only an absorbed right
+        // neighbour moves; after a left merge the left span is already right
+        // and everything from the freed span on moves.
+        let from = if idx == freed_idx {
+            freed_len
+        } else {
+            freed_idx - idx
+        };
+        span_mark_free(seg, idx, len, from);
         // PURGE the coalesced free span (the RSS lever): return its pages to
         // the OS. Only worthwhile for multi-slice spans — a syscall costs
         // more than the pages a single 64 KiB slice returns. The span is
         // marked `purged` so reuse re-commits it; skipping that recommit is
         // an access violation on Windows (MEM_DECOMMIT), which is how this
         // was caught (2026-08-05).
-        let purge_delay = crate::options::get(15);
-        if purge_delay >= 0 && len >= crate::types::MEDIUM_PAGE_SLICES {
+        // Length FIRST: it is in a register, the option is a table load, a
+        // bounds test and a sentinel test — and most freed spans are short, so
+        // most frees never need the option at all.
+        if len >= crate::types::MEDIUM_PAGE_SLICES && crate::options::get(15) >= 0 {
             let area = page_area(seg, idx);
             let bytes = len * SEGMENT_SLICE_SIZE;
             let decommits = crate::options::is_enabled(5); // purge_decommits
@@ -917,7 +954,22 @@ pub fn huge_alloc(
         // offsets back to it (only slices 1..512 are addressable via the mask
         // trick, and aligned offsets stay < SEGMENT_SIZE/2 by the contract).
         let page: *mut Page = &raw mut (*seg).pages[1];
-        (*page).block_size = b.size - (block.addr() - seg.addr());
+        // The block's usable size is what was ASKED for, rounded up to a
+        // slice — upstream's `psize` (`mi_segment_huge_page_alloc`, oracle
+        // segment.c:1599) — and NOT the reservation. The reservation is
+        // chunk-rounded (`chunks * SEGMENT_SIZE` through an arena), so a 33 MB
+        // request holds a 64 MiB chunk pair and a 64 MB one holds 96 MiB.
+        // This field used to report that whole extent, and `usable_size` is
+        // the copy length of every `realloc` that MOVES: growing a 33 MB block
+        // copied — and first-touched, on both sides — 64 MiB, and a 64 MB
+        // block 96 MiB. Measured from a consumer at **1.41x / 1.23x mimalloc,
+        // 0/6 pairs** for exactly those two steps, at parity for every step
+        // below the segment size (`docs/plans/youslowbro.md` §3). `zalloc` on
+        // a recycled chunk zeroes `usable_size` bytes and paid the same tax.
+        // The capacity is still `total_size`, and nothing reads past
+        // `block_size`; `usable_size` now agrees with `mi_usable_size` here.
+        let capacity = b.size - (block.addr() - seg.addr());
+        (*page).block_size = crate::prim::align_up(size.max(1), SEGMENT_SLICE_SIZE).min(capacity);
         (*page).used = 1;
         (*page).capacity = 1;
         (*page).reserved = 1;

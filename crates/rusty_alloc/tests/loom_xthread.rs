@@ -90,16 +90,19 @@ impl Model {
                                 break;
                             }
                         }
-                        // Restore DELAYED (list bits may have changed? no —
-                        // only WE can push while FREEING; owner may collect
-                        // though, so re-read and preserve the pointer bits).
+                        // Release FREEING to NORMAL, as `page::remote_free`
+                        // does for a multi-block page (upstream's
+                        // MI_NO_DELAYED_FREE): the delayed entry just pushed
+                        // is what makes the owner un-park the page, and later
+                        // remotes then push onto the page list. Re-read and
+                        // preserve the pointer bits — the owner may collect.
                         loop {
                             let y = self.xthread.load(Ordering::Acquire);
                             if self
                                 .xthread
                                 .compare_exchange(
                                     y,
-                                    (y & !XMASK) | DELAYED,
+                                    (y & !XMASK) | NORMAL,
                                     Ordering::AcqRel,
                                     Ordering::Relaxed,
                                 )
@@ -216,8 +219,9 @@ fn delayed_push_vs_abandon() {
     });
 }
 
-/// Extended soak (set LOOM_EXTENDED=1; CI nightly): two remotes vs the
-/// abandoner under a preemption bound — the wide-space variant.
+/// Extended soak (set LOOM_EXTENDED=1): two remotes vs the abandoner under a
+/// preemption bound — the wide-space variant. No CI workflow runs it (none of
+/// `.github/workflows` mentions loom); it is run by hand, for ~45 minutes.
 #[test]
 fn delayed_push_vs_abandon_two_remotes_extended() {
     if std::env::var_os("LOOM_EXTENDED").is_none() {
@@ -244,6 +248,34 @@ fn delayed_push_vs_abandon_two_remotes_extended() {
             drained_at_abandon + on_page + late_delayed,
             2,
             "protocol lost a block"
+        );
+    });
+}
+
+/// A parked (DELAYED) page receives TWO remote frees while the owner drains
+/// its delayed list and collects: the first goes to the delayed list and
+/// releases the page to NORMAL, the second lands on the page list. Every
+/// block must end in exactly one place, and the heap is never touched after
+/// FREEING is released.
+#[test]
+fn delayed_then_normal_vs_owner() {
+    loom::model(|| {
+        let m = Arc::new(Model::new(DELAYED));
+        let m1 = m.clone();
+        let t1 = thread::spawn(move || {
+            m1.remote_free(1);
+            m1.remote_free(2);
+        });
+        let mo = m.clone();
+        let to = thread::spawn(move || mo.owner_drain_delayed() + mo.owner_collect());
+        t1.join().unwrap();
+        let during = to.join().unwrap();
+        let after = m.owner_drain_delayed() + m.owner_collect();
+        assert_eq!(during + after, 2, "a block was lost or double-counted");
+        assert_eq!(
+            m.xthread.load(Ordering::Relaxed) & XMASK,
+            NORMAL,
+            "the page must be left scannable"
         );
     });
 }

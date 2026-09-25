@@ -111,6 +111,7 @@ secure = []
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
+    "Win32_System_Environment",
     "Win32_System_Memory",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",

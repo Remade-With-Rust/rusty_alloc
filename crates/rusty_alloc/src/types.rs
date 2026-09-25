@@ -11,7 +11,33 @@ pub const INTPTR_SIZE: usize = core::mem::size_of::<usize>();
 /// Maximum "small" allocation in machine words (`MI_SMALL_WSIZE_MAX` = 128).
 ///
 /// Source: `mimalloc.h` v2.4.5 — `#define MI_SMALL_WSIZE_MAX (128)`.
-pub const SMALL_WSIZE_MAX: usize = 128;
+///
+/// `--cfg ra_small_wsize="256"` / `"512"` raises it, and the default is
+/// unchanged. The cfg exists for the same reason [`GENERIC_COLLECT_DEFAULT`]
+/// grew one: a bare-metal consumer could measure that this bound was costing
+/// it and had no way to move it.
+///
+/// **Why a 32-bit target wants it.** [`SMALL_SIZE_MAX`] is this times
+/// `INTPTR_SIZE`, so the `direct[]` fast path covers 1 KiB on a 64-bit host
+/// and only **512 bytes on a 32-bit chip** — the same pointer-width trap that
+/// made the `direct`-route step invisible on a host sweep. Measured on an
+/// ESP32-S3 (`rusty_rtos_core/firmware/esp32s3-devkit-alloc-ab`), an
+/// alloc/free pair costs **114 cycles at 512 bytes and 249 at 513**: one byte
+/// over the bound is +135 cycles, because the request falls off the end of
+/// the table and takes the generic path.
+///
+/// The price is the table: `direct` is `SMALL_WSIZE_MAX + 1` pointers per
+/// heap, so `"512"` costs 2,052 bytes on a 32-bit target where 128 costs 516.
+/// Nothing else moves — the bin geometry, `good_size` and every ABI-visible
+/// answer are computed elsewhere and are unchanged, which is what makes this
+/// safe to offer as a knob rather than a fork.
+pub const SMALL_WSIZE_MAX: usize = if cfg!(ra_small_wsize = "256") {
+    256
+} else if cfg!(ra_small_wsize = "512") {
+    512
+} else {
+    128
+};
 
 /// Maximum "small" allocation in bytes (`MI_SMALL_SIZE_MAX` = 1 KiB on 64-bit).
 /// `mi_malloc_small` / `mi_zalloc_small` require `size <= SMALL_SIZE_MAX`.
@@ -202,7 +228,16 @@ mod tests {
     fn constants_match_oracle_64bit() {
         // Pinned to mimalloc v2.4.5 on x86_64 / aarch64 (64-bit words).
         assert_eq!(INTPTR_SIZE, 8);
+        // `SMALL_WSIZE_MAX` is a knob (`ra_small_wsize`), so pin EACH ARM
+        // rather than the default's number -- the same treatment
+        // `ra_segment_size` gets below, and for the same reason: pinning only
+        // the default passes vacuously at every other setting.
+        #[cfg(not(any(ra_small_wsize = "256", ra_small_wsize = "512")))]
         assert_eq!(SMALL_SIZE_MAX, 1024);
+        #[cfg(ra_small_wsize = "256")]
+        assert_eq!(SMALL_SIZE_MAX, 2048);
+        #[cfg(ra_small_wsize = "512")]
+        assert_eq!(SMALL_SIZE_MAX, 4096);
         #[cfg(not(ra_small_profile))]
         assert_eq!(SEGMENT_SIZE, 32 * 1024 * 1024);
         // The small profile's geometry is a DECISION, pinned here so moving it
