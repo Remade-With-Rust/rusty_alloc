@@ -68,6 +68,41 @@ unsafe fn unalign(pg: *mut Page, p: *mut u8) -> *mut u8 {
     }
 }
 
+/// `free_local_at` on the owning heap, for [`free_general`]'s local arm.
+///
+/// [`owner_heap`] inlined there carried its fallback — `my_heap()`, which can
+/// CREATE the heap — as a non-tail call, and that one call gave
+/// `free_general` a three-register frame paid by every general free,
+/// including the cross-thread frees it hands to `remote_free` and never
+/// reach this arm (callgrind, opscan `xthread`). Here the common case is a
+/// tail call and the fallback is its own cold function.
+///
+/// # Safety
+/// As [`owner_heap`] and `Heap::free_local_at`.
+#[inline(always)]
+unsafe fn free_local_owned(seg: *mut Segment, pg: *mut Page, block: *mut u8) {
+    // SAFETY: forwarded contract.
+    unsafe {
+        let xh = (*pg).xheap.load(core::sync::atomic::Ordering::Acquire);
+        if xh == 0 {
+            return free_local_no_xheap(seg, pg, block);
+        }
+        (*(*init::box_of_xheap(xh)).heap.get()).free_local_at(seg, pg, block);
+    }
+}
+
+/// [`owner_heap`]'s fallback arm, out of line so its call stays out of
+/// `free_general`'s frame.
+///
+/// # Safety
+/// As [`free_local_owned`].
+#[cold]
+#[inline(never)]
+unsafe fn free_local_no_xheap(seg: *mut Segment, pg: *mut Page, block: *mut u8) {
+    // SAFETY: forwarded contract.
+    unsafe { (*owner_heap(pg)).free_local_at(seg, pg, block) };
+}
+
 /// The heap that OWNS `pg` — recovered from the page's `xheap` back-pointer
 /// (container-of over the `HeapBox`'s offset-0 delayed list), so it is right
 /// even when the thread holds several first-class heaps.
@@ -355,13 +390,52 @@ pub fn zalloc(size: usize) -> *mut u8 {
     // sentinel, and so carries the once-per-thread initialisation and a null
     // check for its failure on a path taken once per ALLOCATION. `rptest`
     // calls calloc 43,449 times and paid it on every one.
+    //
+    // And no compare against the sentinel either, now: the fast path is
+    // `malloc`'s — RAW reads only, so `hb` may be the sentinel, whose direct
+    // table of empty pages always misses — and the sentinel test moved into
+    // the cold miss. It was a `cmp; je` on every `calloc` (Python: 60,336 of
+    // them in the real-program gate) for a case that a miss already routes.
+    // The zeroing keeps the popped page in hand, as `Heap::zalloc` does
+    // (opps.md #5).
     let hb = init::heap_box_fast();
+    // SAFETY: raw reads only, exactly as `malloc`: `direct` entries point at a
+    // live page of this thread's heap or at the immortal empty page, and
+    // `page_pop` on that returns null before its first store. A non-null
+    // block means `hb` is this thread's real heap.
+    unsafe {
+        if size <= SMALL_SIZE_MAX {
+            let w = crate::types::wsize_from_size(size);
+            let h = (*hb).heap.get();
+            let p = (*h).direct[w];
+            let b = crate::page::page_pop(p);
+            if !b.is_null() {
+                #[cfg(debug_assertions)]
+                {
+                    (*h).stats.allocs += 1;
+                }
+                if (*p).free_is_zero {
+                    b.cast::<usize>().write(0);
+                } else {
+                    ptr::write_bytes(b, 0, (*p).block_size);
+                }
+                return b;
+            }
+        }
+        zalloc_slow(hb, size)
+    }
+}
+
+/// [`zalloc`]'s miss: the sentinel test, then the heap's own zalloc.
+///
+/// # Safety
+/// `hb` is `heap_box_fast()` of the calling thread.
+#[cold]
+#[inline(never)]
+unsafe fn zalloc_slow(hb: *mut init::HeapBox, size: usize) -> *mut u8 {
     if hb == init::empty_heap_box_ptr() {
         return zalloc_first(size);
     }
-    // `Heap::zalloc` zeroes with the popped page in hand, avoiding the
-    // `usable_size` re-resolution the old `malloc` + `zero_block` pair paid on
-    // every recycled block (opps.md #5).
     // SAFETY: a non-sentinel box is this thread's live, initialised box.
     unsafe { (*(*hb).heap.get()).zalloc(size) }
 }
@@ -436,6 +510,29 @@ pub fn malloc_aligned(size: usize, align: usize) -> *mut u8 {
 // reverted. The export gains a frame worth more than the check it removes,
 // the same result the `realloc_inline` twin produced.
 pub fn malloc_aligned_at(size: usize, align: usize, offset: usize) -> *mut u8 {
+    aligned_at_impl::<false>(size, align, offset)
+}
+
+/// [`malloc_aligned`] for a caller that has ALREADY established that `align`
+/// is a power of two: the C shims that validate it for EINVAL
+/// (`posix_memalign`), and Rust's `GlobalAlloc`, whose `Layout` guarantees
+/// it. The public entry re-tested it on every call — a `test; jne` after the
+/// mask it needs anyway (callgrind, opscan `aligned`).
+///
+/// # Safety
+/// `align` must be a power of two. (A violation is not memory-unsafe here —
+/// the bound test still refuses a mask at or above half a segment — but the
+/// block would not be aligned as asked.)
+#[inline]
+pub unsafe fn malloc_aligned_pow2(size: usize, align: usize) -> *mut u8 {
+    debug_assert!(align.is_power_of_two(), "malloc_aligned_pow2: {align}");
+    aligned_at_impl::<true>(size, align, 0)
+}
+
+/// The aligned fast path; `POW2` skips the power-of-two test for callers that
+/// have proven it.
+#[inline(always)]
+fn aligned_at_impl<const POW2: bool>(size: usize, align: usize, offset: usize) -> *mut u8 {
     let hb = init::heap_box_fast();
     // SAFETY: raw reads only, exactly as `malloc` does — `hb` may be the
     // shared immortal sentinel, which must never see a `&mut` or a write. Its
@@ -454,7 +551,7 @@ pub fn malloc_aligned_at(size: usize, align: usize, offset: usize) -> *mut u8 {
         if offset == 0
             && size <= SMALL_SIZE_MAX
             && mask < crate::types::SEGMENT_SIZE / 2
-            && align & mask == 0
+            && (POW2 || align & mask == 0)
         {
             let h = (*hb).heap.get();
             let w = crate::types::wsize_from_size(size);
@@ -990,10 +1087,17 @@ pub unsafe fn free_inline(p: *mut u8) {
                             // `unsafe`; it is a separate item.
                             // SAFETY: `pg` is the live page this free resolved,
                             // owned by this thread.
+                            //
+                            // ONE test, not three: `used`, `next` and `prev`
+                            // OR-ed are zero exactly when the page emptied
+                            // (not a wrapped double free) and is its queue's
+                            // only member. Three compare-and-branch pairs
+                            // were 6 Ir on every free that empties a page —
+                            // every free of an alloc/free loop cycling one
+                            // block. `retire_or_abort` re-tests each case.
                             unsafe {
-                                if (*pg).used == 0
-                                    && (*pg).next.is_null()
-                                    && (*pg).prev.is_null()
+                                if ((*pg).used as usize | (*pg).next.addr() | (*pg).prev.addr())
+                                    == 0
                                 {
                                     return;
                                 }
@@ -1008,7 +1112,8 @@ pub unsafe fn free_inline(p: *mut u8) {
                     let u = (*pg).used.wrapping_sub(1);
                     (*pg).used = u;
                     if (u as i32) <= 0 {
-                        if u == 0 && (*pg).next.is_null() && (*pg).prev.is_null() {
+                        // One test, as in the x86-64 arm above.
+                        if (u as usize | (*pg).next.addr() | (*pg).prev.addr()) == 0 {
                             return;
                         }
                         return retire_or_abort(pg);
@@ -1169,12 +1274,12 @@ unsafe fn free_general(p: *mut u8, seg: *mut Segment, pg: *mut Page, owner_tid: 
                 options(nostack, readonly),
             );
             // Fell through: this thread owns the page.
-            (*owner_heap(pg)).free_local_at(seg, pg, block);
+            free_local_owned(seg, pg, block);
         }
         #[cfg(not(all(target_arch = "x86_64", target_os = "linux", not(miri))))]
         if crate::ONE_THREAD || owner_tid == init::thread_id() {
             // Hand the already-resolved segment through (M9 brick #2).
-            (*owner_heap(pg)).free_local_at(seg, pg, block);
+            free_local_owned(seg, pg, block);
         } else {
             // Remote: the loom-modeled protocol (huge pages sit DELAYED, so
             // this lands on the owner's delayed list and the owner's
@@ -1258,16 +1363,57 @@ unsafe fn usable_size_slow(pg: *mut Page, p: *const u8, flags: u8) -> usize {
 ///
 /// # Safety
 /// `p` must be null or a live pointer from this allocator; invalidated on move.
+///
+/// **The null test is in front of the frame, and that is the whole reason
+/// this is two functions.** In one body, LLVM placed the move arm's five
+/// callee-saved pushes BEFORE `test %rdi,%rdi`, so `realloc(NULL, n)` paid ten
+/// frame instructions to reach a tail call into `malloc`. That is not a corner
+/// case: Lua's allocator routes every allocation through `realloc`, and in the
+/// `lua` real-program instrument **480,342 of 540,393 calls had a null
+/// pointer** (callgrind, per instruction). Here the null arm inlines `malloc`'s
+/// fast path with no frame, and a live pointer costs one `jmp` into
+/// [`realloc_live`] with its arguments already in place.
+#[inline]
 pub unsafe fn realloc(p: *mut u8, newsize: usize) -> *mut u8 {
     if p.is_null() {
         return malloc(newsize);
     }
+    // SAFETY: forwarded contract; `p` is non-null here.
+    unsafe { realloc_live(ptr::NonNull::new_unchecked(p), newsize) }
+}
+
+/// [`realloc`] of a non-null pointer.
+///
+/// `NonNull`, not `*mut u8`, and it is measured: split out with a raw pointer,
+/// LLVM no longer knew `p` was non-null in here, and the null tests inside the
+/// inlined `usable_size` and `free_inline` came back — two `test; je` pairs
+/// per moving realloc, opscan `realloc` +11.84 Ir/op. The `nonnull` parameter
+/// attribute folds both away again.
+///
+/// # Safety
+/// `p` must be a live pointer from this allocator; invalidated on move.
+#[inline(never)]
+unsafe fn realloc_live(p: ptr::NonNull<u8>, newsize: usize) -> *mut u8 {
+    let p = p.as_ptr();
     // SAFETY: p live per contract.
     let usable = unsafe { usable_size(p) };
     // NOTE: rewriting this as the one-compare unsigned range check
     // `newsize.wrapping_sub(usable >> 1) <= usable - (usable >> 1)` measured
     // FLAT — LLVM already emits that shape from the readable form.
-    if newsize <= usable && newsize >= usable / 2 {
+    //
+    // GROWTH first, on its own move path. A live realloc from a real program
+    // almost always MOVES — lua's grow, and Python's shrink below half
+    // (60,100 of its 60,669 took the second arm below) — and the two-sided
+    // test compiled branch-free — `setbe`, `shr`, `setae`, `test`, `je` — so
+    // every move paid all of it (callgrind, per instruction). As two
+    // branches each move arm decides in one compare, and each knows its copy
+    // length outright (`usable` for a growth, `newsize` for a shrink), so the
+    // `min` goes too.
+    if newsize > usable {
+        // SAFETY: forwarded contract; a growth copies the whole old block.
+        return unsafe { realloc_move(p, newsize, usable) };
+    }
+    if newsize >= usable / 2 {
         // Keep in place. NOTE: this counter costs a TLS heap lookup (a call
         // into ld.so's __tls_get_addr in a cdylib) on the most common realloc
         // outcome, so removing it was tried as a brick -- and measured FLAT on
@@ -1283,13 +1429,26 @@ pub unsafe fn realloc(p: *mut u8, newsize: usize) -> *mut u8 {
     // **+12.00 Ir/op** and was reverted. The argument setup plus the call and
     // return are paid on every MOVING realloc, and the scan is all moves; the
     // frame it saved was smaller than the call it added.
+    // A shrink below half: the copy is the new, smaller size.
+    // SAFETY: forwarded contract.
+    unsafe { realloc_move(p, newsize, newsize) }
+}
+
+/// The moving arm of [`realloc_live`]: allocate `newsize`, copy `copy` bytes,
+/// free `p`. Inlined into both of its call sites, so each copy length is a
+/// value the site already holds.
+///
+/// # Safety
+/// `p` live from this allocator; `copy <= min(usable_size(p), newsize)`.
+#[inline(always)]
+unsafe fn realloc_move(p: *mut u8, newsize: usize, copy: usize) -> *mut u8 {
     let np = malloc(newsize);
     if np.is_null() {
         return ptr::null_mut();
     }
     // SAFETY: both live and disjoint; prefix preserved then p consumed.
     unsafe {
-        core::ptr::copy_nonoverlapping(p, np, usable.min(newsize));
+        core::ptr::copy_nonoverlapping(p, np, copy);
         // `free_inline`, not the outlined `free`: this function has ALREADY
         // masked `p` to its segment for `usable_size`, and inlining the free
         // here lets LLVM common-subexpression that away instead of masking
@@ -1297,6 +1456,15 @@ pub unsafe fn realloc(p: *mut u8, newsize: usize) -> *mut u8 {
         // pass the segment explicitly was tried first and cost +1 Ir on EVERY
         // free (batch_lifo 60.00 -> 61.00); letting the inliner find it costs
         // other callers nothing because only this one opts in.
+        //
+        // REFUTED (2026-09-24): resolving this free's page, flags and owner
+        // BEFORE the copy, so the opaque `memcpy` would not force LLVM to
+        // re-derive them after it (five instructions per move). `free` stayed
+        // byte-identical, but LLVM re-loaded the page index before the copy
+        // anyway (the `malloc` above may write memory), and holding four
+        // values across the call took a sixth callee-saved register plus a
+        // stack adjustment: opscan `realloc` +8.00 (+4 per move), lua
+        // +240,221 and python +302,857 allocator Ir.
         free_inline(p);
         stat_realloc(false);
     }

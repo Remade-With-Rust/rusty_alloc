@@ -342,6 +342,49 @@ fn align_storm() {
     }
 }
 
+/// A huge block's usable size is what was asked for, rounded up to a slice —
+/// not the chunk-rounded reservation it lives in.
+///
+/// This is the deterministic half of `docs/plans/youslowbro.md` §3: `realloc`
+/// copies `usable_size` bytes when it moves a block, and a 33 MB block used
+/// to report the whole 64 MiB chunk pair as usable — so growing it copied
+/// (and first-touched, on both sides) twice what the caller had written, and
+/// a consumer measured the step at 1.41x mimalloc. The reservation itself is
+/// unchanged; only what is REPORTED, and therefore what is copied and what
+/// `zalloc` zeroes on a recycled chunk.
+#[test]
+fn huge_usable_size_is_the_request_not_the_reservation() {
+    use rusty_alloc::types::{SEGMENT_SIZE, SEGMENT_SLICE_SIZE};
+    for mb in [33usize, 64] {
+        let size = mb << 20;
+        assert!(size > SEGMENT_SIZE, "{mb} MB must be a huge allocation");
+        let p = malloc(size);
+        assert!(!p.is_null(), "malloc({size})");
+        // SAFETY: fresh live block of ≥ size bytes; freed once below.
+        unsafe {
+            let us = usable_size(p);
+            assert!(us >= size, "usable {us} < requested {size}");
+            assert!(
+                us < size + SEGMENT_SLICE_SIZE,
+                "usable {us} for a {mb} MB block reports the reservation \
+                 ({} would be the chunk boundary), not the request",
+                size.div_ceil(SEGMENT_SIZE) * SEGMENT_SIZE
+            );
+            // The bytes a move preserves are exactly the ones the caller
+            // could have written: fill the whole usable extent, grow past
+            // the reservation, and check the prefix survived.
+            p.write(0xA5);
+            p.add(us - 1).write(0x5A);
+            let np = realloc(p, 2 * size);
+            assert!(!np.is_null(), "realloc({size} -> {})", 2 * size);
+            assert_eq!(np.read(), 0xA5);
+            assert_eq!(np.add(us - 1).read(), 0x5A);
+            assert!(usable_size(np) >= 2 * size);
+            free(np);
+        }
+    }
+}
+
 #[test]
 fn realloc_storm() {
     // Seeded randomized realloc churn with content verification — the M3

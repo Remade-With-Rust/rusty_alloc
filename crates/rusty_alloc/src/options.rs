@@ -322,7 +322,25 @@ const DEFAULTS: [i64; OPTION_COUNT] = [
 static VALUES: [AtomicI64; OPTION_COUNT] = [const { AtomicI64::new(i64::MIN) }; OPTION_COUNT];
 static ENV_PARSED: AtomicBool = AtomicBool::new(false);
 
+/// Parse the environment once. The common case — every call after the first —
+/// is one plain load and a branch, inlined into the caller.
+///
+/// This used to be the `swap` below on EVERY call: a locked read-modify-write
+/// behind an out-of-line call, on every `options::get`. `span_free` reads
+/// `purge_delay` on every span it frees, so a 2 MiB alloc/free pair paid
+/// **19 Ir in `ensure_init`** per operation (callgrind, opscan `huge`) to
+/// learn that the environment had already been read. The swap stays, in the
+/// cold arm, as what decides WHICH thread runs the pass.
+#[inline(always)]
 fn ensure_init() {
+    if !ENV_PARSED.load(Ordering::Acquire) {
+        ensure_init_slow();
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn ensure_init_slow() {
     if ENV_PARSED.swap(true, Ordering::AcqRel) {
         return;
     }
@@ -335,13 +353,15 @@ fn ensure_init() {
         VALUES[i].store(DEFAULTS[i], Ordering::Release);
     }
     // ...and neither has `wasm32-unknown-unknown`. `std::env::var` there is a
-    // stub that always fails, so this loop formatted 76 strings, allocated 76
-    // `String`s and read an environment that cannot exist — on every startup,
-    // to find nothing. It also dragged `core::fmt`, `alloc::fmt::format` and
-    // `str::to_uppercase` into a module that otherwise needs none of them:
-    // `options::get` was the LARGEST function in a wasm build at 3,708 bytes,
-    // ahead of anything in the allocator proper. Same deletion as the `no_std`
-    // arm above, for the same reason — there is nothing to read.
+    // stub that always fails, so the pass used to format 76 strings, allocate
+    // 76 `String`s and read an environment that cannot exist — on every
+    // startup, to find nothing. It also dragged `core::fmt`,
+    // `alloc::fmt::format` and `str::to_uppercase` into a module that
+    // otherwise needs none of them: `options::get` was the LARGEST function in
+    // a wasm build at 3,708 bytes, ahead of anything in the allocator proper.
+    // Same deletion as the `no_std` arm above, for the same reason — there is
+    // nothing to read. (The pass owns no memory any more, see `env`, but the
+    // wasm size ratchet is kept exactly where it was by leaving it out.)
     //
     // `target_os = "unknown"` and not `target_arch` alone: wasm32-wasip1 does
     // have an environment and keeps the pass.
@@ -349,24 +369,286 @@ fn ensure_init() {
         feature = "std",
         not(all(target_arch = "wasm32", target_os = "unknown"))
     ))]
-    for i in 0..OPTION_COUNT {
-        let name = OPTION_NAMES[i].to_uppercase();
-        let val = std::env::var(std::format!("RUSTY_ALLOC_{name}"))
-            .or_else(|_| std::env::var(std::format!("MIMALLOC_{name}")))
-            .ok()
-            .and_then(|s| parse_value(&s));
-        if let Some(v) = val {
-            VALUES[i].store(v, Ordering::Release);
-        }
-    }
+    env::pass();
 }
 
-#[cfg(feature = "std")]
-fn parse_value(s: &str) -> Option<i64> {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "" | "1" | "true" | "yes" | "on" => Some(1),
-        "0" | "false" | "no" | "off" => Some(0),
-        t => t.parse::<i64>().ok(),
+/// The environment pass, and why it owns no memory.
+///
+/// It used to be `OPTION_NAMES[i].to_uppercase()` and two `format!`ed keys
+/// handed to `std::env::var`, every one of which returns an owned `String`:
+/// 38 options x (one uppercase name, two keys, up to two values) made **251
+/// allocations through the global allocator on the first allocation of every
+/// process**, measured from a consumer behind a counting `GlobalAlloc`
+/// (`docs/plans/youslowbro.md` §4), where mimalloc makes none. Each one landed
+/// in the heap that was still being set up — allocator re-entrancy during
+/// initialisation — and every short CLI run paid all of them.
+///
+/// Now the key is built by hand in a stack buffer sized by the table, the
+/// value lands in a second stack buffer through `prim::getenv` — the raw
+/// `getenv` / `GetEnvironmentVariableA` that upstream's prim calls — and the
+/// parse reads the bytes in place. Zero allocations, and
+/// `crates/rusty_alloc_api/tests/reentrancy.rs` fails if one comes back.
+#[cfg(all(
+    feature = "std",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
+mod env {
+    use core::sync::atomic::Ordering;
+
+    use super::{OPTION_COUNT, OPTION_NAMES, VALUES};
+
+    /// Longest option name: the key buffer is sized by the table, not by hand.
+    const MAX_NAME_LEN: usize = {
+        let mut m = 0;
+        let mut i = 0;
+        while i < OPTION_COUNT {
+            if OPTION_NAMES[i].len() > m {
+                m = OPTION_NAMES[i].len();
+            }
+            i += 1;
+        }
+        m
+    };
+    /// `RUSTY_ALLOC_` is the longer prefix; `+ 1` for the NUL a C `getenv` needs.
+    const KEY_CAP: usize = "RUSTY_ALLOC_".len() + MAX_NAME_LEN + 1;
+    /// Values are integers and booleans; upstream's buffer is 64 bytes as well.
+    const VALUE_CAP: usize = 64;
+
+    /// `RUSTY_ALLOC_<NAME>` first, `MIMALLOC_<NAME>` second, as before.
+    pub(super) fn pass() {
+        #[cfg(all(target_os = "linux", not(miri)))]
+        {
+            scan_pass();
+        }
+        #[cfg(not(all(target_os = "linux", not(miri))))]
+        {
+            keyed_pass();
+        }
+    }
+
+    /// The same pass as ONE walk of the environment (`prim::env_for_each`)
+    /// instead of 76 `getenv` calls, each of which walks all of it: 27,011
+    /// instructions on the first allocation of every process, 2 % of a
+    /// one-line `sort` (callgrind, inclusive). Keeps [`keyed_pass`]'s
+    /// semantics exactly: the FIRST occurrence of a key is the one `getenv`
+    /// returns, a value too long for `VALUE_CAP` reads as unset (so it falls
+    /// back to `MIMALLOC_`), and a present-but-unparsable `RUSTY_ALLOC_` value
+    /// keeps the default without consulting `MIMALLOC_`.
+    #[cfg(all(target_os = "linux", not(miri)))]
+    fn scan_pass() {
+        let mut rusty = [core::ptr::null::<u8>(); OPTION_COUNT];
+        let mut mi = [core::ptr::null::<u8>(); OPTION_COUNT];
+        crate::prim::env_for_each(|e| {
+            // SAFETY: `e` is a NUL-terminated environment entry; `strip`
+            // and `match_name` stop at the first mismatch, so no read passes
+            // its NUL.
+            unsafe {
+                let (table, rest) = if let Some(r) = strip(e, b"RUSTY_ALLOC_") {
+                    (&mut rusty, r)
+                } else if let Some(r) = strip(e, b"MIMALLOC_") {
+                    (&mut mi, r)
+                } else {
+                    return;
+                };
+                for i in 0..OPTION_COUNT {
+                    if let Some(v) = match_name(rest, OPTION_NAMES[i].as_bytes()) {
+                        if table[i].is_null() {
+                            table[i] = v;
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+        let mut val = [0u8; VALUE_CAP];
+        for i in 0..OPTION_COUNT {
+            // SAFETY: each non-null entry points at a NUL-terminated value.
+            let got =
+                unsafe { copy_value(rusty[i], &mut val).or_else(|| copy_value(mi[i], &mut val)) };
+            if let Some(v) = got.and_then(|len| parse_value(&val[..len])) {
+                VALUES[i].store(v, Ordering::Release);
+            }
+        }
+    }
+
+    /// `e` past `prefix`, if it starts with it.
+    ///
+    /// # Safety
+    /// `e` NUL-terminated.
+    #[cfg(all(target_os = "linux", not(miri)))]
+    unsafe fn strip(e: *const u8, prefix: &[u8]) -> Option<*const u8> {
+        for (k, &b) in prefix.iter().enumerate() {
+            // SAFETY: a mismatch (the NUL included) returns before reading on.
+            if unsafe { *e.add(k) } != b {
+                return None;
+            }
+        }
+        // SAFETY: every byte up to here matched a non-NUL prefix byte.
+        Some(unsafe { e.add(prefix.len()) })
+    }
+
+    /// The value after `NAME=` when `rest` is exactly the uppercased `name`
+    /// followed by `=` — `getenv`'s case-sensitive match.
+    ///
+    /// # Safety
+    /// `rest` NUL-terminated.
+    #[cfg(all(target_os = "linux", not(miri)))]
+    unsafe fn match_name(rest: *const u8, name: &[u8]) -> Option<*const u8> {
+        for (k, &b) in name.iter().enumerate() {
+            // SAFETY: as in `strip`.
+            if unsafe { *rest.add(k) } != b.to_ascii_uppercase() {
+                return None;
+            }
+        }
+        // SAFETY: as in `strip`.
+        unsafe { (*rest.add(name.len()) == b'=').then(|| rest.add(name.len() + 1)) }
+    }
+
+    /// `prim::getenv`'s copy: the value into `out`, `None` when `v` is null or
+    /// the value does not fit.
+    ///
+    /// # Safety
+    /// `v` null or NUL-terminated.
+    #[cfg(all(target_os = "linux", not(miri)))]
+    unsafe fn copy_value(v: *const u8, out: &mut [u8]) -> Option<usize> {
+        if v.is_null() {
+            return None;
+        }
+        for (n, slot) in out.iter_mut().enumerate() {
+            // SAFETY: stops at the value's NUL.
+            let b = unsafe { *v.add(n) };
+            if b == 0 {
+                return Some(n);
+            }
+            *slot = b;
+        }
+        None // longer than the buffer: not an option value
+    }
+
+    /// One `getenv` per key: every host without `prim::env_for_each`.
+    #[cfg_attr(all(target_os = "linux", not(miri)), allow(dead_code))]
+    fn keyed_pass() {
+        let mut key = [0u8; KEY_CAP];
+        let mut val = [0u8; VALUE_CAP];
+        for i in 0..OPTION_COUNT {
+            let name = OPTION_NAMES[i].as_bytes();
+            let n = build_key(&mut key, b"RUSTY_ALLOC_", name);
+            let got = lookup(&key[..n], &mut val).or_else(|| {
+                let n = build_key(&mut key, b"MIMALLOC_", name);
+                lookup(&key[..n], &mut val)
+            });
+            if let Some(v) = got.and_then(|len| parse_value(&val[..len])) {
+                VALUES[i].store(v, Ordering::Release);
+            }
+        }
+    }
+
+    /// `<prefix><NAME>\0`, `name` ASCII-uppercased, into `key`; returns the
+    /// length written, NUL included. `KEY_CAP` bounds every combination.
+    fn build_key(key: &mut [u8; KEY_CAP], prefix: &[u8], name: &[u8]) -> usize {
+        let mut n = 0;
+        for &b in prefix {
+            key[n] = b;
+            n += 1;
+        }
+        for &b in name {
+            key[n] = b.to_ascii_uppercase();
+            n += 1;
+        }
+        key[n] = 0;
+        n + 1
+    }
+
+    /// One variable, no allocation: `prim::getenv` on a hosted OS.
+    #[cfg(all(any(windows, unix), not(miri)))]
+    fn lookup(key: &[u8], out: &mut [u8]) -> Option<usize> {
+        crate::prim::getenv(key, out)
+    }
+
+    /// The same through `std::env` where there is no raw `getenv` to call:
+    /// Miri, which interprets `std::env` itself, and wasm32-wasip1. This arm
+    /// allocates, and that is accepted — neither is a shipping host.
+    #[cfg(not(all(any(windows, unix), not(miri))))]
+    fn lookup(key: &[u8], out: &mut [u8]) -> Option<usize> {
+        let name = core::str::from_utf8(key.split_last()?.1).ok()?;
+        let v = std::env::var_os(name)?;
+        let v = v.to_str()?.as_bytes();
+        if v.len() >= out.len() {
+            return None;
+        }
+        out[..v.len()].copy_from_slice(v);
+        Some(v.len())
+    }
+
+    /// mimalloc's value grammar, on the bytes in place: 1/0/true/false/yes/
+    /// no/on/off in any case (an empty value is 1), else a decimal integer.
+    fn parse_value(v: &[u8]) -> Option<i64> {
+        let t = core::str::from_utf8(v).ok()?.trim();
+        if ["", "1", "true", "yes", "on"]
+            .iter()
+            .any(|w| t.eq_ignore_ascii_case(w))
+        {
+            return Some(1);
+        }
+        if ["0", "false", "no", "off"]
+            .iter()
+            .any(|w| t.eq_ignore_ascii_case(w))
+        {
+            return Some(0);
+        }
+        t.parse::<i64>().ok()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn keys_are_the_uppercased_names_with_a_nul_and_always_fit() {
+            let mut key = [0u8; KEY_CAP];
+            let n = build_key(&mut key, b"RUSTY_ALLOC_", b"purge_delay");
+            assert_eq!(&key[..n], b"RUSTY_ALLOC_PURGE_DELAY\0");
+            let n = build_key(&mut key, b"MIMALLOC_", b"show_stats");
+            assert_eq!(&key[..n], b"MIMALLOC_SHOW_STATS\0");
+            // The longest name with the longer prefix is exactly what the
+            // buffer was sized for; `build_key` would panic past it.
+            for name in OPTION_NAMES {
+                let n = build_key(&mut key, b"RUSTY_ALLOC_", name.as_bytes());
+                assert!(n <= KEY_CAP, "{name}");
+                assert_eq!(key[n - 1], 0);
+            }
+        }
+
+        #[test]
+        fn values_follow_mimalloc_grammar() {
+            assert_eq!(parse_value(b""), Some(1));
+            assert_eq!(parse_value(b"  On "), Some(1));
+            assert_eq!(parse_value(b"TRUE"), Some(1));
+            assert_eq!(parse_value(b"off"), Some(0));
+            assert_eq!(parse_value(b"No"), Some(0));
+            assert_eq!(parse_value(b" -1 "), Some(-1));
+            assert_eq!(parse_value(b"1048576"), Some(1_048_576));
+            assert_eq!(parse_value(b"maybe"), None);
+            assert_eq!(parse_value(&[0xff, 0xfe]), None);
+        }
+
+        #[test]
+        fn lookup_reads_the_process_environment_in_place() {
+            // SAFETY: this test is the only writer of these names, and the
+            // one reader of the environment in this process — the one-shot
+            // option pass — ran when the harness made its first allocation.
+            unsafe {
+                std::env::set_var("RUSTY_ALLOC_TEST_PROBE", " 42 ");
+                std::env::set_var("RUSTY_ALLOC_TEST_LONG_PROBE", "x".repeat(VALUE_CAP));
+            }
+            let mut out = [0u8; VALUE_CAP];
+            let n = lookup(b"RUSTY_ALLOC_TEST_PROBE\0", &mut out).expect("set");
+            assert_eq!(&out[..n], b" 42 ");
+            assert_eq!(parse_value(&out[..n]), Some(42));
+            assert_eq!(lookup(b"RUSTY_ALLOC_TEST_PROBE_UNSET\0", &mut out), None);
+            // A value that does not fit is not an option value.
+            assert_eq!(lookup(b"RUSTY_ALLOC_TEST_LONG_PROBE\0", &mut out), None);
+        }
     }
 }
 
@@ -385,6 +667,13 @@ pub fn get(option: usize) -> i64 {
     if crate::ONE_REGION {
         return DEFAULTS[option];
     }
+    // NOTE (2026-09-24, REFUTED): a "table complete" flag, so the steady
+    // state could skip the `i64::MIN` sentinel test below, measured flat on
+    // every opscan op and slightly worse on real programs (allocator Ir lua
+    // +527, perl +255, sqlite +162). The sentinel is already free where it is
+    // hot: the callers test the value's SIGN, `i64::MIN` is negative, and
+    // LLVM folds both questions into one `js` (see `span_free`'s
+    // `purge_delay` read).
     ensure_init();
     let v = VALUES[option].load(Ordering::Acquire);
     if v == i64::MIN { DEFAULTS[option] } else { v }
@@ -633,12 +922,6 @@ pub fn deferred_free(force: bool) {
     if DEFERRED_FUN.load_fun().is_null() {
         return;
     }
-    // A hook that allocates re-enters `malloc_generic` → `deferred_free`.
-    // Without a per-thread guard that recurses until the stack dies
-    // (OH-rusty_alloc-17).
-    if IN_DEFERRED.with(|c| c.get()) {
-        return;
-    }
     fire_deferred(force);
 }
 
@@ -649,9 +932,25 @@ pub fn deferred_free(force: bool) {
 /// forces the whole heartbeat's caller to preserve callee-saved registers, on
 /// every slow-path allocation, for a hook that is unregistered in nearly every
 /// process. The peek above is all the common path executes.
+///
+/// The re-entry guard lives HERE, not in `deferred_free`, and that is the
+/// point of it. In a cdylib `IN_DEFERRED` is a general-dynamic thread-local,
+/// so reading it is a call to `__tls_get_addr` — and LLVM treats that address
+/// computation as free to hoist, so with the guard inline it ran ABOVE the
+/// null test of the hook pointer: **12 Ir in `__tls_get_addr` on every
+/// slow-path allocation**, for a hook no process had registered (callgrind,
+/// opscan `huge`/`big`; the disassembly loads `DEFERRED_FUN` and calls
+/// `__tls_get_addr` before testing it). Out here it runs only when a hook
+/// exists.
 #[cold]
 #[inline(never)]
 fn fire_deferred(force: bool) {
+    // A hook that allocates re-enters `malloc_generic` → `deferred_free`.
+    // Without a per-thread guard that recurses until the stack dies
+    // (OH-rusty_alloc-17).
+    if IN_DEFERRED.with(|c| c.get()) {
+        return;
+    }
     IN_DEFERRED.with(|c| c.set(true));
     let _clear = HookExit(|| IN_DEFERRED.with(|c| c.set(false)));
     let (f, a) = DEFERRED_FUN.load();

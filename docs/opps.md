@@ -32,6 +32,8 @@ are to try.
 | 7 | `wait_no_remote_in_flight` 512-slot scan | 3 | latency | **LANDED — bounded to the carved region** |
 | 8 | Collect-loop double `block_next` | — | batch loss | **banked (landed)** |
 | 9 | `process_delayed` swaps an empty list every slow-path alloc | 3 | slow path | **LANDED — load-before-swap** |
+| 10 | Huge `realloc` grows in place inside the reservation's slack | 3 | huge realloc | **NOT BUILT (2026-09-24) — no measured workload reaches it; a load and a branch on every moving realloc** |
+| 11 | Recycle retained huge chunks' untouched tail for small objects | 3 | footprint | **OPEN — backlog from `docs/plans/youslowbro.md` §5** |
 
 ---
 
@@ -308,6 +310,47 @@ It would trade latency for instruction count — and this project's metric is Ir
 so it would read as `aligned` regressing in every opscan. Not shipped;
 `page_collect`'s xthread steal was already load-guarded before it CASes, so #9
 was the one place the pattern actually paid.
+
+## From a consumer report — `docs/plans/youslowbro.md` (2026-09-24)
+
+### 10. Huge `realloc` in place inside the reservation — NOT BUILT
+
+**Where:** `alloc.rs::realloc`'s move arm; `segment.rs::huge_alloc`.
+
+A huge block's reservation is chunk-rounded — 64 MiB for a 33 MB request, 96
+MiB for 64 MB — so up to a chunk of committed, never-touched slack sits after
+the block. Until 2026-09-24 the page REPORTED that slack as its usable size,
+which made a `realloc` that fit inside it free and made every `realloc` past
+it copy the whole slack: the 1.41x / 1.23x loss `youslowbro.md` §3 measured.
+The fix reports the request (upstream's `psize`), and the in-place growth
+went with it.
+
+It could be kept deliberately: in the move arm, if the page is `HUGE_SEGMENT`
+and `newsize <= total_size - (block - seg)`, bump `block_size` and return
+`p`. The arithmetic against building it now: the growth that consumers hit
+is a `Vec` doubling (33 -> 66 MB, 64 -> 128 MB), which never fits the slack
+(capacity 64 MiB - 64 KiB and 96 MiB - 64 KiB respectively), so the only
+beneficiary is a sub-2x grow of a block already above 32 MiB — a pattern no
+report has named — while the test is a flags load and a branch on EVERY
+moving `realloc`, which is the whole of the `realloc` opscan op (277 Ir/op,
+all moves). Not built. If a workload with that shape appears, price it on
+opscan `realloc` first; the hook is a `#[cold]` arm after the in-place test,
+and `total_size` already holds the capacity.
+
+### 11. Recycle a retained huge chunk's untouched tail for small objects — OPEN
+
+**Where:** `arena.rs` chunk bitmap; `segment.rs::segment_alloc`.
+
+`youslowbro.md` §5: after 456 MB of huge blocks are freed, 45 MB of 224-byte
+blocks raise the working set from 461 to 494 MB — mimalloc reads 491, so it
+is not a regression against upstream. The chunks DO come back through the
+arena bitmap and a fresh segment takes one, so the recycling exists; what
+rises is first-touch of the pages inside those chunks that the huge block
+never wrote (a 38 MB block leaves 26 MB of its 64 MiB pair untouched). A
+segment carved from a recycled chunk could prefer the touched prefix, or the
+arena could hand a 64 MiB pair's touched half out first. Backlog: needs the
+`retain` probe from the consumer's harness as its instrument, and a working
+set number, not an instruction count, as its verdict.
 
 ## Banked
 

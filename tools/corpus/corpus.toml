@@ -49,3 +49,13 @@ name = "rusty_maplibre"
 path = "F:/coding/rusty_maplibre"
 features = ""
 note = "KNOWN RISK: takes rusty_alloc AND rusty_alloc-api with default-features = false, which is exactly what 2.0.0 redefines"
+
+[[consumer]]
+name = "spacedb (published mirror)"
+path = "F:/coding/spacedb"
+pkg = "spacedb-sdk"
+features = ""
+# The standalone checkout `release/release.sh` generates from mata-master's
+# packages — the tree crates.io receives. Registered separately because it is
+# what ships, and it carries its own workspace root (no synth needed).
+note = "generated mirror of packages/spacedb; rusty_alloc-api =1.1.6, default-on"

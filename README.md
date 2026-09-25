@@ -23,7 +23,11 @@ does not offer.
 ## The headline
 
 - Counting only the allocator's own instructions, where the comparison actually lives:
-  **0.66× / 0.83× / 0.85×**.
+  **0.52× / 0.81× / 0.83× mimalloc** on lua / perl / sqlite.
+- **Rust programs got their own fast path**: `#[global_allocator]` users see
+  **up to −27 % whole-program instructions** against 2.2.0, with outputs
+  checked byte-for-byte on real consumers — see
+  [Rust programs](#rust-programs-globalalloc).
 - **A double free aborts instead of corrupting.** Upstream mimalloc accepts it
   silently in release builds; we detect it on both the local and the
   cross-thread path and abort.
@@ -80,7 +84,7 @@ WHOLE-PROGRAM instructions:
 
 | workload | vs mimalloc | vs jemalloc | vs glibc |
 |---|---:|---:|---:|
-| lua | **0.97** | **0.84** | 0.82 |
+| lua | **0.96** | **0.84** | 0.81 |
 | perl | **0.99** | **0.89** | 0.81 |
 | sqlite | **1.00** | **0.98** | 0.99 |
 
@@ -90,9 +94,61 @@ runs, decomposed:
 
 | workload | allocator share | **allocator-only ra/mi** | whole program | floor if our allocator cost ZERO |
 |---|---:|---:|---:|---:|
-| lua | 4.9% | **0.66** | 0.97 | 0.93 |
-| perl | 3.3% | **0.83** | 0.99 | 0.96 |
-| sqlite | 1.5% | **0.85** | 1.00 | 0.98 |
+| lua | 3.9% | **0.52** | 0.96 | 0.93 |
+| perl | 3.2% | **0.81** | 0.99 | 0.96 |
+| sqlite | 1.5% | **0.83** | 1.00 | 0.98 |
+
+Allocator-only Ir is summed by OBJECT from the raw callgrind file
+(`bench/icount-arms.sh`), so code inlined from any source file counts. Measured
+2026-09-25 against the mimalloc v2.4.5 oracle build.
+
+**What moved since 2.2.0** — four rounds of exact-instruction work, every
+change gated on the counts and on the full suites (`docs/LEDGER.md`,
+CURIOSITY rounds one to four). Per-op, `bench/opscan.c` (lower is better):
+
+| op | 2.2.0 (`c9631f4`) | now | Δ |
+|---|---:|---:|---:|
+| cross-thread free (`xthread`) | 113.71 | **77.26** | −32 % |
+| huge (2 MiB) alloc + free | 689.68 | **293.68** | −57 % |
+| `big` (4 KiB) alloc + free | 121.00 | **92.00** | −24 % |
+| `mixed` sizes | 110.93 | **92.82** | −16 % |
+| `calloc` | 107.57 | **93.19** | −13 % |
+| `posix_memalign` | 97.88 | **83.69** | −14 % |
+| `realloc` (grow) | 259.86 | **231.20** | −11 % |
+| `small` (32 B) alloc + free | 54.39 | **52.25** | −4 % |
+
+Process start-up also got cheaper: reading the allocator's options used to
+walk the environment 76 times; on Linux it now walks it once, about 25,000
+instructions saved on every process launch.
+
+### Rust programs (`GlobalAlloc`)
+
+Rust deliverables reach the allocator through `GlobalAlloc`, which the C
+instruments above never exercise. Three deterministic Rust workloads
+(`bench/rust-globalalloc.sh`, whole-program Ir per 20,000 steps, identical
+checksums between arms):
+
+| workload | 2.2.0 (`c9631f4`) | now | Δ |
+|---|---:|---:|---:|
+| boxed trees, buffers, `Rc` | 23,357,670 | 18,436,430 | **−21.1 %** |
+| hash maps, B-trees, strings | 28,220,088 | 26,577,921 | **−5.8 %** |
+| cache-line-aligned buffers (`realloc`) | 1,856,092 | 1,349,905 | **−27.3 %** |
+| short-lived threads | 12,201,584 | 12,105,054 | −0.8 % |
+
+What changed: the `GlobalAlloc` methods are `#[inline]` (as the `mimalloc`
+crate's are), so rustc's `__rust_alloc` shims carry the fast path instead of
+jumping to it; `dealloc` is the free fast path with its null test folded
+away; layouts aligned to 16 bytes — every hashbrown table — are served from
+the ordinary size classes, which are already 16-aligned, instead of the
+aligned path; and `realloc` at any alignment keeps a block in place when it
+fits instead of always copying.
+
+**Checked on real consumers, not just counted.** On 2026-09-25 SpaceDB (whole
+workspace, 314 tests) and rusty_zstd (194 tests plus C-zstd cross tests) ran
+on this allocator on Windows and Linux, and the Silesia corpus went through
+rusty_zstd's CLI: every file at levels 1/3/9/19 and 4 threads compressed
+**byte-identically** to the same CLI on 2.2.0 and round-tripped through C zstd
+1.5.7 both ways (`tools/corpus/`, `docs/LEDGER.md` DOWNSTREAM CORPUS).
 
 **Where this came from: `free`.** It is the function a real program spends its
 allocator time in, so it is the one worth counting instruction by instruction.
@@ -317,6 +373,16 @@ suite asserts the allocator *aborts* on a poisoned free list.
 
 **Portability** — x86-64 and aarch64, Linux, macOS and Windows, plus
 `wasm32-unknown-unknown` via `memory.grow`.
+
+**Memory** — freed memory stays mapped and committed by default, as it does
+in upstream mimalloc: `purge_delay` ships at `-1`, so a process that once held
+a large peak keeps reading near that peak in `RSS` / working set afterwards
+(a consumer measured 461 MB retained after freeing 456 MB of huge blocks,
+where the Windows heap fell back to 4 MB — and mimalloc read the same 461 MB).
+That is the trade that makes re-use fast. To hand freed spans back, set
+`RUSTY_ALLOC_PURGE_DELAY` (or `MIMALLOC_PURGE_DELAY`) to a delay in
+milliseconds, `0` for as soon as a span is free, or call
+`options::set(15, delay)` before the first allocation.
 
 ## Install
 

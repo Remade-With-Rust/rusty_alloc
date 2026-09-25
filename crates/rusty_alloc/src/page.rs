@@ -831,15 +831,37 @@ pub unsafe fn remote_free(page: *mut Page, block: *mut Block) {
                                 break;
                             }
                         }
-                        // Restore DELAYED, preserving whatever the owner did
-                        // to the pointer bits meanwhile.
+                        // Release FREEING, preserving whatever the owner did
+                        // to the pointer bits meanwhile — to NORMAL, as
+                        // upstream does (`mi_tf_set_delayed(.., MI_NO_DELAYED_FREE)`
+                        // in `_mi_free_block_mt`), not back to DELAYED.
+                        //
+                        // One block on the owner's delayed list is all the
+                        // owner needs: draining it un-parks the page
+                        // (`free_local_at`), and from then on the page is
+                        // scanned. Restoring DELAYED sent EVERY later remote
+                        // free to a parked page through this three-CAS route
+                        // and the owner through `drain_delayed` +
+                        // `free_local_at` per block — 82 % of the frees on the
+                        // `xthread` op. After NORMAL they are one CAS onto the
+                        // page's own list, collected in bulk.
+                        //
+                        // SINGLE-BLOCK pages (large spans, huge segments) keep
+                        // DELAYED: they are never scanned, so their only route
+                        // to the owner is this list.
+                        let restore =
+                            if (*page).flags.load(Ordering::Relaxed) & pflags::SINGLE_BLOCK != 0 {
+                                XFLAG_DELAYED
+                            } else {
+                                XFLAG_NORMAL
+                            };
                         loop {
                             let y = (*page).xthread_free.load(Ordering::Acquire);
                             if (*page)
                                 .xthread_free
                                 .compare_exchange_weak(
                                     y,
-                                    (y & !XMASK) | XFLAG_DELAYED,
+                                    (y & !XMASK) | restore,
                                     Ordering::AcqRel,
                                     Ordering::Relaxed,
                                 )
@@ -1056,6 +1078,14 @@ unsafe fn page_collect_impl<const SET_FLAG: bool>(page: *mut Page, flag: usize) 
             let mut tail = head;
             let mut n = 1u32;
             loop {
+                // NOTE (2026-09-24, REFUTED): calling the may-return
+                // `remote_double_free` here instead — to stop this diverging
+                // call pinning an alignment `push` to the top of
+                // `malloc_generic_once`'s frameless medium arm — made it far
+                // WORSE: a call that may return, inside the walk loop, keeps
+                // `tail`/`n`/`page` live across it, and the entry grew a
+                // six-register frame (opscan `huge` +20.00, every op worse).
+                // The may-return trick works only in TAIL position.
                 if n > used {
                     double_free_abort();
                 }
@@ -1090,6 +1120,17 @@ const EXTEND_SHIFT_BASE: u32 = {
     );
     crate::types::SEGMENT_SLICE_SIZE.trailing_zeros() - 12
 };
+
+/// The fewest blocks one [`page_extend`] links, whatever the block size —
+/// upstream's `MI_MIN_EXTEND` (4 outside its secure mode).
+///
+/// Ours was an implicit 1 (`.max(1)`), a drift from upstream: every class
+/// whose 4 KiB byte bound rounds below four blocks — everything above 1 KiB —
+/// was carved one to three blocks per extend, so on perl 8,990 of 10,639
+/// extends linked one block and each was a full generic trip (callgrind, per
+/// instruction). The floor only moves list-linking earlier inside a span
+/// that is already committed; it touches at most four block headers.
+const MIN_EXTEND: usize = 4;
 
 /// Lazily extend the free list into never-used capacity (`mi_page_extend_free`).
 ///
@@ -1210,7 +1251,11 @@ pub unsafe fn page_extend(page: *mut Page, area: *mut u8) {
         // Derived, so it is correct at every geometry and byte-identical at the
         // default (65536 >> 12 == 16, whose log2 is the old 4).
         let span_shift = EXTEND_SHIFT_BASE + (*page).slice_count.trailing_zeros();
-        let take = ((reserved >> span_shift).max(1)).min(reserved - capacity);
+        // At least `MIN_EXTEND` blocks, as upstream (`MI_MIN_EXTEND`, 4): the
+        // byte bound alone gives ONE block to any class above 4 KiB and one
+        // to three to classes above 1 KiB, so a fresh medium page served one
+        // allocation per slow-path trip. See `MIN_EXTEND`.
+        let take = ((reserved >> span_shift).max(MIN_EXTEND)).min(reserved - capacity);
         let start = area.add(capacity * bsize);
         // Link the fresh blocks in address order.
         //

@@ -4,8 +4,16 @@
 //! own heap, `free` routes by the segment's owner id, and cross-thread frees go
 //! through the loom-modeled 4-state protocol in `page.rs`.
 
+use core::cell::Cell;
 use core::ptr;
 use core::sync::atomic::Ordering;
+
+ra_thread_local! {
+    /// Set while `Heap::malloc_generic_retry` runs its one reclaim-and-retry,
+    /// so a second null from the nested pass ends the attempt. Read only on
+    /// the OOM path; see `Heap::malloc_generic` for why it is not a parameter.
+    static IN_OOM_RETRY: Cell<bool> = const { Cell::new(false) };
+}
 
 use crate::bins::{self, BIN_COUNT, PAGES_DIRECT};
 use crate::page::{
@@ -393,6 +401,19 @@ impl Heap {
                 return b;
             }
         }
+        self.zalloc_generic(size)
+    }
+
+    /// `zalloc`'s miss, out of line and in TAIL position.
+    ///
+    /// Inline, this arm's call to `malloc_generic` had to return here to zero
+    /// the block, so `size` was live across it and every `calloc` — hit or
+    /// miss — paid a frame for it: `push`/`push` on entry and `add`/`pop`/
+    /// `pop` before the fast path's `jmp memset` (callgrind, opscan `calloc`,
+    /// hit rate 94 %). Out here the fast path is a leaf.
+    #[cold]
+    #[inline(never)]
+    fn zalloc_generic(&mut self, size: usize) -> *mut u8 {
         // Slow/large path: rare, and the generic allocator has resolved the
         // page anyway. Recover the usable size the general way.
         let (b, is_zero) = self.malloc_generic(size);
@@ -434,20 +455,84 @@ impl Heap {
     /// only ~649 generic trips in total, far under the 10,000 default, so the
     /// timer never fires. This trigger is failure, not a clock.
     ///
-    /// **Costs nothing on the happy path**: it runs only when the allocation
-    /// was about to fail. `collect_inner(true, true)` is `mi_collect(true)` —
-    /// reclaim orphans too, since this is the last resort before null.
+    /// `collect_inner(true, true)` is `mi_collect(true)` — reclaim orphans
+    /// too, since this is the last resort before null.
+    ///
+    /// **Where the retry test lives is a cost decision.** It first sat here as
+    /// `let r = once(size); if r.0.is_null() { collect; once(size) }`, which
+    /// read as free on the happy path and was not: a test AFTER the call means
+    /// the call is no longer in tail position, so `alloc::malloc_slow` — whose
+    /// own doc says "this arm must stay a TAIL call" — grew a frame, a spill of
+    /// `size` and a `test; je` again, 16 Ir around a 1-instruction jump on
+    /// every slow-path allocation (callgrind, opscan `big`). Now the test is in
+    /// `malloc_generic_once`'s epilogue, where the result is already in a
+    /// register, and this wrapper is a tail call.
+    ///
+    /// And "only once" is a THREAD-LOCAL, not a parameter. As a `retry: bool`
+    /// argument it cost every generic trip a `mov $1` at the call, a copy into
+    /// a callee-saved register, and a flag test ahead of the null test in the
+    /// epilogue — about four instructions to decide something only a null
+    /// result ever asks. Now the epilogue tests the result alone, and the flag
+    /// is read on the OOM path only.
+    ///
+    /// Inside the chain the zero flag is a `u8`, and it becomes a `bool` only
+    /// here. A `(*mut u8, bool)` pair return makes the caller re-truncate the
+    /// flag (`and $0x1,%dl`) after every call that returns one, which is what
+    /// kept `malloc_generic_once` from TAIL-calling `grow_front` — the
+    /// commonest generic outcome on a real program (jq: 10,307 of 11,229
+    /// trips) — and the walk. Callers that want only the pointer, like
+    /// `alloc::malloc_slow`, drop the conversion entirely.
+    #[inline]
     pub(crate) fn malloc_generic(&mut self, size: usize) -> (*mut u8, bool) {
-        let r = self.malloc_generic_once(size);
-        if !r.0.is_null() {
-            return r;
-        }
-        // SAFETY: owner thread; `collect_inner` allocates nothing.
-        unsafe { self.collect_inner(true, true) };
-        self.malloc_generic_once(size)
+        let (p, z) = self.malloc_generic_once(size);
+        (p, z != 0)
     }
 
-    fn malloc_generic_once(&mut self, size: usize) -> (*mut u8, bool) {
+    /// One pass of the generic path; on null, one reclaim-and-retry through
+    /// [`Heap::malloc_generic_retry`].
+    ///
+    /// NOTE (2026-09-24, REFUTED on real programs): splitting the medium
+    /// collect-and-retry into a frameless entry that tail-calls the rest was
+    /// worth **-11.00 Ir/op** on opscan `big`/`large` and -6.83 on `mixed` —
+    /// the arm was paying this function's four-register frame. It cost every
+    /// OTHER generic trip ~8 Ir (an alignment `push` pinned by the collect
+    /// walk's diverging `double_free_abort`, a `pop`, a bool zero-extension
+    /// and a jump), and real programs make more of those than medium hits:
+    /// allocator Ir **lua +31,945, perl +23,549, sqlite +15,997**. Reverted.
+    /// Making the abort a may-return callee to drop the `push` was far worse
+    /// (see `page_collect_impl`).
+    ///
+    /// The OOM test is NOT here. In this epilogue it sat after every arm,
+    /// including the one that serves most real-program trips — jq: 10,307 of
+    /// 11,229 generic trips end in `grow_front` — which it turned from a tail
+    /// call into `call`, `jmp`, a copy and a `test; jne` (callgrind, per
+    /// instruction), for an arm that cannot fail. It lives at the three exits
+    /// that CAN return null: the fresh-page carve at the end of the walk, and
+    /// the large and huge arms.
+    #[inline(never)]
+    fn malloc_generic_once(&mut self, size: usize) -> (*mut u8, u8) {
+        self.malloc_generic_body(size)
+    }
+
+    /// The reclaim-and-retry. The nested pass it makes lands back here on a
+    /// second null, and `IN_OOM_RETRY` is what turns that into the final
+    /// answer instead of another round.
+    #[cold]
+    #[inline(never)]
+    fn malloc_generic_retry(&mut self, size: usize) -> (*mut u8, u8) {
+        if IN_OOM_RETRY.with(Cell::get) {
+            return (ptr::null_mut(), 0);
+        }
+        IN_OOM_RETRY.with(|c| c.set(true));
+        // SAFETY: owner thread; `collect_inner` allocates nothing.
+        unsafe { self.collect_inner(true, true) };
+        let r = self.malloc_generic_once(size);
+        IN_OOM_RETRY.with(|c| c.set(false));
+        r
+    }
+
+    #[inline(always)]
+    fn malloc_generic_body(&mut self, size: usize) -> (*mut u8, u8) {
         self.stats.generic += 1;
         // Guarded objects (secure/guarded builds): sampled allocations get a
         // dedicated segment whose trailing page is PROT_NONE, so an overflow
@@ -460,7 +545,7 @@ impl Heap {
             && self.guarded_rate != 0
             && let Some(r) = self.try_guarded(size)
         {
-            return r;
+            return (r.0, u8::from(r.1));
         }
         // COLLECT-AND-RETRY for the medium band, and it TURNS ITSELF OFF.
         //
@@ -487,24 +572,74 @@ impl Heap {
         // allocations keeps the win however many threads the process has; a
         // producer whose pages a consumer frees pays one detection and then
         // behaves exactly as before.
+        // NOTE (2026-09-24, REFUTED): the arm usually MISSES on a real program
+        // (perl: 7,708 of 11,384 generic trips entered it, 7,695 found the
+        // front page dry after the collect), so those trips derive this bin
+        // twice — here and after the heartbeat. Computing it ONCE above both
+        // uses made it live across the heartbeat's calls: opscan `big`/`large`
+        // +17.00, `mixed` +11.86, perl allocator +101,962. Recomputing a pure
+        // value is cheaper than holding it in a callee-saved register.
         if !self.saw_remote_free && size > SMALL_SIZE_MAX && size <= MEDIUM_OBJ_SIZE_MAX {
             let bin = bins::bin(size);
             let p = self.pages[bin].first;
             if !p.is_null() {
-                // SAFETY: queue members are live pages of this heap, we are the
-                // owner thread, and `page_collect` is the same operation the
-                // walk below performs on this page.
-                let (stole, b) = unsafe {
-                    let stole = crate::page::page_collect(p);
-                    (stole, page_pop(p))
-                };
-                if stole {
-                    self.saw_remote_free = true;
-                }
+                // POP FIRST, as `malloc`'s own fast path does: when the front
+                // page's free list is non-empty the collect below changes
+                // nothing the pop needs — it would test the list, read the
+                // cross-thread word and re-load the list, eight instructions
+                // ahead of the pop on every medium hit (opscan `mixed`,
+                // callgrind per instruction). Remote frees still get
+                // collected, and the latch below still set, the first time
+                // the list runs dry.
+                // SAFETY: as for the collect-and-pop below.
+                let b = unsafe { page_pop(p) };
                 if !b.is_null() {
                     self.stat_alloc();
                     // SAFETY: p live per above.
-                    return (b, unsafe { (*p).free_is_zero });
+                    return (b, u8::from(unsafe { (*p).free_is_zero }));
+                }
+                // SAFETY: queue members are live pages of this heap, we are the
+                // owner thread, and `page_collect` is the same operation the
+                // walk below performs on this page.
+                //
+                // The latch is stored BEFORE the pop, inside the branch that
+                // knows it. Written as `(stole, pop)` and tested after, LLVM
+                // merged the two collect outcomes first and then materialised
+                // and re-tested a flag that is constant on the path that
+                // matters — `xor %eax,%eax` … `test %al,%al; je`, two dead
+                // instructions on every medium hit (opscan `big`/`large`).
+                if unsafe { crate::page::page_collect(p) } {
+                    self.saw_remote_free = true;
+                }
+                // SAFETY: as above.
+                let b = unsafe { page_pop(p) };
+                if !b.is_null() {
+                    self.stat_alloc();
+                    // SAFETY: p live per above.
+                    return (b, u8::from(unsafe { (*p).free_is_zero }));
+                }
+                // The front page is dry but not fully carved: grow it HERE.
+                // Falling through, the trip ran the heartbeat, derived this
+                // same bin again, collected this same page again and only
+                // then reached `grow_front` — and on a real program that is
+                // the common medium outcome, not the hit (perl: 7,693 of
+                // 7,707 medium trips missed here; callgrind, per
+                // instruction). Skipping the heartbeat is what the hit above
+                // already does; it still runs when the page is exhausted and
+                // the walk is needed.
+                // SAFETY: `p` is the live front page of this bin's queue,
+                // its free list just came back empty, and it has room to
+                // carve — `grow_front`'s contract.
+                //
+                // `w` is passed as "above the direct table" rather than
+                // computed: `grow_front` reads it only for that test, a medium
+                // size is always above it, and computing `wsize_from_size`
+                // here made LLVM rewrite the bin arithmetic on the HIT path
+                // above (+5.00 Ir/op on opscan `big`/`large`).
+                unsafe {
+                    if (*p).capacity < (*p).reserved {
+                        return self.grow_front(bin, crate::types::SMALL_WSIZE_MAX + 1, p);
+                    }
                 }
             }
         }
@@ -527,20 +662,30 @@ impl Heap {
         //
         // `reclaim = false`: this is a routine sweep of our own pages, not the
         // orphan adoption a forced `mi_collect(true)` performs.
-        if self.generic_countdown == 0 {
+        //
+        // One decrement whose wrap means "it was zero", rather than a test
+        // and then a decrement: the same schedule (N trips between sweeps,
+        // reset on the trip that finds zero), in a form that is a
+        // memory-destination `sub` and one branch on every generic trip
+        // instead of load, test, branch, decrement and store.
+        let left = self.generic_countdown.wrapping_sub(1);
+        self.generic_countdown = left;
+        if left == usize::MAX {
             self.generic_countdown =
                 crate::options::get_clamp(crate::options::GENERIC_COLLECT, 1, 1_000_000) as usize;
             // SAFETY: owner thread, and `collect_inner` allocates nothing.
             unsafe { self.collect_inner(false, false) };
-        } else {
-            self.generic_countdown -= 1;
         }
         if size > MEDIUM_OBJ_SIZE_MAX {
-            return if size <= LARGE_OBJ_SIZE_MAX {
+            let r = if size <= LARGE_OBJ_SIZE_MAX {
                 self.large_alloc(size)
             } else {
                 self.huge_alloc(size, 8, 0)
             };
+            if r.0.is_null() {
+                return self.malloc_generic_retry(size);
+            }
+            return (r.0, u8::from(r.1));
         }
         let bin = bins::bin(size);
         let w = wsize_from_size(size);
@@ -568,7 +713,7 @@ impl Heap {
                     }
                     let b = page_pop(p);
                     self.stat_alloc();
-                    return (b, (*p).free_is_zero);
+                    return (b, u8::from((*p).free_is_zero));
                 }
                 if (*p).capacity < (*p).reserved {
                     return self.grow_front(bin, w, p);
@@ -613,7 +758,7 @@ impl Heap {
     /// `capacity < reserved`.
     #[cold]
     #[inline(never)]
-    unsafe fn grow_front(&mut self, bin: usize, w: usize, p: *mut Page) -> (*mut u8, bool) {
+    unsafe fn grow_front(&mut self, bin: usize, w: usize, p: *mut Page) -> (*mut u8, u8) {
         // SAFETY: forwarded contract.
         unsafe {
             page_extend(p, (*p).area);
@@ -626,7 +771,7 @@ impl Heap {
             }
             let b = page_pop(p);
             self.stat_alloc();
-            (b, (*p).free_is_zero)
+            (b, u8::from((*p).free_is_zero))
         }
     }
 
@@ -646,7 +791,7 @@ impl Heap {
     /// # Safety
     /// `bin` indexes `self.pages`.
     #[inline(never)]
-    unsafe fn malloc_generic_walk(&mut self, bin: usize) -> (*mut u8, bool) {
+    unsafe fn malloc_generic_walk(&mut self, bin: usize) -> (*mut u8, u8) {
         // SAFETY: all page/queue manipulation below happens under the heap
         // lock on pages owned by this heap; raw pointers are used so no two
         // Rust references to the same Page coexist.
@@ -692,7 +837,7 @@ impl Heap {
                     self.update_direct(bin);
                     let b = page_pop(p);
                     self.stat_alloc();
-                    return (b, (*p).free_is_zero);
+                    return (b, u8::from((*p).free_is_zero));
                 }
                 // Truly full: park it so the queue front stays useful.
                 let next = (*p).next;
@@ -721,14 +866,18 @@ impl Heap {
             let p = self.fresh_page(bin, bsize);
             if p.is_null() {
                 self.update_direct(bin);
-                return (ptr::null_mut(), false); // OOM
+                // OOM: the one reclaim-and-retry, with this bin's block size —
+                // the same class and the same block the caller would get.
+                // Here and not in `malloc_generic_once`'s epilogue: see
+                // `Heap::malloc_generic`.
+                return self.malloc_generic_retry(bsize);
             }
             page_extend(p, (*p).area);
             self.stats.extends += 1;
             self.update_direct(bin);
             let b = page_pop(p);
             self.stat_alloc();
-            (b, (*p).free_is_zero)
+            (b, u8::from((*p).free_is_zero))
         }
     }
 
@@ -964,6 +1113,11 @@ impl Heap {
         }
     }
 
+    /// Out of line: `segment::huge_alloc` returns its `Result` through a stack
+    /// slot, and inlined here that slot became part of `malloc_generic_once`'s
+    /// frame — a `sub`/`add` of the stack pointer on EVERY generic trip for
+    /// an arm taken on requests above 32 MiB (callgrind, per instruction).
+    #[inline(never)]
     fn huge_alloc(&mut self, size: usize, align: usize, offset: usize) -> (*mut u8, bool) {
         match segment::huge_alloc(size, align, offset, self.arena_id) {
             Ok((seg, block)) => {
@@ -1284,7 +1438,16 @@ impl Heap {
                 // EXACTLY flat: LLVM already inlines `free_local` and proves
                 // the block non-null from this loop's own condition.)
                 self.free_local(b.cast());
-                self.stats.delayed_frees += 1;
+                // Debug-only, like `allocs`/`frees` (`stat_alloc`) and
+                // upstream's `MI_STAT`: a read-modify-write per drained block
+                // on the cross-thread path, and nothing reads it but the stats
+                // printer — no test, bench or probe (unlike `generic` and
+                // `extends`, which the release bench prints as work-parity
+                // counters and so stay live).
+                #[cfg(debug_assertions)]
+                {
+                    self.stats.delayed_frees += 1;
+                }
                 b = next;
             }
         }
@@ -1363,6 +1526,15 @@ impl Heap {
             // Running queue pointer: `self.pages[bin]` re-indexed the array
             // (and re-borrowed `self`) on every one of the MAX_NORMAL_BIN
             // steps, on every collect.
+            //
+            // REFUTED (2026-09-25): moving the per-queue body out of line so
+            // this scan would keep its pointer in a register (inlined, the
+            // body's calls spill it, and every EMPTY queue pays a reload and a
+            // store: nine instructions per bin). The thread-exit workload
+            // gained 272 instructions per thread, but the split changed
+            // inlining around the generic path's periodic collect and every
+            // opscan op got worse — `big`/`large` +4.00, `mixed` +2.89 — with
+            // perl +45,287 and python +79,035 whole-program.
             let qbase: *mut PageQueue = (&raw mut self.pages).cast::<PageQueue>();
             let mut q: *mut PageQueue = qbase.add(1);
             while bin <= MAX_NORMAL_BIN {

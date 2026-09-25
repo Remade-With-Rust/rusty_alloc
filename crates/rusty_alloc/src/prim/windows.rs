@@ -13,6 +13,7 @@ use core::ptr;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use windows_sys::Win32::Foundation::GetLastError;
+use windows_sys::Win32::System::Environment::GetEnvironmentVariableA;
 use windows_sys::Win32::System::Memory::{
     GetLargePageMinimum, MEM_COMMIT, MEM_DECOMMIT, MEM_FREE, MEM_LARGE_PAGES, MEM_RELEASE,
     MEM_RESERVE, MEM_RESET, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
@@ -232,6 +233,28 @@ pub(super) fn numa_node_count() -> usize {
     // SAFETY: out-param is a valid local.
     let ok = unsafe { GetNumaHighestNodeNumber(&mut highest) };
     if ok != 0 { highest as usize + 1 } else { 1 }
+}
+
+/// `_mi_prim_getenv`: the value of `name` into `out`, no allocation of ours.
+///
+/// The ANSI form, as upstream's prim uses: option values are integers and
+/// booleans, so there is nothing to lose to the code page. The API converts
+/// the name to UTF-16 on the process heap — never through this allocator.
+pub(super) fn getenv(name: &[u8], out: &mut [u8]) -> Option<usize> {
+    let cap = u32::try_from(out.len()).ok()?;
+    // SAFETY: `name` is NUL-terminated (checked by `prim::getenv`); `out` is
+    // a live buffer of exactly `cap` bytes, and the call writes at most `cap`
+    // bytes into it — when the value does not fit it writes nothing and
+    // returns the size it would need.
+    let n = unsafe { GetEnvironmentVariableA(name.as_ptr(), out.as_mut_ptr(), cap) };
+    // 0 is "unset" or "empty", which the API cannot distinguish without a
+    // `GetLastError` round-trip; upstream's prim treats both as unset, and so
+    // does this. `n >= cap` means it did not fit: not an option value.
+    if n == 0 || n >= cap {
+        None
+    } else {
+        Some(n as usize)
+    }
 }
 
 #[inline]

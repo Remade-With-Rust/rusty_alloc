@@ -52,7 +52,26 @@ rusty_alloc-api = { version = "2", default-features = false, features = ["std"] 
 
 With that applied to the copy, the `rusty_alloc` error is gone.
 
-## Four things this harness got wrong before it got anything right
+## Run of 2026-09-25 (`--test`, after CURIOSITY rounds three and four)
+
+The first run to verify, per row, that the candidate resolved THIS tree.
+
+| consumer | result |
+|---|---|
+| `spacedb-sdk` | PASS |
+| `spacedb-sdk` (`secure`) | PASS |
+| `rusty_alloc_default` | PASS |
+| `rusty_zstd` (through the patched shim) | PASS |
+| `spacedb (published mirror)` (`F:/coding/spacedb`, new) | PASS |
+| `rusty_maplibre` | FAIL, the known 2.0.0 `no_std` break. With the documented `features = ["std"]` migration applied to the copy: **1,199 tests passed, 0 failed** |
+
+Beyond the harness, the same day (see `docs/LEDGER.md`, DOWNSTREAM CORPUS;
+the Silesia check is `tools/corpus/silesia.sh`):
+both SpaceDB and `rusty_zstd` workspaces ran their whole test suites on Linux
+with this tree's allocator `LD_PRELOAD`ed into every test binary, and Silesia
+went through `rusty_zstd`'s CLI against C zstd 1.5.7 on Windows and Linux.
+
+## Seven things this harness got wrong before it got anything right
 
 Recorded because each one made it lie, and a corpus that lies is worse than none
 — it gets muted.
@@ -76,6 +95,24 @@ Recorded because each one made it lie, and a corpus that lies is worse than none
    UNRELATED rule then swallowed. Re-running that consumer alone restored the
    true FAIL. **If a run shows fork or cygheap errors, re-run the affected
    consumer in isolation before believing its row.**
+
+5. **A PASS can test the wrong allocator.** Two ways, both found on
+   2026-09-25, and the first run's `rusty_zstd` PASS was one of them.
+   `rusty_zstd` names no `rusty_alloc*` crate; it reaches us through the
+   published `rusty_alloc_default` shim, which pins the crates.io allocator,
+   so its candidate never built this tree. And with `TMPDIR` inside this
+   repository, `repoint` skipped every manifest (its `/target/` exclusion
+   matched the copy's own path), so SpaceDB's candidates built crates.io
+   1.1.6 and PASSED. The shim is now patched to a repointed local copy, the
+   script refuses a work dir inside the repo, and **every candidate's
+   `Cargo.lock` is checked: a registry `rusty_alloc` in it is reported
+   NOT-REPOINTED, never PASS.**
+6. **A work dir inside this repository breaks copies that have no workspace
+   root:** cargo walks up into this repo's `[workspace]` and refuses to build
+   (`rusty_alloc_default` read FAIL for that reason alone).
+7. **`{ workspace = true }` entries must be left alone.** `repoint` added a
+   `path` to `rmap-alloc`'s inherited dependencies; the root is rewritten on
+   its own.
 
 ## What it still does not do
 

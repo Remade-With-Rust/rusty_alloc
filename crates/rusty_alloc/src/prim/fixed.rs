@@ -2085,6 +2085,10 @@ mod tests {
         assert!(!shape_of(SMALL_SIZE_MAX + 1).direct_route);
         // The route top is 1024 on 64-bit and 512 on 32-bit, whatever the
         // geometry -- it is a pointer-width fact, not a profile one.
+        // At the DEFAULT `SMALL_WSIZE_MAX`. The relationship asserted above
+        // holds at every setting of `ra_small_wsize`; these literals are the
+        // default arm's, and are pinned as such rather than unconditionally.
+        #[cfg(not(any(ra_small_wsize = "256", ra_small_wsize = "512")))]
         if core::mem::size_of::<usize>() == 8 {
             assert_eq!(SMALL_SIZE_MAX, 1024);
         } else if core::mem::size_of::<usize>() == 4 {
