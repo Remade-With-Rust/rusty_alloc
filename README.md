@@ -39,10 +39,14 @@ does not offer.
   measured on a XIAO ESP32-S3 at 240 MHz, both allocators built from one source.
   It costs more RAM to get that (64 KiB vs 8 KiB); both numbers are below.
 
-> **Status: `2.2.0`.** The API is frozen and changes follow semver. 2.0.1
-> through 2.0.5 were patch releases; 2.1.0 and 2.2.0 are minors because they
-> ADD public items and move none — `cargo-semver-checks` calls both
-> API-compatible. **2.2.0 also carries the largest embedded speed fix in this
+> **Status: `2.2.1`.** The API is frozen and changes follow semver. 2.0.1
+> through 2.0.5 and 2.2.1 are patch releases; 2.1.0 and 2.2.0 are minors because
+> they ADD public items and move none — `cargo-semver-checks` calls every one
+> API-compatible. **2.2.1 is a speed release** (it also adds `malloc_aligned_pow2` and `prim::getenv`, moving nothing): four rounds of exact-instruction
+> work (the cross-thread free 32 % cheaper, a 2 MiB allocate-and-free 57 %),
+> and a `GlobalAlloc` fast path worth up to 27 % whole-program on Rust
+> workloads — see [Performance](#performance-deterministic-instruction-counts).
+> **2.2.0 also carries the largest embedded speed fix in this
 > series:** under `--cfg ra_small_profile` every page was being extended one
 > block at a time, so `malloc_generic` ran on 100 % of allocations; on a XIAO
 > ESP32-S3 fixing it is **13–16 % faster on every binned workload**.

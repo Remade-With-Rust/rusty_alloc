@@ -7,16 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [2.3.0](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.2.0...rusty_alloc-v2.3.0) - 2026-09-25
-
-### Added
-
-- four rounds of deterministic instruction wins, a Rust GlobalAlloc fast path, and 16-byte natural alignment
-
-### Other
-
-- the three Ubuntu-only compile errors a Windows box cannot see
-- Openheimer, split: land the boundary fixes, drop the hot-path guards, write OH-11
+## [2.2.1](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.2.0...rusty_alloc-v2.2.1) - 2026-09-25
 
 ### Fixed
 

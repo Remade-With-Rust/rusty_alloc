@@ -7,15 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [2.3.0](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-api-v2.2.0...rusty_alloc-api-v2.3.0) - 2026-09-25
+## [2.2.1](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-api-v2.2.0...rusty_alloc-api-v2.2.1) - 2026-09-25
 
-### Added
+### Performance
 
-- four rounds of deterministic instruction wins, a Rust GlobalAlloc fast path, and 16-byte natural alignment
-
-### Other
-
-- release v2.2.0
+- **`GlobalAlloc` methods are `#[inline]`**, as the `mimalloc` crate's are, so
+  rustc's `__rust_alloc` / `__rust_dealloc` shims carry the fast path instead
+  of jumping to it, and `dealloc` is the free fast path with its null test
+  folded away. Measured whole-program against 2.2.0 on two deterministic Rust
+  workloads (`bench/rust-globalalloc.sh`): **-21.1 %** and **-5.8 %**.
+- **Layouts aligned up to two words (16 bytes on 64-bit) come from the natural
+  size classes**, which are already aligned that far, instead of the aligned
+  path; every hashbrown table is such a layout. `tests/natural_align.rs` pins
+  the alignment for every size class through alloc, alloc_zeroed and realloc.
+- **`realloc` keeps a block in place at any alignment when it fits** instead
+  of always allocating, copying and freeing above 8 bytes of alignment:
+  **-27.3 %** on an over-aligned buffer workload.
 
 ## [2.2.0](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-api-v2.1.0...rusty_alloc-api-v2.2.0) - 2026-09-10
 
