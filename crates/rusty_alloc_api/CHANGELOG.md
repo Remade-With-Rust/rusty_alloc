@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.0](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-api-v2.2.0...rusty_alloc-api-v2.3.0) - 2026-09-25
+
+### Added
+
+- four rounds of deterministic instruction wins, a Rust GlobalAlloc fast path, and 16-byte natural alignment
+
+### Other
+
+- release v2.2.0
+
 ## [2.2.0](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-api-v2.1.0...rusty_alloc-api-v2.2.0) - 2026-09-10
 
 ### Other
