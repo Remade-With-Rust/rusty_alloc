@@ -15,68 +15,65 @@
 
 # rusty_alloc
 
-A ground-up, pure-**Rust** general-purpose **allocator** — the mimalloc v2.4.5
-architecture rebuilt from the design rather than transliterated from the C. No
-C in the dependency tree, permissive licence, and a safety property upstream
-does not offer.
+## The world's first unified allocator, remade in Rust.
 
-## The headline
+**One allocator, one codebase, every target you ship to**: Linux, macOS and
+Windows servers, desktop apps, the browser (WebAssembly), and bare-metal
+microcontrollers. It replaces mimalloc, jemalloc, glibc `malloc`, `dlmalloc`
+and `esp-alloc`, each on its home turf, with one pure-Rust dependency: no C
+toolchain, no emscripten, no per-platform allocator to qualify.
 
-- Counting only the allocator's own instructions, where the comparison actually lives:
-  **0.52× / 0.81× / 0.83× mimalloc** on lua / perl / sqlite.
-- **Rust programs got their own fast path**: `#[global_allocator]` users see
-  **up to −27 % whole-program instructions** against 2.2.0, with outputs
-  checked byte-for-byte on real consumers — see
-  [Rust programs](#rust-programs-globalalloc).
-- **A double free aborts instead of corrupting.** Upstream mimalloc accepts it
-  silently in release builds; we detect it on both the local and the
-  cross-thread path and abort.
-- **Runs on WebAssembly** with no C toolchain and no emscripten, and **two
-  releases have cut what it adds to a gzipped bundle by two thirds** (+7,760 ->
-  +3,829 -> +2,435 bytes on a minimal module) — see
-  [Shipping it to a browser](#shipping-it-to-a-browser).
-- **Runs on a microcontroller, and is 2.1-3.9x faster than `esp-alloc` there** —
-  measured on a XIAO ESP32-S3 at 240 MHz, both allocators built from one source.
-  It costs more RAM to get that (64 KiB vs 8 KiB); both numbers are below.
+```toml
+[dependencies]
+rusty_alloc-api = "2.2"
+```
 
-> **Status: `2.2.1`.** The API is frozen and changes follow semver. 2.0.1
-> through 2.0.5 and 2.2.1 are patch releases; 2.1.0 and 2.2.0 are minors because
-> they ADD public items and move none — `cargo-semver-checks` calls every one
-> API-compatible. **2.2.1 is a speed release** (it also adds `malloc_aligned_pow2` and `prim::getenv`, moving nothing): four rounds of exact-instruction
-> work (the cross-thread free 32 % cheaper, a 2 MiB allocate-and-free 57 %),
-> and a `GlobalAlloc` fast path worth up to 27 % whole-program on Rust
-> workloads — see [Performance](#performance-deterministic-instruction-counts).
-> **2.2.0 also carries the largest embedded speed fix in this
-> series:** under `--cfg ra_small_profile` every page was being extended one
-> block at a time, so `malloc_generic` ran on 100 % of allocations; on a XIAO
-> ESP32-S3 fixing it is **13–16 % faster on every binned workload**.
-> 2.0.2 halved the allocator's flash cost on a microcontroller and cut its
-> gzipped wasm overhead by a third; 2.0.3 halved the flash cost again and took
-> the static RAM cost from 3 KB to under 300 bytes; 2.0.4 makes a firmware's
-> region whole segments with `prim::fixed::Region<N>` — unpadded by
-> construction, the floor 64 KiB — and refuses a base that would silently cost
-> a segment; 2.0.5 makes segments stride from that region's base, so it needs
-> no segment alignment and the linker leaves no gap in front of it; 2.1.0 names
-> the large-allocation ceiling in the API and adds
-> `--cfg ra_segment_size="256k"` for a firmware whose allocation unit is tens
-> of kilobytes. Three notes for embedded consumers: 2.0.4 moves what
-> `good_region_size` / `region_for` / `MIN_REGION` return; 2.0.5 reduces
-> `Region`'s alignment to 16 bytes, and `--cfg ra_aligned_region` restores the
-> 2.0.4 layout; and if you allocate at or above
-> `prim::fixed::LARGEST_SHARED_ALLOC` (61,440 bytes by default) read
-> [Embedded](#embedded-bare-metal-measured-on-silicon) before sizing a region.
->
-> **What breaks, and why it is a major.** Two things, neither of which touches a
-> consumer on default features: `default-features = false` now selects the
-> `no_std` profile (it used to be identical to the default, because there were
-> no default features), and `heap::Heap` gained a field, which a struct literal
-> would notice. If you set `default-features = false` and want what you had, add
-> `features = ["std"]`. `CHANGELOG.md` has the detail.
->
-> **What you gain**: `no_std` on bare metal, a second geometry for parts with
-> kilobytes instead of gigabytes, and three reclamation fixes — one of which
-> could leave a long-running heap reporting OOM while holding memory it could
-> have reclaimed.
+```rust
+#[global_allocator]
+static ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
+```
+
+## Against every allocator it replaces
+
+Every number below is measured and reproducible from this repository. **The
+losses are in the table too**, because you should know where the trade-offs
+are before you ship.
+
+| platform | replaces | result | trade-off |
+|---|---|---|---|
+| **Linux servers & CLIs** | mimalloc | allocator's own instructions **0.52× / 0.81× / 0.83×** on lua / perl / sqlite; whole program 0.96–1.00× | lead is widest in the allocator and narrowest across a whole program, because most instructions in a real program are not the allocator |
+| **Linux** | jemalloc | whole program **0.84× / 0.89× / 0.98×** | — |
+| **Linux** | glibc `malloc` | whole program **0.81× / 0.81× / 0.99×** | — |
+| **Rust applications** | the default allocator path | **up to 27 % fewer whole-program instructions** vs rusty_alloc 2.2.0 via a dedicated `GlobalAlloc` fast path | short-lived-thread workloads: only 0.8 % |
+| **Windows & macOS** | system heap | same codebase and fast paths, full test suites on each release | freed memory stays committed by default, as in mimalloc: one consumer read 461 MB retained where the Windows heap fell back to 4 MB; set `RUSTY_ALLOC_PURGE_DELAY` to return it |
+| **Browser (wasm32)** | `dlmalloc` | churn workload **4.9–7.3× faster**; adds **+2,435 bytes gzipped** to a minimal module | a 2 KB tight alloc/free loop runs **0.55–0.83×** as fast as dlmalloc; small tight loops within noise |
+| **Microcontrollers (ESP32-S3)** | `esp-alloc` | **2.1–3.9× faster** on silicon, flat capacity under churn | needs a **64 KiB** RAM floor vs 8 KiB; held 21 size classes at once vs 24; **357 NULLs** in 50,000 hostile churn allocations vs 0; refuses 64 KiB-aligned requests |
+
+**A double free aborts instead of corrupting**, on the local and cross-thread
+paths, where upstream mimalloc accepts it silently in release builds.
+
+## Built for commercial use
+
+- **Permissive MIT licence.** No GPL, no LGPL, no C anywhere in the dependency
+  tree.
+- **In production** across the Remade With Rust and Mata Network portfolio, with
+  27,892 active installs. SpaceDB and rusty_zstd validate every release against
+  their full test suites, and the Silesia corpus compresses byte-identically
+  on the allocator.
+- **Hardened**: 14 of 15 v1.0.0 security gates met, Miri-clean, a loom-verified
+  cross-thread protocol, every `unsafe` block documented and ratcheted, and
+  opt-in `secure` mode with encrypted free lists for hostile input. Details in
+  [Security](#security).
+- **Stable API**: frozen since 2.0 and following semver, with every release
+  checked by `cargo-semver-checks`.
+- **Deterministic evidence**: performance claims come from exact instruction
+  counts, not a noisy stopwatch. Every comparison names its harness in
+  `bench/`.
+
+> **Current release: `2.2.1`.** The API is stable and follows semver.
+> Upgrading from 1.x with `default-features = false`? Add
+> `features = ["std"]`, since that flag now selects the bare-metal profile. The
+> release history is in `CHANGELOG.md`.
 
 ## Performance (deterministic instruction counts)
 
@@ -392,7 +389,7 @@ milliseconds, `0` for as soon as a span is free, or call
 
 ```toml
 [dependencies]
-rusty_alloc-api = "2.1"
+rusty_alloc-api = "2.2"
 ```
 
 | crate | docs | what |
