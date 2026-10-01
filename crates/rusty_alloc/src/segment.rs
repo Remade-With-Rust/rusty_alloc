@@ -717,6 +717,12 @@ pub unsafe fn span_free(seg: *mut Segment, page: *mut Page) -> bool {
         (*page).used = 0;
         (*page).capacity = 0;
         (*page).reserved = 0;
+        // `blockmap`: the map pointer is page state like the rest — leave it
+        // and the next tenant of this slot inherits a map it never carved.
+        #[cfg(feature = "blockmap")]
+        {
+            (*page).payload = ptr::null_mut();
+        }
         (*page).flags.store(0, Ordering::Relaxed);
         (*page).free_is_zero = false;
 

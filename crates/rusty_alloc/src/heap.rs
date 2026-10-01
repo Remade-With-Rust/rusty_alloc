@@ -1060,6 +1060,17 @@ impl Heap {
             (*p).free = ptr::null_mut();
             (*p).local_free = ptr::null_mut();
             (*p).bin = BIN_HUGE as u8; // marker: unqueued single-block span
+            // `blockmap`: a single-block span carves no map, and the map code
+            // knows that only by `payload` being null. This slot may have been
+            // a small page's span start, and `fresh_page` — the one other
+            // writer — is not on this path, so a stale `payload` survived: an
+            // adopted segment's collect then decoded this block against the
+            // OLD tenant's map, read a bit past the end of this block, and
+            // aborted as a double free. `stress_mt` on 4 CPUs, every run.
+            #[cfg(feature = "blockmap")]
+            {
+                (*p).payload = ptr::null_mut();
+            }
             (*p).flags.store(pflags::SINGLE_BLOCK, Ordering::Relaxed); // unqueued single-block span
             (*p).free_is_zero = fresh;
             // Unqueued → never scanned → remote frees must go via the
