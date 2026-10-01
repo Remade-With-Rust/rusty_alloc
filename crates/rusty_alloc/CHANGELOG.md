@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.2](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.2.1...rusty_alloc-v2.2.2) - 2026-10-01
+
+### Fixed
+
+- *(prim)* macOS range_is_reserved via mach_vm_region, not mincore
+- *(blockmap)* clear a reused slot's map pointer -- stress_mt aborted on 4 CPUs
+- *(prim)* build on macOS -- mincore's out-vector type differs on Apple
+
+### Other
+
+- *(unsafe)* record the two macOS range_is_reserved sites; ratchet 963 -> 965
+
 ## [2.2.1](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.2.0...rusty_alloc-v2.2.1) - 2026-09-25
 
 ### Fixed
