@@ -69,6 +69,11 @@ criteria = "safe-to-run"
 version = "0.2.17"
 criteria = "safe-to-run"
 
+[[exemptions.portable-atomic]]
+version = "1.15.0"
+criteria = "safe-to-deploy"
+notes = "Target-gated: only in the graph on a std target without 64-bit atomics. Exempted pending an audit or a publisher-trust decision by the owner."
+
 [[exemptions.proc-macro2]]
 version = "1.0.107"
 criteria = "safe-to-run"
