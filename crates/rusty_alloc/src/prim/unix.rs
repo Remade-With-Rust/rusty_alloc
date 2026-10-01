@@ -20,6 +20,7 @@ fn errno() -> PrimError {
         *libc::__errno_location() as PrimError
     }
     #[cfg(target_os = "macos")]
+    // SAFETY: as above; `__error` is Apple's name for the same accessor.
     unsafe {
         *libc::__error() as PrimError
     }
@@ -163,7 +164,8 @@ pub(super) unsafe fn decommit(ptr_: *mut u8, size: usize) -> Result<bool, PrimEr
         if p == libc::MAP_FAILED {
             return Err(errno());
         }
-        return Ok(false);
+        // The tail on Apple, where the block below is compiled out.
+        Ok(false)
     }
     #[cfg(not(target_vendor = "apple"))]
     {
@@ -218,7 +220,12 @@ pub(super) fn range_is_reserved(ptr: *const u8, size: usize) -> bool {
         // SAFETY: `p` is page-aligned and `page` is one page, so the out
         // vector needs one byte, which `vec` is; `mincore` reads the mapping
         // table and writes only that byte.
-        let r = unsafe { libc::mincore(p as *mut libc::c_void, page, &mut vec) };
+        //
+        // `.cast()`, not `&mut vec`: the out vector is `*mut c_uchar` on Linux
+        // but `*mut c_char` on Apple, so a `&mut u8` coerces on one and fails
+        // to compile on the other. Through 2.2.1 this crate did not build on
+        // macOS at all; CI tested Windows and Linux only.
+        let r = unsafe { libc::mincore(p as *mut libc::c_void, page, (&raw mut vec).cast()) };
         if r != 0 {
             return false;
         }
