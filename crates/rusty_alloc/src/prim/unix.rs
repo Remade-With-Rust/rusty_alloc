@@ -203,6 +203,7 @@ pub(super) unsafe fn protect(ptr_: *mut u8, size: usize, on: bool) -> Result<(),
 }
 
 /// Whether `[ptr, ptr+size)` is mapped (`mincore` succeeds on every page).
+#[cfg(not(target_vendor = "apple"))]
 pub(super) fn range_is_reserved(ptr: *const u8, size: usize) -> bool {
     if ptr.is_null() || size == 0 {
         return false;
@@ -221,14 +222,115 @@ pub(super) fn range_is_reserved(ptr: *const u8, size: usize) -> bool {
         // vector needs one byte, which `vec` is; `mincore` reads the mapping
         // table and writes only that byte.
         //
-        // `.cast()`, not `&mut vec`: the out vector is `*mut c_uchar` on Linux
-        // but `*mut c_char` on Apple, so a `&mut u8` coerces on one and fails
-        // to compile on the other. Through 2.2.1 this crate did not build on
-        // macOS at all; CI tested Windows and Linux only.
+        // `.cast()`, not `&mut vec`: the out vector is `*mut c_uchar` on
+        // Linux but `*mut c_char` on the BSDs, so a `&mut u8` coerces on one
+        // and fails to compile on the other.
         let r = unsafe { libc::mincore(p as *mut libc::c_void, page, (&raw mut vec).cast()) };
         if r != 0 {
             return false;
         }
+    }
+    true
+}
+
+/// `vm_region_basic_info_64` from `<mach/vm_region.h>`, which `libc` does not
+/// carry. The header declares it under `#pragma pack(4)`, so `offset` sits at
+/// byte 20 rather than 24 and the whole is 36 bytes — the size the kernel is
+/// told it may write, through `VM_REGION_BASIC_INFO_COUNT_64` below.
+#[cfg(target_vendor = "apple")]
+#[repr(C, packed(4))]
+#[derive(Default)]
+struct VmRegionBasicInfo64 {
+    protection: libc::vm_prot_t,
+    max_protection: libc::vm_prot_t,
+    inheritance: u32,
+    shared: i32,
+    reserved: i32,
+    offset: u64,
+    behavior: i32,
+    user_wired_count: u16,
+}
+
+#[cfg(target_vendor = "apple")]
+const _: () = assert!(core::mem::size_of::<VmRegionBasicInfo64>() == 36);
+
+/// Whether `[ptr, ptr+size)` is mapped memory that could ever be accessed.
+///
+/// Not `mincore`, which is the Linux answer and a wrong one here: XNU's
+/// `mincore` succeeds on unmapped ranges, so an unmapped arena was accepted
+/// (`oh_f05_manage_os_memory_unmapped_is_err`, the first macOS CI run). The
+/// Mach region query is the Apple equivalent of the `VirtualQuery` walk on
+/// Windows — and it adds one rule neither other platform needs: every 64-bit
+/// Apple process maps `__PAGEZERO` over the low 4 GiB with a MAXIMUM
+/// protection of none, so "mapped" alone accepts `0x8` as an arena base
+/// (`oh_f05_manage_os_memory_garbage_base_is_err`). A region that can never be
+/// made accessible is not memory; a caller's `PROT_NONE` reservation still
+/// is, because its maximum protection is not none.
+#[cfg(target_vendor = "apple")]
+pub(super) fn range_is_reserved(ptr: *const u8, size: usize) -> bool {
+    const VM_REGION_BASIC_INFO_64: i32 = 9;
+    const VM_REGION_BASIC_INFO_COUNT_64: u32 =
+        (core::mem::size_of::<VmRegionBasicInfo64>() / core::mem::size_of::<i32>()) as u32;
+    // `mach_task_self()` is a C macro over this global, which libSystem
+    // initialises before any Rust code runs. `libc`'s wrapper for it is
+    // deprecated in favour of the `mach2` crate; one `static` is not worth a
+    // dependency.
+    unsafe extern "C" {
+        static mach_task_self_: libc::mach_port_t;
+        fn mach_vm_region(
+            target_task: libc::mach_port_t,
+            address: *mut libc::mach_vm_address_t,
+            size: *mut libc::mach_vm_size_t,
+            flavor: i32,
+            info: *mut i32,
+            info_cnt: *mut u32,
+            object_name: *mut libc::mach_port_t,
+        ) -> libc::c_int;
+    }
+    if ptr.is_null() || size == 0 {
+        return false;
+    }
+    let mut addr = ptr as u64;
+    let Some(end) = addr.checked_add(size as u64) else {
+        return false;
+    };
+    while addr < end {
+        let mut region = addr;
+        let mut len: u64 = 0;
+        let mut info = VmRegionBasicInfo64::default();
+        let mut count = VM_REGION_BASIC_INFO_COUNT_64;
+        let mut object: libc::mach_port_t = 0;
+        // SAFETY: a read-only query of our own task, whose port name is a
+        // plain integer the runtime wrote once at startup. Every out-pointer is
+        // a live local; `info` is exactly `count` 32-bit words, which is all
+        // the kernel may write for this flavor, and `object` is MACH_PORT_NULL
+        // for the basic-info flavor, so there is no port right to release.
+        let kr = unsafe {
+            mach_vm_region(
+                mach_task_self_,
+                &raw mut region,
+                &raw mut len,
+                VM_REGION_BASIC_INFO_64,
+                (&raw mut info).cast(),
+                &raw mut count,
+                &raw mut object,
+            )
+        };
+        // The call returns the first region AT OR ABOVE `addr`, so a region
+        // starting past it means `addr` itself is in a hole.
+        if kr != libc::KERN_SUCCESS || region > addr || len == 0 {
+            return false;
+        }
+        if info.max_protection == libc::VM_PROT_NONE {
+            return false;
+        }
+        let Some(region_end) = region.checked_add(len) else {
+            return true; // the region runs to the top of the address space
+        };
+        if region_end <= addr {
+            return false;
+        }
+        addr = region_end;
     }
     true
 }
