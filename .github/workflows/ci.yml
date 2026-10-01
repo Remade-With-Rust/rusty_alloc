@@ -30,7 +30,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        # macOS since 2.2.2: through 2.2.1 the crate did not build there at
+        # all (a `mincore` out-vector that is `c_uchar` on Linux and `c_char`
+        # on Apple), and nothing tested it.
+        os: [windows-latest, ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
