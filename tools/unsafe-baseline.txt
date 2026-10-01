@@ -9,7 +9,7 @@
     37  crates/rusty_alloc/src/prim/fixed.rs
      8  crates/rusty_alloc/src/prim/mock.rs
     17  crates/rusty_alloc/src/prim/mod.rs
-    31  crates/rusty_alloc/src/prim/unix.rs
+    33  crates/rusty_alloc/src/prim/unix.rs
      6  crates/rusty_alloc/src/prim/wasm.rs
     34  crates/rusty_alloc/src/prim/windows.rs
      2  crates/rusty_alloc/src/random.rs
