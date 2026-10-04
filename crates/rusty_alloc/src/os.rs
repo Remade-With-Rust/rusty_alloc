@@ -197,8 +197,42 @@ pub unsafe fn free(block: OsBlock) -> Result<(), PrimError> {
 /// # Safety
 /// Range must lie within a live block from [`alloc_aligned`], page-aligned.
 pub unsafe fn commit(ptr: *mut u8, size: usize) -> Result<bool, PrimError> {
+    #[cfg(all(test, feature = "std"))]
+    if test_hooks::take_commit_failure() {
+        return Err(test_hooks::INJECTED);
+    }
     // SAFETY: forwarded contract.
     unsafe { prim::commit(ptr, page_align_up(size)) }
+}
+
+/// Test-only fault injection: make this thread's next `n` commits fail, the
+/// way `VirtualAlloc(MEM_COMMIT)` fails on Windows once the system's commit is
+/// exhausted. Thread-local, so a parallel test's commits are never taken.
+#[cfg(all(test, feature = "std"))]
+pub(crate) mod test_hooks {
+    use core::cell::Cell;
+
+    /// The synthetic error an injected failure returns.
+    pub const INJECTED: super::PrimError = 0xFA11;
+
+    std::thread_local! {
+        static FAIL_COMMITS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Fail this thread's next `n` commits.
+    pub fn fail_next_commits(n: usize) {
+        FAIL_COMMITS.with(|c| c.set(n));
+    }
+
+    pub(super) fn take_commit_failure() -> bool {
+        FAIL_COMMITS.with(|c| {
+            let n = c.get();
+            if n > 0 {
+                c.set(n - 1);
+            }
+            n > 0
+        })
+    }
 }
 
 /// Decommit a page-aligned sub-range. Returns whether recommit is required.

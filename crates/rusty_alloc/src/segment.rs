@@ -405,6 +405,34 @@ pub fn segment_alloc(arena_id: i32) -> Result<*mut Segment, PrimError> {
     Ok(seg)
 }
 
+/// Make a dead segment's memory fit for a next tenant: lift guard-page
+/// protection and re-commit purged spans (see `purged_any` / `guarded`).
+/// Recycled memory is handed out as-is, so skipping this re-tenants an
+/// inaccessible page (the M8 P0). Returns whether the memory is usable; when
+/// the OS refuses either step (Windows refuses `MEM_COMMIT` once the system's
+/// commit is exhausted), the caller must not recycle the segment, and the
+/// failure is counted in [`crate::stats::commit_failures`].
+///
+/// # Safety
+/// `seg` must be a live segment with no live blocks or references into it.
+unsafe fn restore_for_reuse(seg: *mut Segment) -> bool {
+    // SAFETY: per contract; the range lies inside the segment's reservation.
+    unsafe {
+        if !((*seg).purged_any || (*seg).guarded) {
+            return true;
+        }
+        let base = seg.cast::<u8>().add(HEADER_SLICES * SEGMENT_SLICE_SIZE);
+        let bytes = (*seg).total_size - HEADER_SLICES * SEGMENT_SLICE_SIZE;
+        if os::protect(base, bytes, false).is_err() || os::commit(base, bytes).is_err() {
+            crate::stats::commit_failed();
+            return false;
+        }
+        (*seg).purged_any = false;
+        (*seg).guarded = false;
+        true
+    }
+}
+
 /// Release an empty Normal segment (caller has unlinked it from the heap):
 /// back to its arena when it came from one, else to the OS.
 ///
@@ -416,19 +444,16 @@ pub unsafe fn segment_free(seg: *mut Segment) -> Result<(), PrimError> {
     unsafe { wait_no_remote_in_flight(seg) };
     segment_map::unregister(seg);
     // SAFETY: seg is live and empty per the contract.
-    unsafe {
-        if (*seg).purged_any || (*seg).guarded {
-            // Restore full commitment AND accessibility before the memory can
-            // be re-tenanted from an arena (see purged_any / guarded).
-            let base = seg.cast::<u8>().add(HEADER_SLICES * SEGMENT_SLICE_SIZE);
-            let bytes = (*seg).total_size - HEADER_SLICES * SEGMENT_SLICE_SIZE;
-            let _ = os::protect(base, bytes, false);
-            let _ = os::commit(base, bytes);
-            (*seg).purged_any = false;
-            (*seg).guarded = false;
+    let usable = unsafe { restore_for_reuse(seg) };
+    if !usable {
+        // The memory could not be made accessible and committed again, so it
+        // must not be re-tenanted. Outside an arena, releasing it to the OS
+        // (below) needs neither; inside one, it cannot be released alone, so
+        // it stays marked used for the life of the process.
+        if crate::arena::owns(seg.cast()) {
+            return Ok(());
         }
-    }
-    if crate::arena::chunk_free(seg.cast()) {
+    } else if crate::arena::chunk_free(seg.cast()) {
         return Ok(());
     }
     // wasm: the slice pool is the free list (F2) — `expose_provenance` so a
@@ -436,7 +461,12 @@ pub unsafe fn segment_free(seg: *mut Segment) -> Result<(), PrimError> {
     #[cfg(all(target_arch = "wasm32", not(miri)))]
     // SAFETY: seg is live per the contract; reading total_size.
     unsafe {
-        if crate::slice_pool::free_range(seg.cast::<u8>().expose_provenance(), (*seg).total_size) {
+        if usable
+            && crate::slice_pool::free_range(
+                seg.cast::<u8>().expose_provenance(),
+                (*seg).total_size,
+            )
+        {
             return Ok(());
         }
     }
@@ -656,11 +686,23 @@ pub unsafe fn span_alloc(seg: *mut Segment, slices: usize) -> (*mut Page, bool) 
         while !s.is_null() {
             let len = (*s).slice_count as usize;
             if len >= slices {
-                span_list_remove(seg, s);
                 let idx = page_index(seg, s);
                 // Re-commit BEFORE splitting so both halves are backed; the
                 // remainder inherits the (now cleared) purged state.
-                span_recommit(seg, idx, len);
+                //
+                // A failed re-commit is a failed allocation, never a span
+                // handed out unbacked: Windows has no overcommit, so
+                // `MEM_COMMIT` fails when the system's commit is exhausted,
+                // and the page layer's first store would then fault on
+                // reserved memory (an access violation in `page_extend`,
+                // `docs/plans/recommit-failure-ignored.md`). The span stays
+                // on the free list, still marked purged; null sends the
+                // caller to another segment, and a fresh one fails its own
+                // commit cleanly.
+                if !span_recommit(seg, idx, len) {
+                    return (ptr::null_mut(), false);
+                }
+                span_list_remove(seg, s);
                 if len > slices {
                     // The remainder starts at a new slice: re-mark all of it.
                     span_mark_free(seg, idx + slices, len - slices, 1);
@@ -828,19 +870,25 @@ pub unsafe fn purge_free_spans(seg: *mut Segment) {
     }
 }
 
-/// Re-commit a span that was purged while free (no-op otherwise).
+/// Re-commit a span that was purged while free (no-op otherwise). Returns
+/// whether the span is backed. On failure the span stays marked purged, so
+/// nothing forgets that its memory is not there.
 ///
 /// # Safety
-/// `[idx, idx+len)` is a span of `seg` being handed to a caller.
-unsafe fn span_recommit(seg: *mut Segment, idx: usize, len: usize) {
+/// `[idx, idx+len)` is a span of `seg` about to be handed to a caller.
+unsafe fn span_recommit(seg: *mut Segment, idx: usize, len: usize) -> bool {
     // SAFETY: caller contract; range lies inside the segment reservation.
     unsafe {
         if !(*seg).pages[idx].purged {
-            return;
+            return true;
+        }
+        let area = page_area(seg, idx);
+        if os::commit(area, len * SEGMENT_SLICE_SIZE).is_err() {
+            crate::stats::commit_failed();
+            return false;
         }
         (*seg).pages[idx].purged = false;
-        let area = page_area(seg, idx);
-        let _ = os::commit(area, len * SEGMENT_SLICE_SIZE);
+        true
     }
 }
 
@@ -1035,16 +1083,20 @@ pub unsafe fn huge_free(seg: *mut Segment) -> Result<(), PrimError> {
         // memory must be handed back in a USABLE state: lift any guard-page
         // protection and restore commitment first. Skipping this recycles an
         // inaccessible page into the next tenant (the M8 P0).
-        if (*seg).total_size.is_multiple_of(SEGMENT_SIZE) {
-            if (*seg).guarded || (*seg).purged_any {
-                let base = seg.cast::<u8>().add(HEADER_SLICES * SEGMENT_SLICE_SIZE);
-                let bytes = (*seg).total_size - HEADER_SLICES * SEGMENT_SLICE_SIZE;
-                let _ = os::protect(base, bytes, false);
-                let _ = os::commit(base, bytes);
-                (*seg).guarded = false;
-                (*seg).purged_any = false;
-            }
-            if crate::arena::chunk_free_n(seg.cast(), (*seg).total_size / SEGMENT_SIZE) {
+        //
+        // When that restore fails, the memory must not be recycled at all:
+        // released to the OS if it is a reservation of its own, retired in
+        // place (left marked used) if it is chunks of an arena.
+        // Only chunk-multiple segments can reach an arena and need the
+        // restore; a ragged one is released whole (or pooled, on wasm).
+        let chunked = (*seg).total_size.is_multiple_of(SEGMENT_SIZE);
+        let usable = !chunked || restore_for_reuse(seg);
+        if chunked {
+            if !usable {
+                if crate::arena::owns(seg.cast()) {
+                    return Ok(());
+                }
+            } else if crate::arena::chunk_free_n(seg.cast(), (*seg).total_size / SEGMENT_SIZE) {
                 return Ok(());
             }
         }
@@ -1052,7 +1104,12 @@ pub unsafe fn huge_free(seg: *mut Segment) -> Result<(), PrimError> {
         // the slice pool — the F2 fix itself. Chunk-multiple ones only
         // reach here when no arena owns them, and the pool takes those too.
         #[cfg(all(target_arch = "wasm32", not(miri)))]
-        if crate::slice_pool::free_range(seg.cast::<u8>().expose_provenance(), (*seg).total_size) {
+        if usable
+            && crate::slice_pool::free_range(
+                seg.cast::<u8>().expose_provenance(),
+                (*seg).total_size,
+            )
+        {
             return Ok(());
         }
         let block = os::OsBlock {
@@ -1062,5 +1119,86 @@ pub unsafe fn huge_free(seg: *mut Segment) -> Result<(), PrimError> {
             is_zero: false,
         };
         os::free(block)
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod recommit_tests {
+    use super::*;
+    use crate::alloc::{collect, free, malloc, stats};
+    use crate::os::test_hooks::fail_next_commits;
+    use crate::types::MEDIUM_PAGE_SLICES;
+
+    /// A purged span whose re-commit FAILS must not be handed out.
+    ///
+    /// The MATA desktop app died with an access violation writing a heap
+    /// address in `page_extend` (2026-10-04, `secure` on, `purge_delay = 0`,
+    /// the machine at 98.5 % of its commit limit). `span_recommit` dropped
+    /// the result of `os::commit`, and on Windows that call fails when the
+    /// system's commit is exhausted, so a span whose re-commit failed was
+    /// carved anyway and the page layer's first store hit reserved memory
+    /// (`docs/plans/recommit-failure-ignored.md`, mechanism A).
+    ///
+    /// Without the fix the second allocation below lands back in the purged
+    /// span: on Windows, where the purge is a real `MEM_DECOMMIT`, writing it
+    /// is that access violation; everywhere, the "not in the purged span"
+    /// assertion fails. The last step checks the span still knows it is
+    /// purged, so a later re-commit that succeeds makes it usable again.
+    #[test]
+    fn a_failed_recommit_is_a_failed_span_not_an_unbacked_one() {
+        // A span `span_free` will purge: at least MEDIUM_PAGE_SLICES slices.
+        let span = SEGMENT_SLICE_SIZE * MEDIUM_PAGE_SLICES + SEGMENT_SLICE_SIZE;
+        crate::options::set(15, 0); // purge_delay: purge at once
+        let pin = malloc(span);
+        let p1 = malloc(span);
+        assert!(!pin.is_null() && !p1.is_null());
+        assert_eq!(
+            segment_of(pin),
+            segment_of(p1),
+            "setup: the pin must keep p1's segment alive"
+        );
+        // SAFETY: live blocks of `span` bytes.
+        unsafe {
+            core::ptr::write_bytes(pin, 1, span);
+            core::ptr::write_bytes(p1, 1, span);
+        }
+        let purges = stats().purges;
+        // SAFETY: p1 is live and freed once.
+        unsafe { free(p1) };
+        collect(true);
+        assert!(stats().purges > purges, "setup: p1's span was not purged");
+
+        let failures = crate::stats::commit_failures();
+        fail_next_commits(1);
+        let p2 = malloc(span);
+        fail_next_commits(0);
+        assert!(
+            !p2.is_null(),
+            "a failed re-commit must move on, not fail outright here"
+        );
+        assert_eq!(
+            crate::stats::commit_failures(),
+            failures + 1,
+            "the re-commit was attempted, failed, and was counted"
+        );
+        let in_p1 = (p1.addr()..p1.addr() + span).contains(&p2.addr());
+        assert!(!in_p1, "a span whose re-commit failed was handed out");
+        // SAFETY: p2 is a live block of `span` bytes; the write is the check.
+        unsafe { core::ptr::write_bytes(p2, 2, span) };
+
+        // The span kept its `purged` mark, so with commit available again
+        // whichever allocation reaches it re-commits it before use.
+        let p3 = malloc(span);
+        assert!(!p3.is_null());
+        // SAFETY: live block of `span` bytes.
+        unsafe { core::ptr::write_bytes(p3, 3, span) };
+
+        // SAFETY: all live, each freed once.
+        unsafe {
+            free(p3);
+            free(p2);
+            free(pin);
+        }
+        crate::options::set(15, -1); // restore the shipped default
     }
 }

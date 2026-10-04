@@ -6,6 +6,29 @@
 use crate::heap::Stats;
 #[cfg(feature = "std")]
 use crate::options::out_fmt;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+/// Process-wide count of OS commits (or protection restores) that failed on a
+/// path that would otherwise have handed out, or recycled, memory that is not
+/// backed or not accessible. Unlike
+/// the per-heap counters it is global: a failed commit is a property of the
+/// machine (Windows has no overcommit and refuses `MEM_COMMIT` when the
+/// system's commit is exhausted), and the number a crash report needs is the
+/// process's. Non-zero after an access violation in the page layer says the
+/// machine ran out of commit, not that a span skipped its re-commit
+/// (`docs/plans/recommit-failure-ignored.md`).
+static COMMIT_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
+/// Record one failed commit (cold: only reached when the OS said no).
+#[cold]
+pub(crate) fn commit_failed() {
+    COMMIT_FAILURES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// How many OS commits have failed in this process (see `COMMIT_FAILURES`).
+pub fn commit_failures() -> usize {
+    COMMIT_FAILURES.load(Ordering::Relaxed)
+}
 
 /// Sum the counters of every registered heap (`mi_stats_merge` semantics —
 /// our counters are always per-heap, so the merged view is computed on read).
@@ -63,11 +86,12 @@ pub fn print_process() {
     let (elapsed, user, sys, rss, peak_rss, commit, peak_commit, faults) = process_info();
     out_fmt(&std::format!(
         "process: elapsed {elapsed} ms, user {user} ms, sys {sys} ms, rss {} KiB (peak {}), \
-         commit {} KiB (peak {}), faults {faults}\n",
+         commit {} KiB (peak {}), faults {faults}, failed commits {}\n",
         rss / 1024,
         peak_rss / 1024,
         commit / 1024,
         peak_commit / 1024,
+        commit_failures(),
     ));
 }
 
