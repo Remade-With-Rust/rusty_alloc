@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.3](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.2.2...rusty_alloc-v2.2.3) - 2026-10-05
+
 ### Fixed
 
 - **A failed re-commit no longer hands out unbacked memory (Windows, purging
