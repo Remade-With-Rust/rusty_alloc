@@ -539,6 +539,43 @@ pub fn chunk_free_n(p: *mut u8, n: usize) -> bool {
     false
 }
 
+/// Whether `p` lies inside any arena's live chunks — the question
+/// [`chunk_free`] answers as a side effect, asked without freeing anything.
+///
+/// A segment whose memory cannot be made usable again must not be returned
+/// to its arena (arena memory is committed once, at reservation, and handed
+/// out as-is), and a chunk inside an arena's reservation cannot be released
+/// to the OS on its own either. Such a segment is retired in place, and this
+/// is how the release path tells the two cases apart.
+#[allow(clippy::needless_range_loop)] // indexed scan over a fixed atomic table
+pub fn owns(p: *const u8) -> bool {
+    if crate::FIXED_REGION {
+        return false;
+    }
+    let addr = p.addr();
+    let n = ARENA_COUNT.load(Ordering::Acquire).min(MAX_ARENAS);
+    for id in 0..n {
+        let a = ARENAS[id].load(Ordering::Acquire);
+        if a.is_null() {
+            continue;
+        }
+        // SAFETY: live descriptor; only its base and live-chunk count are read.
+        unsafe {
+            let chunks = (*a).chunks_live.load(Ordering::Acquire);
+            let Some(span) = chunks.checked_mul(SEGMENT_SIZE) else {
+                continue;
+            };
+            let Some(end_addr) = (*a).base.addr().checked_add(span) else {
+                continue;
+            };
+            if addr >= (*a).base.addr() && addr < end_addr {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Return a chunk to its arena. True when the address belonged to one.
 #[allow(clippy::needless_range_loop)] // indexed scan over a fixed atomic table
 pub fn chunk_free(p: *mut u8) -> bool {

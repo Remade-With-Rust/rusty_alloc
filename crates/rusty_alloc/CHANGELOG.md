@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A failed re-commit no longer hands out unbacked memory (Windows, purging
+  on).** With `purge_delay >= 0` and `purge_decommits` on, a freed span is
+  decommitted, and reuse re-commits it — but the result of that commit was
+  discarded. Windows has no overcommit, so `MEM_COMMIT` fails once the
+  system's commit is exhausted, and the span was carved anyway: the first
+  store into it was an access violation in `page_extend`. One was seen in a
+  shipping consumer (`secure` on, `purge_delay = 0`, the machine at 98.5 % of
+  its commit limit). A failed re-commit is now a failed span: it stays on the
+  free list still marked purged, the allocator moves on, and true exhaustion
+  ends as an ordinary allocation failure. The default configuration
+  (`purge_delay = -1`) never purges and was not exposed. Details:
+  `docs/plans/recommit-failure-ignored.md`.
+- **The same for whole segments.** `segment_free` and `huge_free` restore a
+  purged or guarded segment's commit and access before recycling it, and
+  dropped both results. A segment the OS will not restore is no longer
+  recycled: it is released to the OS, or, inside an arena, retired in place.
+
+### Added
+
+- `stats::commit_failures()`: a process-wide count of commits refused on
+  those paths, also printed by `stats::print_process` as `failed commits N`.
+  Non-zero after a fault in the page layer says the machine ran out of
+  commit.
+
 ## [2.2.2](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.2.1...rusty_alloc-v2.2.2) - 2026-10-01
 
 ### Fixed
