@@ -11,10 +11,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- *(segment)* a failed re-commit is a failed span, not unbacked memory
-
-### Fixed
-
 - **A failed re-commit no longer hands out unbacked memory (Windows, purging
   on).** With `purge_delay >= 0` and `purge_decommits` on, a freed span is
   decommitted, and reuse re-commits it — but the result of that commit was
