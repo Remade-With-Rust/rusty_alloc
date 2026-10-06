@@ -5,10 +5,19 @@
 [![remade with rust](https://img.shields.io/badge/remade--with--rust-portfolio-orange.svg)](https://github.com/remade-with-rust)
 
 ### In The Wild with 54,914 Active Installs
-> [RAG Converter](https://ragconverter.com) uses `rusty_alloc` as the allocator, in wasm too.
+> [MATA Network](https://mata.network) uses `rusty_alloc` as their unified allocator
+> deploying across Windows, PC, MAC, Linux, Android, iPhone, WASM, and ESP-32 for Home devices.
+> This diverse ecosystem is battle testing our code base in every environment for performance,
+> and security.
+
+> [RAG Converter](https://ragconverter.com) uses `rusty_alloc` as the allocator in wasm.
 > It makes personal and work files AI-readable without them leaving the machine:
 > the whole conversion runs as WebAssembly in the browser tab, with nothing
 > uploaded and nothing to install.
+
+> [DLDeploy.com](https://DLDEPLOY.COM) uses `rusty_alloc` as their allocator to deploy
+> ESP-32 devices via WASM, but also within the ESP-32 devices as a memory allocation alternative
+> to malloc() and free(), improving performance by over 23% while eliminating memory safety issues.
 
 > [Rusty_JSON_Turbo](https://github.com/Remade-With-Rust/rusty_json_turbo) is a Serde fork, and saw a 54% top speed increase by implementing
 > Rusty_alloc.
