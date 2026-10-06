@@ -20,7 +20,7 @@
 > to malloc() and free(), improving performance by over 23% while eliminating memory safety issues.
 
 > [Rusty_JSON_Turbo](https://github.com/Remade-With-Rust/rusty_json_turbo) is a Serde fork, and saw a 54% top speed increase by implementing
-> Rusty_alloc.
+> `rusty_alloc`.
 
 # rusty_alloc
 
