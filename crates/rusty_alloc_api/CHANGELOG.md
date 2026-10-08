@@ -11,10 +11,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- *(alloc)* keep free_inline's asm goto out of MSVC cleanup funclets
-
-### Fixed
-
 - **2.2.1–2.2.4 failed to build in an MSVC consumer that unwinds, with LTO**
   ("Bogus funclet pad use"): `GlobalAlloc::dealloc` inlined the core's
   `asm!` goto into EH cleanup funclets. Fixed in `rusty_alloc` (see its

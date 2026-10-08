@@ -11,10 +11,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- *(alloc)* keep free_inline's asm goto out of MSVC cleanup funclets
-
-### Fixed
-
 - **2.2.1–2.2.4 failed to build in an MSVC consumer that unwinds, with LTO.**
   `free_inline`'s fast path is an `asm!` goto (LLVM `callbr`), and since
   2.2.1 `GlobalAlloc::dealloc` inlines it into every Rust deallocation,
