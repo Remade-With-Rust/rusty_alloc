@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.2.3...rusty_alloc-v3.0.0) - 2026-10-08
+
+### Fixed
+
+- *(alloc)* fire the deferred-free hook with no &mut Heap alive
+- *(heap)* stranded large spans after adoption; perf: segment scrub, large cache
+
 ### Fixed
 
 - **Freed model memory no longer stays stranded after a loader thread
