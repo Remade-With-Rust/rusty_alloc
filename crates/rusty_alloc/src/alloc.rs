@@ -304,6 +304,53 @@ pub fn malloc_or(size: usize, on_oom: fn(usize) -> *mut u8) -> *mut u8 {
     }
 }
 
+/// A compile-time OOM handler for [`malloc_or_with`].
+pub trait OnOom {
+    /// Called once the ordinary slow path has returned null for `size`.
+    fn on_oom(size: usize) -> *mut u8;
+}
+
+/// [`malloc_or`] with the handler as a TYPE rather than a `fn` pointer.
+///
+/// The cold arm is out of line, so inside it a `fn` pointer is a runtime
+/// value that has to survive the slow-path call next to `size`: two
+/// callee-saved registers and an alignment slot, a 12-instruction frame on
+/// every slow `operator new` (Endless Sky: 70,115 calls, 841 k Ir). With a
+/// type the handler call is direct and only `size` is live.
+#[inline]
+pub fn malloc_or_with<H: OnOom>(size: usize) -> *mut u8 {
+    let hb = init::heap_box_fast();
+    // SAFETY: as [`malloc_or`].
+    unsafe {
+        if size <= SMALL_SIZE_MAX {
+            let w = crate::types::wsize_from_size(size);
+            let h = (*hb).heap.get();
+            let p = (*h).direct[w];
+            let b = crate::page::page_pop(p);
+            if !b.is_null() {
+                #[cfg(debug_assertions)]
+                {
+                    (*h).stats.allocs += 1;
+                }
+                return b;
+            }
+        }
+        malloc_or_slow_with::<H>(hb, size)
+    }
+}
+
+/// The cold arm of [`malloc_or_with`].
+///
+/// # Safety
+/// As [`malloc_slow`].
+#[cold]
+#[inline(never)]
+unsafe fn malloc_or_slow_with<H: OnOom>(hb: *mut init::HeapBox, size: usize) -> *mut u8 {
+    // SAFETY: forwarded contract.
+    let p = unsafe { malloc_slow(hb, size) };
+    if p.is_null() { H::on_oom(size) } else { p }
+}
+
 /// The cold arm of [`malloc_or`]: the ordinary slow path, then the caller's
 /// OOM handler if even that could not serve.
 ///
@@ -980,6 +1027,37 @@ pub unsafe fn free(p: *mut u8) {
 /// As [`free`].
 #[inline(always)]
 pub unsafe fn free_inline(p: *mut u8) {
+    // SAFETY: forwarded contract.
+    unsafe { free_inline_impl::<true>(p) }
+}
+
+/// [`free_inline`] with the 2.2.5 test order (page flags, THEN owner), for
+/// `rusty_alloc_api`'s `GlobalAlloc::dealloc`.
+///
+/// SPLIT BODY, TWO SYMBOLS, because the two kinds of caller want different
+/// shapes. The owner-first order sends a cross-thread free into a FULL page
+/// straight to `remote_free` (Endless Sky allocator Ir -514,197, opscan
+/// `xthread` 77.09 -> 74.82), but its remote arm is a little more code, and
+/// inlined into Rust's `__rust_dealloc` that tipped LLVM out of inlining the
+/// shim into drop glue: `trees` +2.88 % whole-program (`__rust_dealloc` 46 ->
+/// 4,099,351 Ir self), against `maps` -1.19 %. A Rust drop is rarely
+/// cross-thread, so Rust keeps the smaller body.
+///
+/// # Safety
+/// As [`free`].
+#[inline(always)]
+pub unsafe fn free_inline_flags_first(p: *mut u8) {
+    // SAFETY: forwarded contract.
+    unsafe { free_inline_impl::<false>(p) }
+}
+
+/// The body of [`free_inline`] and [`free_inline_flags_first`];
+/// `OWNER_FIRST` picks the test order and folds at compile time.
+///
+/// # Safety
+/// As [`free`].
+#[inline(always)]
+unsafe fn free_inline_impl<const OWNER_FIRST: bool>(p: *mut u8) {
     // REFUTED TWICE (2026-08-22): folding the null test into the segment mask, the
     // way mimalloc does (`lea -0x1(%rdi),%rsi; and mask,%rsi; jle` — a block is
     // never at offset 0, so masking `p - 1` picks the same segment, and NULL
@@ -1004,6 +1082,25 @@ pub unsafe fn free_inline(p: *mut u8) {
     }
     debug_foreign_pointer_guard(p);
     let seg = segment_of(p);
+    // SAFETY: forwarded contract; `seg` is `p`'s segment.
+    unsafe { free_body::<OWNER_FIRST, false>(p, seg, ptr::null_mut()) }
+}
+
+/// The free fast path from the segment on. `KNOWN_PAGE` callers pass the
+/// page they already resolved (`realloc_live`, which resolved it for its
+/// usable size); the others pass null and the page is resolved here, in the
+/// same place as before, AFTER the owner-id load (see the note on that order
+/// below). Both are compile-time choices.
+///
+/// # Safety
+/// As [`free`], `seg == segment_of(p)`, and with `KNOWN_PAGE`,
+/// `known_pg == page_of(seg, p)`.
+#[inline(always)]
+unsafe fn free_body<const OWNER_FIRST: bool, const KNOWN_PAGE: bool>(
+    p: *mut u8,
+    seg: *mut Segment,
+    known_pg: *mut Page,
+) {
     // SAFETY: p is ours per the contract → seg is a live segment header. The
     // OWNING heap is recovered from the page's xheap back-pointer (container-
     // of over the HeapBox's offset-0 delayed list) — correct even when the
@@ -1043,18 +1140,33 @@ pub unsafe fn free_inline(p: *mut u8) {
         // normal segment, single-block span, interior (aligned-at) pointer.
         // page_of works for both kinds: a huge segment's interior slices all
         // offset back to slot 1.
-        let pg = page_of(seg, p);
+        let pg = if KNOWN_PAGE {
+            known_pg
+        } else {
+            page_of(seg, p)
+        };
         let flags = (*pg).flags.load(Ordering::Relaxed);
         // ONE test decides the whole shape of the free (upstream's
         // `page->flags.full_aligned == 0`). A clear byte means: binned page in
         // a Normal segment, queued, exact pointer — so the general path's
         // segment-kind match, bin compare, full-queue re-test and unalign are
         // all provably unnecessary and are skipped rather than re-derived.
-        if flags & pflags::SLOW_FREE == 0 {
-            // SAFETY: reads the thread pointer at `fs:0` and compares it with
-            // the segment's owner id — the same test as `owner_tid ==
-            // init::thread_id()`, with the load folded into the compare's
-            // memory operand. Reads only; no stack.
+        // The OWNER test comes before the flags test, so a cross-thread free
+        // leaves here whatever its page's flags say. Flags-first sent every
+        // remote free into a FULL page (the common cross-thread case: the
+        // owner filled the page, another thread frees into it) through
+        // `free_general`'s frame and second flags load just to reach the same
+        // `remote_free` (Endless Sky: 173 k of 175 k general frees). A remote
+        // free needs the flags only to unalign an interior pointer. Measured:
+        // Endless Sky allocator Ir -514,197 (-0.90 %), opscan xthread 77.09 ->
+        // 74.82, every local op unchanged. Inlining the unalign into this arm
+        // instead cost EVERY free +3 Ir (small 52.26 -> 55.26), and a single
+        // cold call for all remote frees kept only -43,649 of it.
+        // SAFETY: reads the thread pointer at `fs:0` and compares it with the
+        // segment's owner id — the same test as `owner_tid ==
+        // init::thread_id()`, with the load folded into the compare's memory
+        // operand. Reads only; no stack.
+        if OWNER_FIRST {
             #[cfg(all(target_arch = "x86_64", target_os = "linux", not(miri)))]
             core::arch::asm!(
                 "cmp {tid}, fs:0",
@@ -1063,7 +1175,12 @@ pub unsafe fn free_inline(p: *mut u8) {
                 remote = label {
                     // SAFETY: `pg` is the live page this free resolved; a
                     // non-owning thread hands the block to its owner.
-                    unsafe { remote_free(pg, p.cast::<Block>()) };
+                    unsafe {
+                        if flags & pflags::HAS_ALIGNED != 0 {
+                            return remote_free_flagged(pg, p, flags);
+                        }
+                        remote_free(pg, p.cast::<Block>())
+                    };
                     return;
                 },
                 options(nostack, readonly),
@@ -1073,8 +1190,36 @@ pub unsafe fn free_inline(p: *mut u8) {
             // ordinary comparison below.
             #[cfg(not(all(target_arch = "x86_64", target_os = "linux", not(miri))))]
             if !local {
+                if flags & pflags::HAS_ALIGNED != 0 {
+                    return remote_free_flagged(pg, p, flags);
+                }
                 remote_free(pg, p.cast::<Block>());
                 return;
+            }
+        }
+        if flags & pflags::SLOW_FREE == 0 {
+            if !OWNER_FIRST {
+                // The 2.2.5 order: only a clear flags byte reaches the owner
+                // test here; a remote free into a full page goes through
+                // `free_general`.
+                // SAFETY: as the owner-first arm above.
+                #[cfg(all(target_arch = "x86_64", target_os = "linux", not(miri)))]
+                core::arch::asm!(
+                    "cmp {tid}, fs:0",
+                    "jne {remote}",
+                    tid = in(reg) owner_tid,
+                    remote = label {
+                        // SAFETY: as above.
+                        unsafe { remote_free(pg, p.cast::<Block>()) };
+                        return;
+                    },
+                    options(nostack, readonly),
+                );
+                #[cfg(not(all(target_arch = "x86_64", target_os = "linux", not(miri))))]
+                if !local {
+                    remote_free(pg, p.cast::<Block>());
+                    return;
+                }
             }
             {
                 // Routing the whole free on ONE byte is only safe while that
@@ -1198,11 +1343,41 @@ pub unsafe fn free_inline(p: *mut u8) {
                         options(nostack),
                     );
                 }
-                #[cfg(not(all(
+                // MSVC with `panic = "unwind"`: no goto (see the arm above),
+                // but an `asm!` with an OUTPUT operand is allowed there, and
+                // `sub` + `setle` is four instructions with the test, where
+                // the plain decrement below is five (load, dec, store, test,
+                // branch: LLVM will not emit a memory-destination RMW whose
+                // result drives a branch). Measured with this arm forced on
+                // Linux: see the note below the cfg.
+                #[cfg(all(
                     target_arch = "x86_64",
                     not(miri),
-                    not(all(target_env = "msvc", panic = "unwind"))
-                )))]
+                    target_env = "msvc",
+                    panic = "unwind"
+                ))]
+                {
+                    let le: u8;
+                    // SAFETY: as the goto arm: `pg` is a live page of this
+                    // thread, `USED_OFFSET` is `offset_of!(Page, used)`, and
+                    // the asm touches only that `u32` and uses no stack.
+                    core::arch::asm!(
+                        "sub dword ptr [{pg} + {off}], 1",
+                        "setle {le}",
+                        pg = in(reg) pg,
+                        off = const crate::page::USED_OFFSET,
+                        le = out(reg_byte) le,
+                        options(nostack),
+                    );
+                    if le != 0 {
+                        // One test, as in the goto arm.
+                        if ((*pg).used as usize | (*pg).next.addr() | (*pg).prev.addr()) == 0 {
+                            return;
+                        }
+                        return retire_or_abort(pg);
+                    }
+                }
+                #[cfg(not(all(target_arch = "x86_64", not(miri))))]
                 {
                     let u = (*pg).used.wrapping_sub(1);
                     (*pg).used = u;
@@ -1280,6 +1455,27 @@ unsafe fn retire_or_abort(pg: *mut Page) {
         let seg = segment_of(pg.cast());
         (*owner_heap(pg)).retire_emptied(seg, pg);
     }
+}
+
+/// A cross-thread free of a block on a page that holds aligned-at blocks:
+/// hand the owner the block itself, not the interior pointer. Cold and out of
+/// line, so the remote arm of the free fast path stays a direct
+/// `remote_free` for every other block (inlining the unalign there cost every
+/// free +3 Ir, local ones included).
+///
+/// # Safety
+/// `pg` is the live page of `p`, and `flags` its flags byte.
+#[cold]
+#[inline(never)]
+unsafe fn remote_free_flagged(pg: *mut Page, p: *mut u8, flags: u8) {
+    let b = if flags & pflags::HAS_ALIGNED != 0 && flags & pflags::HUGE_SEGMENT == 0 {
+        // SAFETY: an aligned-at block on a binned page, per the flags.
+        unsafe { unalign(pg, p) }
+    } else {
+        p
+    };
+    // SAFETY: as `free_general`'s remote arm.
+    unsafe { remote_free(pg, b.cast::<Block>()) }
 }
 
 /// Everything a free can be once the flags byte is NOT clear: an interior
@@ -1388,6 +1584,7 @@ unsafe fn free_general(p: *mut u8, seg: *mut Segment, pg: *mut Page, owner_tid: 
 ///
 /// # Safety
 /// `p` must be null or a live pointer from this allocator.
+#[inline]
 pub unsafe fn usable_size(p: *const u8) -> usize {
     if p.is_null() {
         return 0;
@@ -1490,8 +1687,24 @@ pub unsafe fn realloc(p: *mut u8, newsize: usize) -> *mut u8 {
 #[inline(never)]
 unsafe fn realloc_live(p: ptr::NonNull<u8>, newsize: usize) -> *mut u8 {
     let p = p.as_ptr();
-    // SAFETY: p live per contract.
-    let usable = unsafe { usable_size(p) };
+    // The segment and page are resolved ONCE, here, and handed to the free
+    // of a moved block: through `usable_size` and then `free_inline` they
+    // were resolved twice per moving realloc. The old block stays live until
+    // that free, so its page cannot change in between.
+    let seg = segment_of(p);
+    // SAFETY: `p` is a live block of ours (contract), so `seg` is its live
+    // segment and `pg` its page; `usable_size`'s own two arms.
+    let (pg, usable) = unsafe {
+        let pg = page_of(seg, p);
+        let flags = (*pg).flags.load(Ordering::Relaxed);
+        let usable =
+            if flags & (pflags::HAS_ALIGNED | pflags::SINGLE_BLOCK | pflags::HUGE_SEGMENT) == 0 {
+                (*pg).block_size
+            } else {
+                usable_size_slow(pg, p, flags)
+            };
+        (pg, usable)
+    };
     // NOTE: rewriting this as the one-compare unsigned range check
     // `newsize.wrapping_sub(usable >> 1) <= usable - (usable >> 1)` measured
     // FLAT — LLVM already emits that shape from the readable form.
@@ -1506,7 +1719,7 @@ unsafe fn realloc_live(p: ptr::NonNull<u8>, newsize: usize) -> *mut u8 {
     // `min` goes too.
     if newsize > usable {
         // SAFETY: forwarded contract; a growth copies the whole old block.
-        return unsafe { realloc_move(p, newsize, usable) };
+        return unsafe { realloc_move_at(p, newsize, usable, seg, pg) };
     }
     if newsize >= usable / 2 {
         // Keep in place. NOTE: this counter costs a TLS heap lookup (a call
@@ -1526,41 +1739,33 @@ unsafe fn realloc_live(p: ptr::NonNull<u8>, newsize: usize) -> *mut u8 {
     // frame it saved was smaller than the call it added.
     // A shrink below half: the copy is the new, smaller size.
     // SAFETY: forwarded contract.
-    unsafe { realloc_move(p, newsize, newsize) }
+    unsafe { realloc_move_at(p, newsize, newsize, seg, pg) }
 }
 
-/// The moving arm of [`realloc_live`]: allocate `newsize`, copy `copy` bytes,
-/// free `p`. Inlined into both of its call sites, so each copy length is a
-/// value the site already holds.
+/// Allocate, copy `copy` bytes and free `p`, for a caller that has resolved
+/// `p`'s segment and page.
 ///
 /// # Safety
-/// `p` live from this allocator; `copy <= min(usable_size(p), newsize)`.
+/// `p` is a live block of ours with at least `copy` usable bytes,
+/// `copy <= newsize`, `seg == segment_of(p)` and `pg == page_of(seg, p)`.
 #[inline(always)]
-unsafe fn realloc_move(p: *mut u8, newsize: usize, copy: usize) -> *mut u8 {
+unsafe fn realloc_move_at(
+    p: *mut u8,
+    newsize: usize,
+    copy: usize,
+    seg: *mut Segment,
+    pg: *mut Page,
+) -> *mut u8 {
     let np = malloc(newsize);
     if np.is_null() {
         return ptr::null_mut();
     }
-    // SAFETY: both live and disjoint; prefix preserved then p consumed.
+    // SAFETY: `p` is live and `copy` of its bytes are ours; `np` is a fresh
+    // block of at least `newsize >= copy` bytes. `p` is freed once, through
+    // the page resolved by the caller.
     unsafe {
         core::ptr::copy_nonoverlapping(p, np, copy);
-        // `free_inline`, not the outlined `free`: this function has ALREADY
-        // masked `p` to its segment for `usable_size`, and inlining the free
-        // here lets LLVM common-subexpression that away instead of masking
-        // back to the same header a second time. Splitting `free_inline` to
-        // pass the segment explicitly was tried first and cost +1 Ir on EVERY
-        // free (batch_lifo 60.00 -> 61.00); letting the inliner find it costs
-        // other callers nothing because only this one opts in.
-        //
-        // REFUTED (2026-09-24): resolving this free's page, flags and owner
-        // BEFORE the copy, so the opaque `memcpy` would not force LLVM to
-        // re-derive them after it (five instructions per move). `free` stayed
-        // byte-identical, but LLVM re-loaded the page index before the copy
-        // anyway (the `malloc` above may write memory), and holding four
-        // values across the call took a sixth callee-saved register plus a
-        // stack adjustment: opscan `realloc` +8.00 (+4 per move), lua
-        // +240,221 and python +302,857 allocator Ir.
-        free_inline(p);
+        free_body::<true, true>(p, seg, pg);
         stat_realloc(false);
     }
     np

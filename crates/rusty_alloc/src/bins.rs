@@ -18,7 +18,7 @@ pub const PAGES_DIRECT: usize = crate::types::SMALL_WSIZE_MAX + 1;
 /// Map a size to its bin index (`mi_bin`). Sizes above [`MEDIUM_OBJ_SIZE_MAX`]
 /// map to [`BIN_HUGE`], the dedicated-segment path.
 #[inline]
-pub fn bin(size: usize) -> usize {
+pub const fn bin(size: usize) -> usize {
     let wsize = wsize_from_size(size);
     if wsize <= 1 {
         1
@@ -43,6 +43,39 @@ pub fn bin(size: usize) -> usize {
         // +1.00, `aligned` +0.69, `mixed` +0.72. Leave it as written.
         let b = (usize::BITS - 1 - w.leading_zeros()) as usize;
         ((b << 2) + ((w >> (b - 2)) & 0x03)) - 3
+    }
+}
+
+/// [`bin`] of every small size, by its word count: `SMALL_BIN[w]` is
+/// `bin(w * INTPTR_SIZE)` for `w <= SMALL_WSIZE_MAX`.
+static SMALL_BIN: [u8; crate::types::SMALL_WSIZE_MAX + 1] = {
+    let mut t = [0u8; crate::types::SMALL_WSIZE_MAX + 1];
+    let mut w = 0;
+    while w <= crate::types::SMALL_WSIZE_MAX {
+        let b = bin(w * INTPTR_SIZE);
+        assert!(b <= u8::MAX as usize);
+        t[w] = b as u8;
+        w += 1;
+    }
+    t
+};
+
+/// [`bin`], from a table for small sizes. The generic slow path re-derives
+/// the bin of a size the fast path already rejected, and on a small size the
+/// computed form (two compares, a `bsr`, shifts) was 10.7 Ir per trip
+/// (Endless Sky: 70 k trips); the table is a load. `bin(size)` depends on
+/// `size` only through its word count when the size is small, so the table
+/// is exact.
+///
+/// Takes the word count the caller already computed (`w ==
+/// wsize_from_size(size)`), so the generic path derives it once.
+#[inline]
+pub fn bin_by_wsize(size: usize, w: usize) -> usize {
+    debug_assert_eq!(w, wsize_from_size(size));
+    if w <= crate::types::SMALL_WSIZE_MAX {
+        SMALL_BIN[w] as usize
+    } else {
+        bin(size)
     }
 }
 

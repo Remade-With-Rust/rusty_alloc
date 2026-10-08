@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+Measured against 2.2.5 with callgrind, allocator instructions, outputs
+identical: Endless Sky start-up -6.85 %, lua -2.23 %, perl -1.64 %, sqlite
+-0.11 %; Rust `GlobalAlloc` workloads up to -4.24 % whole-program. Peak RSS
+within +-0.4 %. Details: `docs/opps.md`, "Vein census 3".
+
+- **Pages carve in growing batches.** A page's first extension is still one
+  4 KiB OS page; each later one carves as many blocks as the page already
+  holds. Each extension costs a slow-path trip, and those trips, not the
+  linking, were the cost. Thread start-up is unchanged.
+- **A cross-thread free into a full page goes straight to its owner** (the
+  `free`/`operator delete` exports test the owner first). Rust's `dealloc`
+  keeps the 2.2.5 order, which keeps `__rust_dealloc` inlinable into drop
+  glue. Trade-off: a same-thread free of a large or huge block costs 2 more
+  instructions (about 1.4 % of that path).
+- **The slow path looks up a small size's bin from a table.**
+- **`operator new`'s slow path has a smaller frame** (`malloc_or_with`, a
+  typed OOM handler).
+- **A moving `realloc` resolves the block's page once, not twice.**
+- **Exited threads' heap boxes are reused**, saving an `mmap`/`munmap` pair
+  and a page fault per thread.
+- **Rust: the natural-alignment arm of `GlobalAlloc::alloc` is out of line,
+  and `usable_size` is inlinable.**
+- **MSVC builds with `panic = "unwind"`** take back one of the three
+  instructions per free that 2.2.5's fix cost them.
+
+### Added
+
+- `alloc::malloc_or_with` and the `alloc::OnOom` trait: `malloc_or` with the
+  OOM handler as a type.
+- `alloc::free_inline_flags_first`: `free_inline`'s body in the 2.2.5 test
+  order, for Rust's `GlobalAlloc::dealloc`.
+
 ## [2.2.5](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.2.4...rusty_alloc-v2.2.5) - 2026-10-08
 
 ### Fixed

@@ -518,6 +518,86 @@ a `let _ = retire_span(..)` missing its same-line terminal comment (semgrep
 `discarded-lifecycle-result`, CI-blocking); `corpus/linux-gates.sh`
 hard-coded `/mnt/c/...` and exited 1 before running anything.
 
+## Vein census 3, 2026-10-08 (real programs, by function)
+
+**Method.** Callgrind on real programs, not synthetic ops: perl, sqlite, lua,
+python and the Endless Sky start-up through the override (`LD_PRELOAD` on
+valgrind itself: through `env`, valgrind traces `env` and not the exec), plus
+the four Rust `GlobalAlloc` workloads. Per function: self Ir, call count,
+self/call and caller->callee edges (`F:/ra-corpus-tmp/veins/cgcensus.py`,
+`census3.sh`). Build: `main` at 2.2.5. mimalloc 2.4.5 through the same
+parser: rusty_alloc is cheaper PER CALL at every comparable site (free 21.0 vs
+25.0, malloc 14.9 vs 15.9, the page carve 1.98 M vs 3.14 M total on perl, the
+lua realloc path 11.2 M vs 27.7 M, the Endless Sky cross-thread free
+5.5 M vs ~15.3 M). So these veins are absolute costs, not gaps to the
+oracle.
+
+Allocator share of the whole program: Endless Sky 57.4 M Ir (5.62 %), perl
+24.7 M (3.19 %), lua 23.1 M (3.85 %), sqlite 4.6 M (1.45 %), python 0.17 M.
+The two fast paths are most of it (ES: delete 19.8 and new 14.8 Ir/call, 41 %
+and 31 % of the allocator) and four campaigns have mined them; they are not
+on this list except where a census line names a specific cost.
+
+| # | vein | evidence (census) | ceiling | first probe |
+|---|---|---|---|---|
+| 1 | **Carving builds a whole free list up front.** `page_extend` links every block of the extension before one is used | `grow_front` perl 1.98 M (8.0 % of allocator; 1.84 M in page.rs), ES 1.91 M, lua 1.20 M; the thread-start walk spends most of its 911 Ir/call in the same loop | most of the carve: ~1.8 M on perl, ~1.9 M on ES | a bump-pointer carve (allocate from the uncarved tail, link nothing until freed). A throwaway that only times the loop sizes it first |
+| 2 | **Endless Sky: 114 k LOCAL frees take the slow path.** `free_general` 175,393 calls, only 61,643 of them `remote_free` | ES `free_general` 4.37 M self (24.9/call, 7.6 % of allocator) | ~2.8 M if the common reason stays on the fast path | a per-reason counter: which `SLOW_FREE` bit (`IN_FULL` likely, or `SINGLE_BLOCK`) |
+| 3 | **Rust: `GlobalAlloc::alloc` is not inlined into `__rust_alloc`; `dealloc` is.** | maps: `__rust_alloc` 4.0 Ir/call self, then a call to `RustyAlloc::alloc` (18.5 self) on 16,026 calls; hashbrown calls it out of line too | ~4-5 Ir per Rust allocation, in every Rust consumer | `#[inline(always)]` on `GlobalAlloc::alloc` (or split body/symbol); whole-program Ir + `.text` on all four workloads |
+| 4 | **The generic slow path's 50-63 Ir of self cost per trip.** | ES 70,187 trips x 63.1 = 4.43 M (7.7 %): heap.rs 2.25 M, page.rs 0.80 M, **bins.rs 0.75 M (10.7/trip: the bin recomputed from the size)**; perl 574 k, lua 405 k | the bin recompute, ~0.75 M on ES; more after a line census | pass the bin the fast path already computed; per-line census of heap.rs |
+| 5 | **C++ `operator new`'s miss takes an extra hop.** new -> `malloc_or_slow` (12 Ir) -> `malloc_slow` (7) -> generic, where `malloc` goes straight to `malloc_slow` | ES `malloc_or_slow` 70,115 x 12.0 = 841 k (1.5 %) | ~0.8 M on ES; every C++ program under the override | route the miss straight to `malloc_slow`, with the null/throw test after |
+| 6 | **`realloc_live` self cost, re-measured.** "At its floor" was decided in 2026-08 against another shape | lua 60,051 calls x 55 = 3.30 M (14.3 % of lua's allocator): alloc.rs 29/call, page.rs 9, **segment.rs 5 (a segment re-resolve?)**, init.rs 2 (TLS heap) | the re-resolve plus whatever a line census finds | per-line census; check whether the segment and heap are already in hand from `realloc` |
+| 7 | **Thread start/exit fixed cost and one OS allocation per thread.** | rust-threads, 200 threads: walk 911 x 2, `collect_inner` 436 x 2, `create_heap_uninstalled` 163, `segment_free` 105, `thread_done_one` 94, `reseed` 67, and `os::alloc_aligned`/`prim::alloc` 203 calls (an OS call per thread) | ~3.9 k Ir and a syscall pair per thread; thread pools pay it per spawn | find what the per-thread OS allocation is, and reuse it from exited threads |
+| 8 | **Over-aligned Rust realloc asks `usable_size` out of line, then re-allocates.** | overaligned: `__rust_realloc` -> `usable_size` 5,125 x 13.0 = 66.6 k (27 % of that workload's allocator Ir), then `alloc` 2,678 x 60 | most of the 66.6 k, plus the moves that fit in place | an aligned in-place realloc that resolves the page once |
+| 9 | **Win back 2.2.5's +3 Ir/free on MSVC builds that unwind.** The goto is banned there, but an `asm!` with an OUTPUT operand is not | 2.2.5: plain-Rust decrement = +3 Ir per local free (small 52.26 -> 55.26 forced on Linux) | up to 3 Ir/free on affected builds (rusty_sloth) | `sub dword ptr [..], 1` + `setle` into an output, branch in Rust; forced on Linux, then the rusty_sloth corpus row |
+| 10 | **A fat heap's thread-exit collect walks every page.** | ES: ONE `thread_done_one` -> `collect_inner` = 1.82 M Ir (page.rs 1.62 M); mimalloc pays the same (`_mi_page_free_collect` 1.64 M) | ~1.8 M per exit of a big heap | abandon whole segments on a dying heap without per-page collection, if adoption can collect lazily |
+
+**Rules for working these** (from the skill and this campaign): paired,
+same-session measurements only; quote at least two shapes per probe (a real
+program AND opscan); the work-parity anchors are the program's output and the
+call counts above; record every refutation with its number.
+
+### Vein census 3 results, 2026-10-08
+
+Final tree against 2.2.5, same session, allocator self Ir (`real.sh`; outputs
+identical):
+
+| program | 2.2.5 | after | delta |
+|---|---:|---:|---:|
+| Endless Sky start-up | 57,380,635 | 53,453,604 | **-6.85 %** |
+| lua | 23,149,581 | 22,632,842 | **-2.23 %** |
+| perl | 24,668,474 | 24,262,947 | **-1.64 %** |
+| sqlite | 4,592,621 | 4,587,503 | -0.11 % |
+| python | 168,937 | 155,977 | -7.7 % |
+
+Rust `GlobalAlloc` workloads, whole program (checksums equal): overaligned
+-4.24 %, threads -1.53 %, maps -0.36 %, trees -0.01 %. Opscan: realloc
+231.89 -> 227.97, xthread 77.09 -> 74.82, aligned 83.75 -> 83.00, calloc
+93.75 -> 93.00, mixed 94.26 -> 93.56, small/big unchanged; **2 MiB op 142.06 ->
+144.06 and 64 MiB pair 834 -> 836 (+2: vein 2's trade, below)**. Peak RSS
+within +-0.4 % (perl, lua, ES); 28-thread battle replay 1,752.6 -> 1,744.1 MB.
+
+| vein | result | what landed |
+|---|---|---|
+| 1 carve | **LANDED**, the biggest | geometric extension batches (`page_extend`: at least what the page holds). ES -4.50 %, lua -1.94 %, perl -1.62 %. The link loop was already 2.75 Ir/block (unrolled x4); the slow-path TRIPS were the cost. A fixed 8 KiB batch: ES -2.92 % but thread life +10 % (refuted) |
+| 2 slow frees | **LANDED** | the census premise was wrong: the 175 k were CROSS-thread frees into FULL pages (`remote_free` inlined in `free_general`). C exports test the owner first (`free_inline`); Rust keeps the 2.2.5 order (`free_inline_flags_first`), because the bigger remote arm stopped `__rust_dealloc` inlining into drop glue (`trees` +2.88 %). ES -515,705, xthread -2.9 %. Trade: a LOCAL free into a slow page (large span, huge, aligned, full) pays the owner compare first, +2 Ir (the 2 MiB and 64 MiB ops). Refuted: unalign inlined into the remote arm (+3 Ir on EVERY free); one cold call for all remote frees (-43,649 only) |
+| 3 Rust alloc inlining | **LANDED** | only the natural-alignment arm out of line (it was a second inlined copy of malloc). maps -0.33 %, overaligned -1.81 %. Refuted: `#[inline(always)]` (maps +0.98 %), all non-word arms out of line (overaligned +0.93 %), one merged malloc call (maps +1.33 %) |
+| 4 bin recompute | **LANDED** | `SMALL_BIN` table by word count, indexed with the word count the generic path already computes. ES -0.70 %, then -73 k more with the shared word count |
+| 5 operator new hop | **LANDED** | `malloc_or_with::<H: OnOom>`: the cold arm's frame 12 -> 7 instructions (a typed handler, not a `fn` pointer). ES -419,182 |
+| 6 realloc_live | **LANDED** (small) | the page resolved for the usable size is handed to the free. lua -60,025, opscan realloc -2.00 |
+| 7 thread start/exit | **LANDED** | an 8-slot heap-box cache (upstream `TD_CACHE_SIZE`). Thread life -1.1 %, Rust threads -1.46 %, minor faults ~137 -> ~117 per run |
+| 8 over-aligned realloc | **LANDED** | `#[inline]` on `usable_size`. overaligned -2.06 % (isolated) |
+| 9 MSVC unwind | **LANDED** | `sub` + `setle` into an output on MSVC with `panic = "unwind"`: +2 over the goto where 2.2.5's plain decrement was +3 (forced on Linux). rusty_sloth builds (registry-identity corpus row), MSVC unwind IR still has 0 `callbr` |
+| 10 thread-exit collect | **REFUTED, inherent** | the cost is the cross-thread drain (each remote-freed block walked once, at its collect; teardown is where the backlog is). mimalloc pays the same 1.64 M. The per-step `n > used` check also bounds a corrupted (cyclic) chain, so it stays |
+
+Gates: workspace `--all-features` 177/177, linux-gates 42/0, embedded 15/15,
+clippy (Windows + Linux targets, all features), fmt, semgrep, wasm self-test
+and size (21,175 B gz, inside the +3 % ratchet), gate self-test 11/11, miri
+gate + `openheimer` 37/37 under miri, mimalloc-bench sweep 19/19, churn 5/5,
+real-world programs byte-identical across ra/mi/sys, alloc-eval checks on all
+8 traces, rusty_sloth (crates.io identity, `--release --features cuda`).
+One unexplained failure in the first of 27 Windows test runs (log lost), not
+reproduced in the 26 after it.
+
 ## Banked
 
 ### 8. Collect-loop double `block_next` — LANDED 2026-08-20

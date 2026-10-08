@@ -1255,7 +1255,20 @@ pub unsafe fn page_extend(page: *mut Page, area: *mut u8) {
         // byte bound alone gives ONE block to any class above 4 KiB and one
         // to three to classes above 1 KiB, so a fresh medium page served one
         // allocation per slow-path trip. See `MIN_EXTEND`.
-        let take = ((reserved >> span_shift).max(MIN_EXTEND)).min(reserved - capacity);
+        //
+        // And at least what the page already holds (`capacity`): the batch
+        // GROWS geometrically, 4 KiB, 4 KiB, 8, 16 ... Each extension costs a
+        // slow-path trip (the generic path, `grow_front`'s setup: ~117 Ir
+        // before the first block), and the linking itself is only 2.75 Ir a
+        // block (LLVM unrolls it x4), so the trips were the cost. Measured,
+        // allocator self Ir: Endless Sky -4.50 %, lua -1.94 %, perl -1.62 %,
+        // python -6.4 %; thread life flat (a short thread still carves one
+        // 4 KiB page); peak RSS within +-0.8 %. Carved-but-unused blocks stay
+        // bounded by the blocks already carved. A FIXED 8 KiB batch got less
+        // (ES -2.92 %) and cost thread life +10 % (16,923 -> 18,643 Ir): every
+        // short thread carved twice what it used.
+        let take =
+            ((reserved >> span_shift).max(MIN_EXTEND).max(capacity)).min(reserved - capacity);
         let start = area.add(capacity * bsize);
         // Link the fresh blocks in address order.
         //
