@@ -228,3 +228,9 @@ normal path. Whatever rusty_sloth does to defeat that is not small. So the gate
 is **rusty_sloth itself**, as a corpus row built `--release`
 (`tools/corpus/corpus.toml`, `build = "release"`). It is a local gate, not a CI
 job, because rusty_sloth is not on CI's machines.
+
+**The row needs `--features cuda`.** Without it, rusty_sloth's release build
+is GREEN on unfixed 2.2.4 (corpus run, 2026-10-07): the drops that land in a
+funclet are in its CUDA paths. `cuda` is also the shape it ships, so the row
+builds that, and a machine without the CUDA toolkit reports BASELINE ALREADY
+RED rather than a pass.

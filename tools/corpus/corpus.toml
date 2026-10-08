@@ -64,7 +64,10 @@ note = "generated mirror of packages/spacedb; rusty_alloc-api =1.1.6, default-on
 name = "rusty_sloth"
 path = "F:/coding/rusty_sloth"
 pkg = "rusty_sloth-cli"
-features = ""
+# `cuda` is the shipped shape AND the trigger: without it the release build
+# is green on 2.2.4 (checked 2026-10-07). Needs the CUDA toolkit; a machine
+# without it reports BASELINE ALREADY RED, not a pass.
+features = "cuda"
 build = "release"
 # The shape no other consumer has: it UNWINDS (default panic strategy) and
 # ships thin LTO with one codegen unit, so the allocator's inlined free lands
@@ -74,4 +77,4 @@ build = "release"
 # threads that exit and frees on main. Built with `cargo build --release`,
 # not `check`: the defect exists only in optimised codegen. Slow (an LTO build
 # of an ML stack, twice), and wants ~10 GB free in TMPDIR.
-note = "via crates/rusty_sloth-alloc; unwinding + thin LTO + cgu=1; release BUILD"
+note = "via crates/rusty_sloth-alloc; --features cuda; unwinding + thin LTO + cgu=1; release BUILD"
