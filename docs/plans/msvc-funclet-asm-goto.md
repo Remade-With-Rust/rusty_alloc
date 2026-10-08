@@ -137,15 +137,6 @@ committed, and rusty_sloth is back on 2.2.0.
   - GLM-4-MoE training (5-step losses to the bit) and decode text.
 - **rusty_alloc-api's own tests pass** (`cargo test --release -p rusty_alloc-api`), clippy and
   fmt are clean.
-- **What 2.2.4 brings this consumer** — the stranded-span fix. rusty_sloth quantises a model's
-  weights on worker threads that exit, and frees the results on the main thread. A 2.8B GLM
-  load plus a 129-token chat, the process sampled every 50 ms, two runs each, identical:
-
-| | 2.2.0 | 2.2.4 + `7037d8d` |
-|---|---:|---:|
-| private bytes at the end | 5,103 MB | **4,077 MB** |
-| working set at the end | 2,133 / 2,149 MB | **1,062 / 1,058 MB** |
-| peak working set | 7,551 / 7,568 MB | 6,397 / 6,294 MB |
 
 ## 5. A regression test that would have caught it
 
