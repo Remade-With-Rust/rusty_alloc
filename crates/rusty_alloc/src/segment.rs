@@ -246,8 +246,10 @@ pub unsafe fn page_of(seg: *mut Segment, p: *mut u8) -> *mut Page {
         let off = *tab.add(idx) as usize;
         // The two representations must agree. This is the check that makes the
         // duplicated state safe to keep, and it is free in release.
+        // (A Huge segment keeps `page_off` alone: its interior slots' offsets
+        // are not written, see `huge_alloc`.)
         debug_assert!(
-            {
+            (*seg).kind == SegmentKind::Huge || {
                 let base: *mut Page = (&raw mut (*seg).pages).cast();
                 let slot = base.add(idx);
                 let back = (*slot).slice_offset as usize * slot_stride();
@@ -308,8 +310,10 @@ pub unsafe fn page_index(seg: *mut Segment, page: *mut Page) -> usize {
     // SAFETY: both point into the same header per the contract.
     unsafe {
         let idx = ((*page).area.addr() - seg.addr()) / SEGMENT_SLICE_SIZE;
+        // (A Huge segment keeps `page_off` alone: its interior slots' offsets
+        // are not written, see `huge_alloc`.)
         debug_assert!(
-            {
+            (*seg).kind == SegmentKind::Huge || {
                 let base: *mut Page = (&raw mut (*seg).pages).cast();
                 idx == (page.addr() - base.addr()) / core::mem::size_of::<Page>()
             },
@@ -352,7 +356,17 @@ unsafe fn wait_no_remote_in_flight(seg: *mut Segment) {
         // that carved 10 slices scans 10, not 512. (A Huge segment sets
         // `next_free_slice = SLICES_PER_SEGMENT`, so it is unaffected — correct,
         // since its one page occupies the whole reservation.)
-        let end = (*seg).next_free_slice as usize;
+        //
+        // A Huge segment's one page is slot 1, so slot 1 is the only one
+        // scanned there. Its other slots are never read by anything but this
+        // scan (every slice resolves to slot 1 through `page_off`), and a
+        // recycled chunk no longer scrubs them (`scrub_recycled`): sweeping
+        // them read stale bytes, and cost 511 atomic loads per huge free.
+        let end = if (*seg).kind == SegmentKind::Huge {
+            HEADER_SLICES + 1
+        } else {
+            (*seg).next_free_slice as usize
+        };
         for i in HEADER_SLICES..end {
             let pg = base.add(i);
             while (*pg)
@@ -364,6 +378,35 @@ unsafe fn wait_no_remote_in_flight(seg: *mut Segment) {
                 core::hint::spin_loop();
             }
         }
+    }
+}
+
+/// Scrub what the next tenant of a RECYCLED chunk could read before it writes
+/// it: the owner table (so an uncarved slice resolves exactly as on fresh
+/// memory) and the first `slots` page slots. The rest of `pages` is left as
+/// it was.
+///
+/// This used to zero the whole `Segment`, 512 slots of 88 bytes: 45 KB
+/// written, and its pages first-touched, on every thread's first segment and
+/// every huge allocation once the arena had warmed up. That was 47 k of the
+/// 53.5 k instructions of a 64 MiB malloc/free pair and almost all of what a
+/// thread's life cost over glibc (`docs/opps.md`, vein census 2026-10-07). A
+/// Normal segment's slots are zeroed instead as the bump cursor first carves
+/// them; a Huge segment reads only slots 0 and 1.
+///
+/// # Safety
+/// `seg` is the base of a mapping at least `size_of::<Segment>()` long that
+/// no one else is using.
+///
+/// `owner_table` is false for a Huge segment, which overwrites every entry of
+/// the owner table but the first a few lines later: zeroing it first was a
+/// 2 KB memset that bought nothing.
+unsafe fn scrub_recycled(seg: *mut Segment, slots: usize, owner_table: bool) {
+    // SAFETY: per contract, both ranges lie inside the header.
+    unsafe {
+        let tab = (&raw mut (*seg).page_off).cast::<u32>();
+        core::ptr::write_bytes(tab, 0, if owner_table { SLICES_PER_SEGMENT } else { 1 });
+        core::ptr::write_bytes((&raw mut (*seg).pages).cast::<Page>(), 0, slots);
     }
 }
 
@@ -386,9 +429,12 @@ pub fn segment_alloc(arena_id: i32) -> Result<*mut Segment, PrimError> {
     // in full. A recycled chunk's stale bytes are all overwritten here and
     // page slots are re-initialized by span_mark on every carve.
     unsafe {
-        // Recycled chunks carry stale page slots — scrub the header region.
+        // Recycled chunks carry stale page slots. Only the owner table and the
+        // header slot are scrubbed here; each later slot is zeroed when the
+        // bump cursor first carves it (`span_alloc`). Every scalar field is
+        // assigned below.
         if !mem_zero {
-            core::ptr::write_bytes(seg.cast::<u8>(), 0, core::mem::size_of::<Segment>());
+            scrub_recycled(seg, HEADER_SLICES, true);
         }
         (*seg).kind = SegmentKind::Normal;
         (*seg).total_size = size;
@@ -720,6 +766,13 @@ pub unsafe fn span_alloc(seg: *mut Segment, slices: usize) -> (*mut Page, bool) 
         if idx + slices > SLICES_PER_SEGMENT {
             return (ptr::null_mut(), false);
         }
+        // First carve of these slots in this tenancy: on a recycled chunk
+        // they still hold the previous tenant's bytes (`scrub_recycled` left
+        // them), and a stale `free_is_zero` or `xthread_free` would be read
+        // as this page's. On fresh OS memory they are already zero.
+        if !(*seg).mem_is_zero {
+            ptr::write_bytes((&raw mut (*seg).pages).cast::<Page>().add(idx), 0, slices);
+        }
         (*seg).next_free_slice = (idx + slices) as u32;
         (*seg).used_pages += 1;
         let start: *mut Page = &raw mut (*seg).pages[idx];
@@ -963,10 +1016,14 @@ pub fn huge_alloc(
         }
     };
     let seg: *mut Segment = bptr.cast();
-    // SAFETY: header region fully written below; recycled chunks scrubbed.
+    // SAFETY: header scalars fully written below; a recycled chunk's owner
+    // table and the two slots a huge segment uses (0, and 1 for its page) are
+    // scrubbed. Slots 2.. only get `slice_offset` below and are read by
+    // nothing else (every slice resolves to slot 1 through `page_off`, and
+    // `wait_no_remote_in_flight` scans slot 1 alone for a Huge segment).
     unsafe {
         if !mem_zero {
-            core::ptr::write_bytes(seg.cast::<u8>(), 0, core::mem::size_of::<Segment>());
+            scrub_recycled(seg, HEADER_SLICES + 1, false);
         }
     }
     let b = os::OsBlock {
@@ -1048,18 +1105,17 @@ pub fn huge_alloc(
         );
         (*page).free_is_zero = b.is_zero;
         // Every slice of a huge segment resolves to slot 1, so the owner table
-        // is one value repeated across the run. (Writing it as a vectorised
-        // `slice::fill` instead of a store in the loop below measured exactly
-        // flat — the loop is dominated by `slice_offset`, which strides by
-        // `size_of::<Page>()` and cannot vectorise.)
+        // is one value repeated across the run, and it is the ONLY record of
+        // that: the interior slots' `slice_offset` used to be written too, 511
+        // stores 88 bytes apart that touched the whole 45 KB slot array, and
+        // their one reader was the `page_of` debug cross-check (which now
+        // skips Huge segments). Nothing else reads a Huge segment's slots past
+        // slot 1. With the strided stores gone, this is a contiguous 2 KB fill.
         let owner = page_off_for(1);
         let tab: *mut u32 = (&raw mut (*seg).page_off).cast();
-        *tab.wrapping_add(1) = owner;
-        let mut j = 2;
+        let mut j = 1;
         while j < SLICES_PER_SEGMENT {
-            // Slices back to slot 1, which holds this huge block's page data.
-            (*seg).pages[j].slice_offset = (j - 1) as u16;
-            *tab.wrapping_add(j) = owner;
+            *tab.add(j) = owner;
             j += 1;
         }
         Ok((seg, block))
@@ -1090,6 +1146,23 @@ pub unsafe fn huge_free(seg: *mut Segment) -> Result<(), PrimError> {
         // Only chunk-multiple segments can reach an arena and need the
         // restore; a ragged one is released whole (or pooled, on wasm).
         let chunked = (*seg).total_size.is_multiple_of(SEGMENT_SIZE);
+        // With purging on, a freed huge block gives its pages back BEFORE its
+        // chunks rejoin the arena, exactly as `span_free` does for a span.
+        // It never did: arena memory is committed once and handed out as-is,
+        // so a dead 150 MB tensor stayed resident for the life of the process
+        // whatever `purge_delay` said — the unexplained ~150 MB of
+        // `docs/plans/huge-free-retention.md` (Whisper small's embedding is
+        // 152 MiB). Marked `purged_any`, so `restore_for_reuse` below
+        // re-commits it (checked since 2.2.3) and the next tenant gets
+        // demand-zero pages, not a decommitted range. A segment outside an
+        // arena is released whole below and needs none of this.
+        if chunked && crate::options::get(15) >= 0 && crate::arena::owns(seg.cast()) {
+            let base = seg.cast::<u8>().add(HEADER_SLICES * SEGMENT_SLICE_SIZE);
+            let bytes = (*seg).total_size - HEADER_SLICES * SEGMENT_SLICE_SIZE;
+            if os::purge(base, bytes, crate::options::is_enabled(5)).is_ok() {
+                (*seg).purged_any = true;
+            }
+        }
         let usable = !chunked || restore_for_reuse(seg);
         if chunked {
             if !usable {

@@ -273,6 +273,12 @@ pub fn register(seg: *mut Segment) {
 /// (OH-rusty_alloc-30). Reachable from a caller-supplied `manage_os_memory`
 /// range, so bounded here as well as there.
 #[cfg(all(not(ra_small_profile), not(all(target_arch = "wasm32", not(miri)))))]
+///
+/// REFUTED (2026-10-07): coalescing the windows that share a bitmap word into
+/// one `op` call (one locked RMW per word instead of per window) measured
+/// +15 Ir on a 64 MiB malloc/free pair (824 -> 839): tracking the pending word
+/// costs more instructions than the two RMWs it removes. It may still win on
+/// cycles (a locked RMW is ~20), which callgrind cannot show; not kept.
 fn walk_windows(base: usize, size: usize, mut op: impl FnMut(usize, u32)) {
     let mut a = base;
     let end = base.saturating_add(size.max(1));

@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Freed model memory no longer stays stranded after a loader thread
+  exits.** A thread that exits abandons its segments with their blocks live;
+  blocks freed into them later are collected when another thread adopts the
+  segment, but adoption retired only ONE dead large span per segment and left
+  the rest carved for the life of the process. A model loaded on one thread
+  and dropped on another kept ~0.6 of its size resident and unreusable,
+  whatever `purge_delay` said. Every dead large span is now retired. Adoption
+  also no longer releases the empty segment it has just parked (which left
+  the heap releasing every empty segment instead of keeping one).
+- **A freed huge block (> 32 MiB) is purged when purging is on.** It used to
+  rejoin the arena resident whatever `purge_delay` said: a dead Whisper-small
+  embedding (152 MiB) stayed resident for the life of the process. Details,
+  measurements and the consumer report: `docs/plans/huge-free-retention.md`.
+
+- **A deferred-free hook that allocates is no longer undefined behaviour.**
+  `mi_register_deferred_free`'s hook fired inside the generic allocation
+  path while that path held `&mut Heap`, so a hook that allocated (or freed)
+  re-entered the heap under a protected exclusive borrow. Miri reported it
+  (Stacked Borrows, `tests/openheimer.rs`), and it had kept the `miri` CI job
+  red since 2.2.3. The hook now fires at the next allocation entry, before
+  any `&mut Heap` exists. Cost: one flag test per slow-path entry (perl and
+  sqlite allocator instructions +0.16 % / +0.22 %).
+
+### Performance
+
+- **Recycled segments are no longer scrubbed whole.** Every thread's first
+  segment and every huge allocation zeroed the 45 KB header of a recycled
+  chunk; now only the owner table and the slots read before a carve are
+  zeroed, and a slot is zeroed at its first carve. Huge segments also skip
+  511 unused slot writes and scan one slot, not 511, when freed. Measured
+  (callgrind, memset counted as real instructions): 64 MiB malloc+free
+  8,959 -> 824 Ir (-90.8 %), a thread's life -12.4 %, a Rust thread-pool
+  workload -15.0 %.
+- **A freed large block (<= 4 MiB) is kept for same-size reuse** while
+  purging is off, and only when it is a lone free (never the end of a
+  teardown run, so a model swap lays out exactly as before). A 2 MiB
+  malloc/free pair 293 -> 138 Ir.
+- **Multi-chunk arena claims** read each bitmap word once and claim a
+  one-word run with one atomic: 6 -> 2 locked read-modify-writes per huge
+  allocation.
+
+Every opscan op is unchanged or better; perl, sqlite and Endless Sky are flat
+on allocator instructions; code size +361 bytes gzipped on wasm.
+
 ## [2.2.3](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.2.2...rusty_alloc-v2.2.3) - 2026-10-05
 
 ### Fixed

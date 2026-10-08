@@ -8,7 +8,9 @@
 # an infinite-recursion bug, and was briefly read as a pass.
 set -uo pipefail
 source ~/.cargo/env 2>/dev/null
-cd /mnt/c/Users/talmo/coding/rusty_alloc || exit 1
+# The repo this script lives in, wherever it is mounted (it was a hard-coded
+# /mnt/c path, which exited 1 before running anything on any other layout).
+cd "$(cd "$(dirname "$0")/.." && pwd)" || exit 1
 
 # CLIPPY RUNS HERE TOO, and that is not redundant with the Windows gate.
 # Lints are platform-dependent: `c_long` is i64 on LP64 unix and i32 on

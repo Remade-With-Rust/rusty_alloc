@@ -359,9 +359,72 @@ unsafe fn malloc_slow(hb: *mut init::HeapBox, size: usize) -> *mut u8 {
         // only where a workload leaves populated free lists behind
         // (`mixed`, and `rptest` through `Heap::malloc`). A fast path is worth
         // its cost only where the thing it looks for is actually there.
-        return unsafe { (*(*hb).heap.get()).malloc_generic(size).0 };
+        //
+        // The deferred-free hook check stays in TAIL position too: a due hook
+        // jumps to the cold `malloc_slow_deferred`, which fires it and then
+        // allocates. Calling `fire_deferred_if_due` here instead put a call in
+        // this function and gave it a frame: big 91 -> 100, mixed +6.6 Ir/op.
+        // SAFETY: as above; the flag read forms no reference.
+        unsafe {
+            let h = (*hb).heap.get();
+            if (*h).deferred_due {
+                return malloc_slow_deferred(h, size);
+            }
+            return (*h).malloc_generic(size).0;
+        }
     }
     malloc_first(size)
+}
+
+/// [`malloc_slow`] when the heartbeat marked the deferred-free hook due: fire
+/// it while no `&mut Heap` exists, then allocate (see
+/// [`fire_deferred_if_due`]).
+///
+/// # Safety
+/// `h` is the calling thread's live, initialised heap.
+#[cold]
+#[inline(never)]
+unsafe fn malloc_slow_deferred(h: *mut crate::heap::Heap, size: usize) -> *mut u8 {
+    // SAFETY: per contract; the hook runs before `&mut Heap` is formed.
+    unsafe {
+        fire_deferred_if_due(h);
+        (*h).malloc_generic(size).0
+    }
+}
+
+/// Fire the deferred-free hook if the generic path's heartbeat marked it due
+/// ([`crate::heap::Heap::deferred_due`]). Called at every allocation entry
+/// BEFORE it forms `&mut Heap`, which is the point: run inside the heartbeat,
+/// a hook that allocates re-entered the heap while `malloc_generic`'s
+/// `&mut self` was protected — undefined behaviour under Stacked Borrows
+/// (Miri, `oh_f01_deferred_free_hook_that_mallocs_is_contained`, red on main
+/// since 2.2.3). Upstream calls the hook at the start of the generic path,
+/// with no aliasing rules to break; here it runs at the start of the NEXT
+/// allocation entry, which the hook's contract ("called occasionally, with a
+/// heartbeat") allows.
+///
+/// # Safety
+/// `h` is a live heap owned by the calling thread, and no reference to it is
+/// live.
+#[inline(always)]
+unsafe fn fire_deferred_if_due(h: *mut crate::heap::Heap) {
+    // SAFETY: a raw field read and write on the caller's own heap; no
+    // reference to the heap is formed, so the hook may re-enter it.
+    unsafe {
+        if (*h).deferred_due {
+            (*h).deferred_due = false;
+            fire_deferred_now();
+        }
+    }
+}
+
+/// The hook call itself, out of line and cold: it is an indirect call that is
+/// almost never reached, and inlined it would cost every entry's register
+/// allocation.
+#[cold]
+#[inline(never)]
+fn fire_deferred_now() {
+    crate::options::deferred_free(false);
 }
 
 /// A fresh thread's very first allocation: create the heap, then allocate.
@@ -437,7 +500,11 @@ unsafe fn zalloc_slow(hb: *mut init::HeapBox, size: usize) -> *mut u8 {
         return zalloc_first(size);
     }
     // SAFETY: a non-sentinel box is this thread's live, initialised box.
-    unsafe { (*(*hb).heap.get()).zalloc(size) }
+    unsafe {
+        let h = (*hb).heap.get();
+        fire_deferred_if_due(h);
+        (*h).zalloc(size)
+    }
 }
 
 /// A fresh thread's first zeroing allocation: create the heap, then allocate.
@@ -654,7 +721,10 @@ fn malloc_aligned_first(size: usize, align: usize, offset: usize) -> *mut u8 {
         return ptr::null_mut(); // heap creation failed: OOM ⇒ null
     }
     // SAFETY: own heap.
-    unsafe { (*h).malloc_aligned_at(size, align, offset).0 }
+    unsafe {
+        fire_deferred_if_due(h);
+        (*h).malloc_aligned_at(size, align, offset).0
+    }
 }
 
 /// `mi_zalloc_aligned`.
@@ -679,7 +749,9 @@ pub fn zalloc_aligned_at(size: usize, align: usize, offset: usize) -> *mut u8 {
     // SAFETY: a non-sentinel box is this thread's live, initialised box;
     // zero_block contract (zeroes [p, p+usable)).
     unsafe {
-        let (p, is_zero) = (*(*hb).heap.get()).malloc_aligned_at(size, align, offset);
+        let h = (*hb).heap.get();
+        fire_deferred_if_due(h);
+        let (p, is_zero) = (*h).malloc_aligned_at(size, align, offset);
         if !p.is_null() {
             zero_block(p, is_zero);
         }
@@ -697,6 +769,7 @@ fn zalloc_aligned_first(size: usize, align: usize, offset: usize) -> *mut u8 {
     }
     // SAFETY: own heap; zero_block contract.
     unsafe {
+        fire_deferred_if_due(h);
         let (p, is_zero) = (*h).malloc_aligned_at(size, align, offset);
         if !p.is_null() {
             zero_block(p, is_zero);
@@ -1570,7 +1643,11 @@ unsafe fn heap_of(hb: *mut init::HeapBox) -> *mut Heap {
 /// `hb` live and owned by the calling thread.
 pub unsafe fn heap_malloc(hb: *mut init::HeapBox, size: usize) -> *mut u8 {
     // SAFETY: forwarded contract.
-    unsafe { (*heap_of(hb)).malloc(size).0 }
+    unsafe {
+        let h = heap_of(hb);
+        fire_deferred_if_due(h);
+        (*h).malloc(size).0
+    }
 }
 
 /// `mi_heap_zalloc`.
@@ -1580,7 +1657,9 @@ pub unsafe fn heap_malloc(hb: *mut init::HeapBox, size: usize) -> *mut u8 {
 pub unsafe fn heap_zalloc(hb: *mut init::HeapBox, size: usize) -> *mut u8 {
     // SAFETY: forwarded contract.
     unsafe {
-        let (p, is_zero) = (*heap_of(hb)).malloc(size);
+        let h = heap_of(hb);
+        fire_deferred_if_due(h);
+        let (p, is_zero) = (*h).malloc(size);
         if !p.is_null() {
             zero_block(p, is_zero);
         }
@@ -1599,7 +1678,11 @@ pub unsafe fn heap_malloc_aligned_at(
     offset: usize,
 ) -> *mut u8 {
     // SAFETY: forwarded contract.
-    unsafe { (*heap_of(hb)).malloc_aligned_at(size, align, offset).0 }
+    unsafe {
+        let h = heap_of(hb);
+        fire_deferred_if_due(h);
+        (*h).malloc_aligned_at(size, align, offset).0
+    }
 }
 
 /// `mi_heap_zalloc_aligned_at`.
@@ -1614,7 +1697,9 @@ pub unsafe fn heap_zalloc_aligned_at(
 ) -> *mut u8 {
     // SAFETY: forwarded contract.
     unsafe {
-        let (p, is_zero) = (*heap_of(hb)).malloc_aligned_at(size, align, offset);
+        let h = heap_of(hb);
+        fire_deferred_if_due(h);
+        let (p, is_zero) = (*h).malloc_aligned_at(size, align, offset);
         if !p.is_null() {
             zero_block(p, is_zero);
         }
