@@ -17,6 +17,23 @@ bash tools/corpus/run.sh --test   # + each consumer's test suite
 Consumers are registered in `corpus.toml`. Add one the moment it takes a
 dependency on this crate.
 
+A consumer with `build = "release"` is BUILT in its own release profile
+instead, in both modes. `check` never runs codegen and `test` never uses LTO,
+and some defects exist only in optimised codegen. 2.2.1–2.2.4 failed LLVM's
+verifier in rusty_sloth, an unwinding MSVC consumer with thin LTO
+(`docs/plans/msvc-funclet-asm-goto.md`). That row is slow: an LTO build of an
+ML stack, twice. A candidate failing LLVM's verifier ("Broken module found")
+is blamed on us even though the error names no crate, because the baseline
+built and only the allocator differs between the two builds.
+
+`identity = "registry"` keeps the candidate's rusty_alloc a crates.io
+package, vendored with only its `src/` swapped for this tree's
+(`registry_swap`), instead of rewriting it to a path. Use it when a defect
+depends on codegen: a path dependency has a different package id, so
+different symbol hashes and different LLVM inlining. The funclet defect
+fails rusty_sloth from crates.io and builds clean as a path dependency of the
+very same source.
+
 ## What it does
 
 Two arms per consumer. **BASELINE** is the consumer as it sits on disk, with its

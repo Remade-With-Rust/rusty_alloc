@@ -59,3 +59,27 @@ features = ""
 # packages — the tree crates.io receives. Registered separately because it is
 # what ships, and it carries its own workspace root (no synth needed).
 note = "generated mirror of packages/spacedb; rusty_alloc-api =1.1.6, default-on"
+
+[[consumer]]
+name = "rusty_sloth"
+path = "F:/coding/rusty_sloth"
+pkg = "rusty_sloth-cli"
+# `cuda` is the shipped shape, and the one the defect was reproduced in. Needs
+# the CUDA toolkit; a machine without it reports BASELINE ALREADY RED, not a
+# pass.
+features = "cuda"
+build = "release"
+# AND with rusty_alloc kept a crates.io package (vendored, source swapped).
+# Repointed to a path, unfixed 2.2.4 built GREEN here, with and without cuda,
+# while the same source from crates.io failed: the package id changes the
+# symbol hashes, and with them LLVM's inlining (checked 2026-10-07).
+identity = "registry"
+# The shape no other consumer has: it UNWINDS (default panic strategy) and
+# ships thin LTO with one codegen unit, so the allocator's inlined free lands
+# in EH cleanup funclets on MSVC. 2.2.1-2.2.4 failed LLVM's verifier there
+# ("Bogus funclet pad use"); docs/plans/msvc-funclet-asm-goto.md. Also the
+# consumer that exercised 2.2.4's stranded-span fix: it quantises on worker
+# threads that exit and frees on main. Built with `cargo build --release`,
+# not `check`: the defect exists only in optimised codegen. Slow (an LTO build
+# of an ML stack, twice), and wants ~10 GB free in TMPDIR.
+note = "via crates/rusty_sloth-alloc; --features cuda; unwinding + thin LTO + cgu=1; release BUILD"

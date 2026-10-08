@@ -1,6 +1,6 @@
 # 2.2.1–2.2.4 do not build in an unwinding MSVC consumer with LTO
 
-**Status:** fix written and verified in a consumer; **not merged, not released**. To do: §6.
+**Status:** fixed differently from §3, on branch `fix/msvc-funclet-asm-goto`, for 2.2.5. See §8.
 **Date:** 2026-10-07 · **Affects:** rusty_alloc-api 2.2.1, 2.2.2, 2.2.3, 2.2.4 ·
 **Platform:** `x86_64-pc-windows-msvc`, consumer built with `panic = "unwind"` (the default),
 `lto = "thin"`, `codegen-units = 1` ·
@@ -29,6 +29,39 @@ error: could not compile `rusty_sloth-cli` (bin "sloth")
 
 The consumer's release profile is `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`, and the
 default `panic = "unwind"`. 2.2.0 builds in the same profile.
+
+### Reproduce (re-run 2026-10-07 from a clean rusty_sloth `main`, no patch)
+
+The consumer's `Cargo.lock` pins **2.2.0**. Cargo keeps a locked version until it is told to
+move. Without step 2 the build compiles 2.2.0 from crates.io and tests nothing; a `[patch]`
+entry is likewise left unused (cargo only warns "Patch … was not used in the crate graph").
+
+```sh
+cd rusty_sloth                                    # F:/coding/rusty_sloth
+cargo add rusty_alloc-api@2.2.4 -p rusty_sloth-alloc
+cargo update -p rusty_alloc-api -p rusty_alloc    # REQUIRED: moves the lock off 2.2.0
+cargo tree -i rusty_alloc-api -e normal           # must print "rusty_alloc-api v2.2.4"
+cargo build --release -p rusty_sloth-cli --features cuda
+```
+
+**Expected:** `Compiling rusty_alloc v2.2.4`, then four "Bogus funclet pad use" and `rustc-LLVM
+ERROR: Broken module found`. Reproduced with the published 2.2.4 (`source =
+"registry+…crates.io-index"` in the lock). The LTO link of the `sloth` binary is where it fails;
+building only the library crates passes.
+
+**To test a rusty_alloc tree instead** (the fix, or `main`), put the two entries in rusty_sloth's
+**existing** `[patch.crates-io]` table. It already holds `serde_json` and `tokenizers`, and a
+second `[patch.crates-io]` header is a duplicate-key error:
+
+```toml
+rusty_alloc = { path = "<tree>/crates/rusty_alloc" }
+rusty_alloc-api = { path = "<tree>/crates/rusty_alloc_api" }
+```
+
+Then the same `cargo add` (the requirement must admit the tree's version), `cargo update -p
+rusty_alloc-api -p rusty_alloc`, and check that the lock's two entries have **no `source =`
+line** (a path dependency) before building. Restore rusty_sloth afterwards (`git checkout
+Cargo.toml Cargo.lock crates/rusty_sloth-alloc/Cargo.toml`).
 
 ## 2. Mechanism
 
@@ -165,3 +198,59 @@ workspace (`tests/msvc-unwind-consumer/`, with `path` dependencies) built with
 - Would an LLVM / rustc issue be worth filing? A `callbr` inlined into a funclet should either be
   handled or refused at inline time, not left for the verifier. A minimal reproducer is an
   `asm!` goto in an `#[inline(always)]` function called from a `Drop` on MSVC with LTO.
+
+## 8. Resolution (2026-10-07, rusty_alloc session)
+
+**The fix is in `free_inline`, not in `dealloc`.** `7037d8d` outlined only
+`GlobalAlloc::dealloc`, so the other callers were still exposed:
+`rusty_alloc_api::Heap::dealloc` calls `rusty_alloc::alloc::free`, whose body
+is `free_inline`, and LTO is free to inline it into a consumer's drop. Instead,
+the asm goto's cfg in `free_inline` now excludes
+`all(target_env = "msvc", panic = "unwind")`. Those builds take the
+plain-Rust decrement that aarch64 and Miri already use. MSVC builds with
+`panic = "abort"`, which have no funclets, keep the asm. `7037d8d` is not
+merged; its branch is left in place.
+
+**Cost** (§6 step 3). Callgrind cannot run an MSVC build, so the same code was
+forced on Linux and counted there: +3 Ir per local free, exactly opps #6's
+figure. Opscan small 52.26 -> 55.26, big 94 -> 97, mixed 94.26 -> 97.26. On the
+Rust `GlobalAlloc` workloads it cost maps +0.30 %, threads +0.40 %,
+overaligned +0.62 % and trees +3.56 % (free-heavy), with identical checksums.
+Outlining would have cost about +2 (call and return) and covered one caller.
+
+**Regression gate** (§5). The defect depends on LLVM's inlining choices,
+and those depend on more than the code.
+
+- **No small consumer reproduced it.** Four shapes, thin and fat LTO, all
+  built clean on the unfixed code: a `Vec` owned across a panicking call, a
+  `Heap::dealloc` in a `Drop`, a direct `GlobalAlloc::dealloc` in a `Drop`, an
+  unwind-only guard with an `#[inline(always)]` drop. The IR shows why: rustc
+  marks calls in cleanup blocks cold, so the inliner leaves the drop out of
+  line and the `callbr` stays on the normal path.
+- **rusty_sloth repointed to a PATH did not reproduce it either.** Unfixed
+  2.2.4 as a path dependency built green, with and without `--features cuda`.
+  The same source from crates.io failed. The source is byte-identical
+  (`diff -r` of the published crate against the tree). What differs is the
+  package id, which goes into every symbol hash and so into LLVM's inlining
+  order.
+- **What does reproduce it: crates.io identity, source swapped.**
+  `cargo vendor` plus source replacement keeps rusty_alloc a crates.io
+  package, so only its `src/` changes. rusty_sloth `--release --features cuda`:
+
+  | allocator source | result |
+  |---|---|
+  | 2.2.4 as published | **fails**, 4 × "Bogus funclet pad use" |
+  | 2.2.4 + this fix | **builds**; `sloth --help` runs |
+
+  A vendored package is immutable to Cargo: swapping its source does NOT
+  rebuild it. `cargo clean -p rusty_alloc -p rusty_alloc-api` first, or the
+  "fixed" build reuses the broken rlib (it did once here: 4 errors, nothing
+  recompiled).
+- **Deterministic check.** In `rusty_alloc`'s own IR for
+  `x86_64-pc-windows-msvc`, `callbr` count: unfixed 3 (unwind) / 3 (abort);
+  fixed **0** (unwind) / 3 (abort). With no `callbr` there is nothing for any
+  inlining order to misplace.
+
+The gate is the corpus row for rusty_sloth: `build = "release"` and
+`identity = "registry"` (`run.sh`'s `registry_swap`). It runs locally only,
+because CI has neither rusty_sloth nor CUDA.

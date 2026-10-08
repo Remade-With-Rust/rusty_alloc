@@ -108,6 +108,37 @@ patch_shim() {
 
 # Did the candidate actually build THIS tree? A registry `source` on any
 # rusty_alloc crate in its lock means no — and such a row used to PASS.
+# `identity = "registry"`: build the candidate with rusty_alloc STILL a
+# crates.io package and only its SOURCE swapped for this tree's. A path
+# dependency gets a different package id, so different symbol hashes, and LLVM
+# makes different inlining decisions. 2.2.4's MSVC funclet defect fails
+# rusty_sloth from crates.io and builds clean as a path dependency
+# (docs/plans/msvc-funclet-asm-goto.md section 8). Moves the lock to this tree's
+# version when crates.io has it, vendors every dependency, overwrites the two
+# vendored `src/` trees, and prints the cargo flags that select the vendor.
+registry_swap() {
+  local tree="$1" vend="$1.vendor" ver
+  ver="$(grep -m1 '^version' "$root/Cargo.toml" | cut -d'"' -f2)"
+  (cd "$tree" && cargo update -q -p rusty_alloc-api --precise "$ver") >/dev/null 2>&1 || true
+  rm -rf "$vend"
+  # The config `cargo vendor` prints covers git sources too, not just crates.io.
+  (cd "$tree" && cargo vendor --versioned-dirs "$vend") >"$vend.toml" 2>/dev/null || return 1
+  local n=0 d
+  for d in "$vend"/rusty_alloc-[0-9]* "$vend"/rusty_alloc-api-[0-9]*; do
+    [ -d "$d" ] || continue
+    case "$d" in *rusty_alloc-api-*) src="$root/crates/rusty_alloc_api/src" ;; *) src="$root/crates/rusty_alloc/src" ;; esac
+    rm -rf "$d/src" && cp -r "$src" "$d/src" || return 1
+    python3 - "$d/.cargo-checksum.json" <<'PY2' || return 1
+import json, sys
+p = sys.argv[1]; j = json.load(open(p)); j['files'] = {}; json.dump(j, open(p, 'w'))
+PY2
+    n=$((n + 1))
+  done
+  [ "$n" -ge 1 ] || return 1
+  grep -q 'replace-with' "$vend.toml" || return 1
+  echo "--offline --config $vend.toml"
+}
+
 resolved_from_registry() {
   local lock="$1/Cargo.lock"
   [ -f "$lock" ] || return 1
@@ -155,7 +186,7 @@ PY
 }
 
 run_one() {
-  local name="$1" path="$2" feats="$3" pkg="$4" synth="$5" note="$6"
+  local name="$1" path="$2" feats="$3" pkg="$4" synth="$5" note="$6" build="${7:-}" ident="${8:-}"
   if [ ! -d "$path" ]; then
     echo "  SKIP  $name -- $path not on this machine"
     ROWS+=("SKIP|$name|not on this machine")
@@ -169,6 +200,13 @@ run_one() {
   # bins and `rusty_alloc_default` both claim it), which is this harness picking
   # the wrong target rather than anything being wrong downstream.
   [ -n "${pkg:-}" ] && fargs+=(-p "$pkg")
+  # `build = "release"`: this consumer is built, not checked or tested, in ITS
+  # OWN release profile. Some defects exist only in optimised codegen: 2.2.1-
+  # 2.2.4 failed LLVM's verifier in an unwinding MSVC build with LTO (an asm
+  # goto inlined into an EH funclet), which `check` never codegens and `test`
+  # (no LTO) never inlines (docs/plans/msvc-funclet-asm-goto.md).
+  local cmd=("$mode")
+  [ "$build" = "release" ] && cmd=(build --release)
 
   echo "== $name"
   echo "   $note"
@@ -189,19 +227,30 @@ run_one() {
     synth_workspace "$base_dir"
   fi
   local base_out base_rc
-  base_out="$(cd "$base_dir" && cargo "$mode" --quiet "${fargs[@]}" 2>&1)"
+  base_out="$(cd "$base_dir" && cargo "${cmd[@]}" --quiet "${fargs[@]}" 2>&1)"
   base_rc=$?
 
   # CANDIDATE: a copy, repointed at this tree.
   copy_tree "$dst"
   [ "${synth:-}" = "yes" ] && synth_workspace "$dst"
-  repoint "$dst"
-  patch_shim "$dst"
-  local cand_out cand_rc
-  cand_out="$(cd "$dst" && cargo "$mode" --quiet "${fargs[@]}" 2>&1)"
+  local cand_out cand_rc vargs=()
+  if [ "$ident" = "registry" ]; then
+    local va
+    if ! va="$(registry_swap "$dst")"; then
+      echo "  NOT-SWAPPED  could not vendor or swap the crates.io source -- this row tests nothing"
+      ROWS+=("NOT-SWAPPED|$name|registry_swap failed")
+      fail=$((fail + 1))
+      return
+    fi
+    eval "vargs=($va)"
+  else
+    repoint "$dst"
+    patch_shim "$dst"
+  fi
+  cand_out="$(cd "$dst" && cargo "${cmd[@]}" --quiet "${fargs[@]}" "${vargs[@]}" 2>&1)"
   cand_rc=$?
 
-  if resolved_from_registry "$dst"; then
+  if [ "$ident" != "registry" ] && resolved_from_registry "$dst"; then
     echo "  NOT-REPOINTED  the candidate resolved rusty_alloc from crates.io -- this row tests nothing"
     ROWS+=("NOT-REPOINTED|$name|candidate still built the crates.io allocator")
     fail=$((fail + 1))
@@ -226,7 +275,10 @@ run_one() {
     echo "  PASS  both arms green"
     ROWS+=("PASS|$name|both arms green")
     pass=$((pass + 1))
-  elif ! grep -qiE "rusty[_-]alloc" <<<"$cand_out"; then
+  # An LLVM verifier failure names no crate ("Bogus funclet pad use ...
+  # Broken module found"), yet the baseline built: with only the allocator
+  # changed between the arms, it is ours.
+  elif ! grep -qiE "rusty[_-]alloc|Broken module found" <<<"$cand_out"; then
     # The candidate is red but nothing in the error mentions us. A consumer can
     # be broken for its own reasons -- a missing dependency, a resolver shift
     # from the rewritten manifest -- and blaming the upgrade for it would make
@@ -236,10 +288,10 @@ run_one() {
     ROWS+=("UNRELATED|$name|$(echo "$cand_out" | grep -E '^error' | head -1 | cut -c1-70)")
     skip=$((skip + 1))
   else
-    echo "  FAIL  2.0.0 BREAKS THIS CONSUMER"
-    echo "$cand_out" | grep -E "^error" | head -3 | sed 's/^/        /'
+    echo "  FAIL  THIS TREE BREAKS THIS CONSUMER"
+    echo "$cand_out" | grep -E "^error|Bogus|Broken module" | head -3 | sed 's/^/        /'
     local first
-    first="$(echo "$cand_out" | grep -E "^error" | head -1 | cut -c1-110)"
+    first="$(echo "$cand_out" | grep -E "Bogus|Broken module|^error" | head -1 | cut -c1-110)"
     ROWS+=("FAIL|$name|$first")
     fail=$((fail + 1))
   fi
@@ -252,15 +304,15 @@ import re, sys
 s = open(sys.argv[1], encoding='utf-8').read()
 for blk in s.split('[[consumer]]')[1:]:
     g = lambda k: (re.search(rf'^{k}\s*=\s*"(.*)"', blk, re.M) or [None, ''])[1]
-    print('|'.join([g('name'), g('path'), g('features'), g('pkg'), g('synth'), g('note')]))
+    print('|'.join([g('name'), g('path'), g('features'), g('pkg'), g('synth'), g('note'), g('build'), g('identity')]))
 PY
 mkdir -p "$work"
 # `|`, not tab: tab is IFS WHITESPACE, so bash collapses runs of it and an empty
 # `features` field silently shifts every column after it. That fed each
 # consumer's NOTE to `--features` and turned all five baselines red -- the
 # harness reporting on itself, again.
-while IFS='|' read -r n p f pk sy note; do
-  [ -n "$n" ] && run_one "$n" "$p" "$f" "$pk" "$sy" "$note"
+while IFS='|' read -r n p f pk sy note bld idn; do
+  [ -n "$n" ] && run_one "$n" "$p" "$f" "$pk" "$sy" "$note" "$bld" "$idn"
 done < "$work.list"
 
 echo
