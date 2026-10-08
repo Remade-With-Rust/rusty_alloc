@@ -42,10 +42,14 @@ fn span_lifecycle_and_realloc() {
     // SAFETY: live block freed once.
     unsafe { free(p) };
     let s2 = stats();
+    // Not retired: with purging off (the default) the heap keeps one freed
+    // large span carved for the next allocation of the same slice count
+    // (`Heap::large_cache`); a collect retires it. The reuse below is what
+    // this section is about either way.
     assert_eq!(
         s2.pages_retired - s1.pages_retired,
-        1,
-        "large span not retired"
+        0,
+        "freed large span was retired instead of cached"
     );
     // "Similar size": slightly smaller than `l`, so it must reuse the span
     // just retired rather than take a fresh segment.

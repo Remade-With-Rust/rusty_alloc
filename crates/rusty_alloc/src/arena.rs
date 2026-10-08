@@ -435,12 +435,55 @@ fn chunk_alloc_n_inner(restrict_id: i32, n: usize) -> Option<(*mut u8, bool)> {
                 }
                 let mut run = 0usize;
                 let mut idx = 0usize;
+                // The bitmap word under the cursor, loaded once per word, not
+                // once per bit: the scan was an atomic load per chunk, ~166 Ir
+                // per huge allocation (`docs/opps.md` vein census). A cached
+                // word only steers the scan; every claim below is verified
+                // against the live word, so a stale copy cannot double-assign.
+                let mut cur_w = usize::MAX;
+                let mut used_w: BitWord = 0;
                 while idx < chunks {
-                    let bit = (*a).used[idx / WORD_BITS].load(Ordering::Acquire)
-                        & (1 << (idx % WORD_BITS));
+                    let w = idx / WORD_BITS;
+                    if w != cur_w {
+                        cur_w = w;
+                        used_w = (*a).used[w].load(Ordering::Acquire);
+                        if used_w == BitWord::MAX {
+                            // Nothing free in this word: the run ends here.
+                            run = 0;
+                            idx = (w + 1) * WORD_BITS;
+                            continue;
+                        }
+                    }
+                    let bit = used_w & (1 << (idx % WORD_BITS));
                     run = if bit == 0 { run + 1 } else { 0 };
                     if run == n {
                         let start = idx + 1 - n;
+                        // A run inside ONE word is claimed with one `fetch_or`
+                        // of its mask (and its dirty bits with another), not
+                        // one locked RMW per chunk for each. Same contract as
+                        // the per-chunk path below: on conflict, roll back
+                        // exactly the bits this claim set and rescan past the
+                        // lowest conflicting chunk.
+                        if start / WORD_BITS == w {
+                            let lo = start % WORD_BITS;
+                            let ones: BitWord = if n >= WORD_BITS {
+                                BitWord::MAX
+                            } else {
+                                ((1 as BitWord) << n) - 1
+                            };
+                            let mask = ones << lo;
+                            let prev = (*a).used[w].fetch_or(mask, Ordering::AcqRel);
+                            if prev & mask != 0 {
+                                (*a).used[w].fetch_and(!(mask & !prev), Ordering::AcqRel);
+                                run = 0;
+                                idx = w * WORD_BITS + (prev & mask).trailing_zeros() as usize + 1;
+                                cur_w = usize::MAX; // reload the live word
+                                continue;
+                            }
+                            let dirty_prev = (*a).dirty[w].fetch_or(mask, Ordering::AcqRel);
+                            let p = (*a).base.add(start * SEGMENT_SIZE);
+                            return Some((p, dirty_prev & mask == 0));
+                        }
                         // CLAIM-AND-VERIFY. MULTI_LOCK excludes other
                         // multi-chunk claims but NOT the lock-free
                         // single-chunk path, which can take one of these
@@ -465,6 +508,7 @@ fn chunk_alloc_n_inner(restrict_id: i32, n: usize) -> Option<(*mut u8, bool)> {
                             }
                             run = 0;
                             idx = c + 1;
+                            cur_w = usize::MAX; // reload the live word
                             continue;
                         }
                         let mut any_dirty = false;
@@ -487,74 +531,16 @@ fn chunk_alloc_n_inner(restrict_id: i32, n: usize) -> Option<(*mut u8, bool)> {
     result
 }
 
-/// Free `n` contiguous chunks. True when the address belonged to an arena.
+/// The live arena whose chunks contain `addr`, with `addr`'s byte offset into
+/// it and its live chunk count. The one copy of the table scan that
+/// [`chunk_free_n`], [`chunk_free`] and [`owns`] each used to carry.
 #[allow(clippy::needless_range_loop)] // indexed scan over a fixed atomic table
-pub fn chunk_free_n(p: *mut u8, n: usize) -> bool {
+fn find_arena(addr: usize) -> Option<(*mut Arena, usize, usize)> {
     if crate::FIXED_REGION {
-        return false; // nothing came from an arena, so nothing returns to one
+        return None; // nothing came from an arena, so nothing returns to one
     }
-    // Zero / overflowing `n` is false, not `start..start+n` OOB on the bitmap
-    // (OH-rusty_alloc-25).
-    if n == 0 {
-        return false;
-    }
-    let addr = p.addr();
     let count = ARENA_COUNT.load(Ordering::Acquire).min(MAX_ARENAS);
     for id in 0..count {
-        let a = ARENAS[id].load(Ordering::Acquire);
-        if a.is_null() {
-            continue;
-        }
-        // SAFETY: live descriptor; indices clamped to live chunks.
-        unsafe {
-            let chunks = (*a).chunks_live.load(Ordering::Acquire);
-            let Some(span) = chunks.checked_mul(SEGMENT_SIZE) else {
-                continue;
-            };
-            let Some(end_addr) = (*a).base.addr().checked_add(span) else {
-                continue;
-            };
-            if addr < (*a).base.addr() || addr >= end_addr {
-                continue;
-            }
-            let off = addr - (*a).base.addr();
-            // Interior pointers are false, not a successful free of the
-            // containing chunk (OH-rusty_alloc-27).
-            if !off.is_multiple_of(SEGMENT_SIZE) {
-                return false;
-            }
-            let start = off / SEGMENT_SIZE;
-            let Some(end) = start.checked_add(n) else {
-                return false;
-            };
-            if end > chunks {
-                return false;
-            }
-            for j in start..end {
-                (*a).used[j / WORD_BITS].fetch_and(!(1 << (j % WORD_BITS)), Ordering::AcqRel);
-            }
-            return true;
-        }
-    }
-    false
-}
-
-/// Whether `p` lies inside any arena's live chunks — the question
-/// [`chunk_free`] answers as a side effect, asked without freeing anything.
-///
-/// A segment whose memory cannot be made usable again must not be returned
-/// to its arena (arena memory is committed once, at reservation, and handed
-/// out as-is), and a chunk inside an arena's reservation cannot be released
-/// to the OS on its own either. Such a segment is retired in place, and this
-/// is how the release path tells the two cases apart.
-#[allow(clippy::needless_range_loop)] // indexed scan over a fixed atomic table
-pub fn owns(p: *const u8) -> bool {
-    if crate::FIXED_REGION {
-        return false;
-    }
-    let addr = p.addr();
-    let n = ARENA_COUNT.load(Ordering::Acquire).min(MAX_ARENAS);
-    for id in 0..n {
         let a = ARENAS[id].load(Ordering::Acquire);
         if a.is_null() {
             continue;
@@ -569,49 +555,59 @@ pub fn owns(p: *const u8) -> bool {
                 continue;
             };
             if addr >= (*a).base.addr() && addr < end_addr {
-                return true;
+                return Some((a, addr - (*a).base.addr(), chunks));
             }
         }
     }
-    false
+    None
+}
+
+/// Free `n` contiguous chunks. True when the address belonged to an arena.
+pub fn chunk_free_n(p: *mut u8, n: usize) -> bool {
+    // Zero / overflowing `n` is false, not `start..start+n` OOB on the bitmap
+    // (OH-rusty_alloc-25).
+    if n == 0 {
+        return false;
+    }
+    let Some((a, off, chunks)) = find_arena(p.addr()) else {
+        return false;
+    };
+    // Interior pointers are false, not a successful free of the containing
+    // chunk (OH-rusty_alloc-27).
+    if !off.is_multiple_of(SEGMENT_SIZE) {
+        return false;
+    }
+    let start = off / SEGMENT_SIZE;
+    let Some(end) = start.checked_add(n) else {
+        return false;
+    };
+    if end > chunks {
+        return false;
+    }
+    // SAFETY: live descriptor; `start..end` lies inside its live chunks.
+    unsafe {
+        for j in start..end {
+            (*a).used[j / WORD_BITS].fetch_and(!(1 << (j % WORD_BITS)), Ordering::AcqRel);
+        }
+    }
+    true
+}
+
+/// Whether `p` lies inside any arena's live chunks — the question
+/// [`chunk_free`] answers as a side effect, asked without freeing anything.
+///
+/// A segment whose memory cannot be made usable again must not be returned
+/// to its arena (arena memory is committed once, at reservation, and handed
+/// out as-is), and a chunk inside an arena's reservation cannot be released
+/// to the OS on its own either. Such a segment is retired in place, and this
+/// is how the release path tells the two cases apart.
+pub fn owns(p: *const u8) -> bool {
+    find_arena(p.addr()).is_some()
 }
 
 /// Return a chunk to its arena. True when the address belonged to one.
-#[allow(clippy::needless_range_loop)] // indexed scan over a fixed atomic table
 pub fn chunk_free(p: *mut u8) -> bool {
-    if crate::FIXED_REGION {
-        return false;
-    }
-    let addr = p.addr();
-    let n = ARENA_COUNT.load(Ordering::Acquire).min(MAX_ARENAS);
-    for id in 0..n {
-        let a = ARENAS[id].load(Ordering::Acquire);
-        if a.is_null() {
-            continue;
-        }
-        // SAFETY: live descriptor; bit index bounded by the range check.
-        unsafe {
-            let chunks = (*a).chunks_live.load(Ordering::Acquire);
-            let Some(span) = chunks.checked_mul(SEGMENT_SIZE) else {
-                continue;
-            };
-            let Some(end_addr) = (*a).base.addr().checked_add(span) else {
-                continue;
-            };
-            if addr >= (*a).base.addr() && addr < end_addr {
-                let off = addr - (*a).base.addr();
-                // Interior pointers are false, not a successful free of the
-                // containing chunk (OH-rusty_alloc-27).
-                if !off.is_multiple_of(SEGMENT_SIZE) {
-                    return false;
-                }
-                let idx = off / SEGMENT_SIZE;
-                (*a).used[idx / WORD_BITS].fetch_and(!(1 << (idx % WORD_BITS)), Ordering::AcqRel);
-                return true;
-            }
-        }
-    }
-    false
+    chunk_free_n(p, 1)
 }
 
 /// Adopt an OS block that cannot be returned to the host, making its memory

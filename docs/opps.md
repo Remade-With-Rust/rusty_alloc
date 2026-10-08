@@ -352,6 +352,172 @@ arena could hand a 64 MiB pair's touched half out first. Backlog: needs the
 `retain` probe from the consumer's harness as its instrument, and a working
 set number, not an instruction count, as its verdict.
 
+## Vein census, 2026-10-07 (where the next ten deterministic wins are)
+
+**Why a new census.** `bench/opscan.sh` (16 ops, two-point callgrind) now has
+rusty_alloc AHEAD of mimalloc on every op it covers: small 52.25, med 56.50,
+big 92.00, opscan "huge" (2 MiB) 293.00, calloc 93.19, batch 53.20, realloc
+231.20, aligned 83.69, xthread 77.08 Ir/op. Four curiosity rounds mined those
+paths; the oracle is no longer a target source there. The veins are on paths
+opscan does not drive. A side probe (`F:/ra-corpus-tmp/veins/veins.c` +
+`scan.sh`, same two-point method, pointers escaped through a `volatile` sink
+because GCC elides an unused malloc/free pair, which first read a flat 30 Ir
+for every allocator) measured them:
+
+| op | rusty_alloc | mimalloc 2.4.5 | glibc |
+|---|---:|---:|---:|
+| 64 MiB malloc + free (true huge) | **53,538** | 53,608 | 384 |
+| thread life (spawn, 32 small allocs, exit) | **63,977** | 101,460 | 15,920 |
+| exited thread's 8 large blocks freed elsewhere, then reloaded | **76,050** | 172,867 | 11,773 |
+| calloc 1 MiB + free | 57,812 | 110,746 | 57,805 |
+
+Note: callgrind counts `rep stosb` once per BYTE, so memset-heavy rows overstate
+cycles; the BYTES are still real (and first-touch faults with them). Rank by
+bytes and calls, then confirm on whole-program Ir.
+
+**Ranked veins, biggest first:**
+
+1. **The 45 KB segment scrub.** `segment_alloc` and `huge_alloc` zero the whole
+   `Segment` (512 `Page` slots x 88 B) whenever the chunk is recycled
+   (`!mem_zero`), which after warm-up is always. It is 47 k of the 53.5 k Ir of a
+   huge pair (a huge segment uses ONE page slot) and 47 k of the ~48 k Ir a thread
+   life costs over glibc (each new thread's first segment is a recycled chunk).
+   The comment beside it already says carved slots are re-initialised by
+   `span_mark`. Lever: scrub the header fields and only the slots something reads
+   before a carve (huge: slots 0-1). Gate: `debug_validate_segment`, the spans and
+   adopt suites, miri. Ceiling: ~47 k Ir and 11 first-touched pages per segment.
+2. **Large spans are carved and retired on every alloc/free.** The 2 MiB pair is
+   293 Ir (big 64 KiB: 92), spread over `span_alloc` 54, `span_free` 52,
+   `malloc_generic_once` 49, `span_from_segments` 33, `free_local_at` 25; the
+   slice-marking loops scale with the span. Upstream keeps a retired page for
+   reuse; here "span reclamation IS the reuse mechanism". Lever: a one-entry
+   per-heap cache of the last retired large span, reused when the size class
+   matches. Ceiling: most of 293 -> ~100 on alloc/free-same-size loops (Vec
+   growth, tensor scratch, request buffers).
+3. **Huge path, excluding the scrub:** ~4.7 k Ir per pair in `huge_alloc`
+   (2.1 k), `huge_free` (1.8 k) and a `range.rs` iterator inside `huge_free`
+   (0.8 k): per-slice `segment_map` register/unregister loops that scale with the
+   block (64 MiB = 1,024 slices). Lever: register per chunk, not per slice.
+4. **Thread start/exit beyond the scrub:** `malloc_generic_walk` ~4.2 k Ir per
+   thread (first allocations walk empty bins), `collect_inner` ~2 k at exit,
+   `span_free` ~1.5 k, `__nptl_deallocate_tsd` 0.7 k. Thread pools (tokio's
+   blocking pool, rayon) pay this per spawn.
+5. **`realloc_live` self cost: 65 Ir/op** before the copy, more than a whole
+   small alloc/free pair; plus 17 from inlined page.rs and 10 from segment.rs.
+   Per-line census first (opps #2 shaped this path once already).
+6. **calloc wrapper:** 93.19 vs malloc's 52.25 per pair at 256 B; the memset is
+   26, leaving ~15 Ir of wrapper and `free_is_zero` bookkeeping. Opps #5
+   (`zero_block` re-resolving `usable_size`) is still OPEN and lives here.
+7. **Adoption rescan (guard for the 2026-10-07 fix).** `adopt_segment` now
+   restarts its slice walk after each dead large span it retires: O(spans^2)
+   per adoption. Cheap at 8 spans; measure a segment of 64+ dead spans before
+   shipping, and resume from the merged span instead of slice 0 if it shows.
+8. **Duplicate arena scans.** `huge_free` with purging on now calls
+   `arena::owns` and then `chunk_free_n`, two linear scans of the arena table;
+   `segment_free` likewise on its failure arm. Fold into one lookup returning the
+   arena id. Small, but it is per huge/segment free.
+9. **Real programs, re-profiled.** perl/sqlite/python/lua/jq whole-program Ir
+   (baselines in `memory/wsl-icount-rig.md` were set before 2.2.x); re-run the
+   exact by-object census (`objir.awk`) and rank functions, not ops. This is
+   where a vein that no synthetic op shapes shows up first.
+10. **Bytes, not instructions.** `tools/wasm-size.sh` and the firmware rig
+    measure code size deterministically; every fix above adds code, and the
+    small profile's flash budget is a currency too. Re-baseline, and look for
+    monomorphised duplicates in the per-arm `GlobalAlloc` paths.
+
+### Vein census results, 2026-10-07 (working tree, uncommitted)
+
+**Read this first: a memset-heavy row overstates cycles under callgrind.**
+glibc's memset uses `rep stosb` above 2 KB and callgrind counts it once per
+BYTE. Every number below marked *honest* was taken with
+`GLIBC_TUNABLES=glibc.cpu.x86_rep_stosb_threshold=0x7fffffff:glibc.cpu.x86_rep_movsb_threshold=0x7fffffff`,
+which makes memset/memcpy vector loops that callgrind counts like any other
+code. Quote the honest column. Also: GCC deletes an unused malloc/free pair at
+`-O2`; a probe must escape the pointer (a `volatile` sink) or every allocator
+reads the same flat count.
+
+| change | probe | before | after | delta |
+|---|---|---:|---:|---:|
+| **vein 1** scrub only the owner table + slots read before a carve; zero a slot at its first carve | 64 MiB malloc+free (honest) | 8,959 | 884 | **-90.1 %** (with vein 3) |
+| | thread life (honest) | 19,387 | 17,409 | **-10.2 %** |
+| | Rust `threads` workload, 20,000 steps (honest, checksum equal) | 3,191,866 | 2,713,575 | **-15.0 %** |
+| **vein 3** huge: no strided `slice_offset` writes to slots 2..511, owner table scrubbed once, `wait_no_remote_in_flight` scans slot 1 only | (inside the 64 MiB row) | 2,931 | 884 | |
+| **vein 2** per-heap one-entry large-span cache (`Heap::large_cache`), newest-first, <= 4 MiB, purging off only, flushed by every collect | 2 MiB malloc+free | 293.05 | 126.07 | **-57.0 %** |
+| | exited-thread reload, 8 x 2.5 MB (honest) | 30,738 | 30,946 | +0.7 % (cache bookkeeping) |
+| **retention fix** adoption retires every dead large span | 64 dead spans adopted (honest) | 136,899 | 139,729 | +2.1 % (the 63 spans 2.2.3 stranded) |
+
+Unchanged to the instruction on every opscan op (small 52.25, med, big 92.00,
+calloc 93.19, realloc 231.20, aligned 83.69, mixed 92.70, xthread 77.08).
+Real programs, allocator-only Ir: perl +203 of 24.6 M, sqlite +90 of 4.6 M
+(mimalloc's own perl count moved +172 between the same two runs: session
+pedestal, not the change). Rust `maps`/`trees`/`overaligned` flat. Code size:
++1,936 bytes `.text` on the Rust workloads (+0.6 %).
+
+**Refuted, recorded:** keeping the OLDEST freed span in the large cache cost
++882 Ir per op on the reload probe (later frees coalesced to its right and
+retiring it last re-marked the whole run); newest-first fixed it. Resuming the
+adoption walk at the merged span instead of slice 0 measured flat at 64 spans
+(kept to bound the worst case, not claimed). A first cache-test design proved
+nothing: first-fit returns the same address without the cache, so the test now
+reads `pages_retired`; the large double-free test needed `--nocapture` in its
+child, or libtest swallowed the line that proves which free aborted.
+
+**Still open from the census:** `realloc_live` frame (13 Ir/call of entry/exit),
+calloc wrapper (opps #5), the multi-chunk arena scan (bit-at-a-time, ~166 Ir
+per huge allocation), `segment_map` per-window RMWs, re-profiling real programs
+by function, code size.
+
+### Vein census round 2 + validation sweep, 2026-10-07
+
+| change | probe | before | after |
+|---|---|---:|---:|
+| multi-chunk arena claim: bitmap word loaded once per word, a one-word run claimed with one masked `fetch_or` (and its dirty bits with another) | 64 MiB malloc+free | 884 | **824 (-6.8 %)**, 6 -> 2 locked RMWs per 3-chunk claim |
+| `owns`/`chunk_free`/`chunk_free_n` share one scan (`find_arena`) | same | 824 | 824 (neutral; -3 B wasm gz) |
+| large cache: cache only a LONE large free (a bool `large_freed`), retire the cached span first on every large free | same-thread model swap, purge off | 1.04 models (the first cache) | **1.01** (= no cache) |
+| | 2 MiB pair | 293.05 (2.2.3) | 138.06 (-52.9 %) |
+| | exited-thread reload, honest | 31,472 (2.2.3) | 30,205 (-4.0 %) |
+| | thread life, honest | 19,387 (2.2.3) | 16,988 (-12.4 %) |
+
+Final build vs 2.2.3 on opscan: small/aligned/calloc/realloc/xthread
+identical, big 92 -> 91, mixed 92.70 -> 92.04. Real programs, allocator-only
+Ir: perl 24,633,532 -> 24,630,214, sqlite 4,582,668 -> 4,582,578. Endless Sky
+start-up: output identical, allocator Ir 57,121,237 -> 57,119,496.
+
+**Refuted, recorded (do not retry the wrong way):**
+- `segment_map::walk_windows` coalescing windows per bitmap word: +15 Ir on
+  the 64 MiB pair (tracking the pending word costs more than the two RMWs).
+- `chunk_free_n` clearing a one-word run with one masked `fetch_and`: +9 Ir
+  for a 3-chunk free.
+- Flushing the large cache on a size miss in `large_alloc`: did NOT fix the
+  model-swap spill, and inlined into `malloc_generic_once` it cost every
+  generic op +3 Ir (big 92 -> 95, mixed +2.2). Bisected with a per-function
+  diff; two earlier guesses (the shared `free_local_at` path, a new `u32`
+  field changing `Heap`'s layout) were wrong.
+- calloc (opps #5) and `realloc_live`: at their floor; #5's re-resolution is
+  already gone, and realloc's frame is the price of inlining malloc + memcpy +
+  free (its outlining was refuted +12 Ir in 2026-08).
+
+**Validation sweep (final code):** workspace `--all-features` 177/177 (Windows);
+`corpus/linux-gates.sh` 42 suites / 0 failures; embedded matrix 15/15
+(small profile, 256k segments, single-threaded, aligned region, both RISC-V
+bare-metal targets x both geometries, the no_std refusal); clippy per feature;
+wasm self-test + size (20,873 B gz, +361 B vs 2.2.3, inside the +3 % ratchet);
+gate self-test 11/11; semgrep clean; miri gate clean (the thread-exit test is
+`ignore`d under miri: the mock prim fires no TLS destructors); mimalloc-bench
+sweep 19/19; churn 5/5; `corpus/realworld.sh`: jq, sqlite, python, git, xz,
+zstd, lua, perl byte-identical output across ra/mi/sys (imagemagick is
+nondeterministic on every arm; redis is jemalloc-linked and fails under ANY
+preloaded allocator, 2.2.3 included); alloc-eval `check` on all 8 traces
+(~37.5 M ops) and the 28-thread battle replay with purging on and off.
+
+**Edge cases the sweep caught and fixed:** the large cache's same-thread
+model-swap spill (above); `adopt_large_spans`/`large_cache` hard-coded sizes
+that are HUGE blocks under `ra_small_profile`, so they failed (or passed
+vacuously) there, now geometry-derived and poison-checked at both geometries;
+a `let _ = retire_span(..)` missing its same-line terminal comment (semgrep
+`discarded-lifecycle-result`, CI-blocking); `corpus/linux-gates.sh`
+hard-coded `/mnt/c/...` and exited 1 before running anything.
+
 ## Banked
 
 ### 8. Collect-loop double `block_next` — LANDED 2026-08-20

@@ -149,6 +149,11 @@ impl Default for Heap {
     }
 }
 
+/// The largest span [`Heap::large_cache`] keeps: 4 MiB. Bigger spans are
+/// rarer, and a cached one is space no other size can use until it is
+/// flushed.
+pub const LARGE_CACHE_MAX_SLICES: usize = (4 << 20) / SEGMENT_SLICE_SIZE;
+
 /// The heap.
 pub struct Heap {
     /// Page queues, indexed by bin; `pages[BIN_FULL]` parks full pages.
@@ -168,6 +173,24 @@ pub struct Heap {
     /// Huge (dedicated-segment) allocations owned by this heap, so
     /// delete/destroy/abandon can account for them.
     pub huge_segments: *mut Segment,
+    /// One freed large span (single-block, unqueued) kept carved for the next
+    /// large allocation of the SAME slice count, or null. A large block is
+    /// otherwise carved fresh on every allocation and retired on every free:
+    /// a 2 MiB malloc/free pair cost 293 Ir, against 92 for the queued sizes
+    /// below it, and this cache takes it to ~124 (`docs/opps.md`, vein
+    /// census 2026-10-07, vein 2). Cached only with purging off, where a
+    /// freed span stays resident anyway, and only up to
+    /// [`LARGE_CACHE_MAX_SLICES`], so it cannot hold back much space other
+    /// sizes could have used; flushed by every collect, which includes the
+    /// heartbeat and thread teardown. A cached page has `used == 0`, which is
+    /// also what makes a second free of its block abort.
+    pub large_cache: *mut Page,
+    /// A large free has happened since the last large allocation: the cache
+    /// keeps only a LONE free, never one at the end of a teardown run. A
+    /// `bool`, not a counter: a `u32` here changed `Heap`'s layout and cost
+    /// every allocation path (big +4.00, mixed +2.89 Ir/op) though none of
+    /// them reads it; the flag packs into existing padding.
+    pub large_freed: bool,
     /// Arena restriction: allocate segments only from this arena (−1 = any
     /// arena, then the OS — `mi_heap_new_in_arena`).
     pub arena_id: i32,
@@ -238,6 +261,8 @@ impl Heap {
             empty_segments: 0,
             delayed: &raw const EMPTY_DELAYED,
             huge_segments: ptr::null_mut(),
+            large_cache: ptr::null_mut(),
+            large_freed: false,
             arena_id: -1,
             tag: 0,
             rng: crate::random::Random::new(),
@@ -1050,6 +1075,26 @@ impl Heap {
         let slices = size.div_ceil(SEGMENT_SLICE_SIZE);
         // SAFETY: heap lock held; page/segment owned by this heap.
         unsafe {
+            // Same-size reuse of the span the last large free kept. Its page
+            // is still fully built (bin, flags, `xheap`, `block_size`); only
+            // the liveness and the contents' zero-ness change.
+            self.large_freed = false;
+            let c = self.large_cache;
+            if !c.is_null() && (*c).slice_count as usize == slices {
+                self.large_cache = ptr::null_mut();
+                (*c).used = 1;
+                (*c).free_is_zero = false;
+                (*c).heap_tag = self.tag;
+                self.stat_alloc();
+                self.stats.large_allocs += 1;
+                return ((*c).area, false);
+            }
+            // REFUTED (2026-10-07): retiring the cached span here on a size
+            // miss, so it could coalesce before this allocation carved. It
+            // did not fix the model-swap spill (the free-run rule in
+            // `free_large_span` did), and the extra call, inlined into
+            // `malloc_generic_once`, cost every generic allocation +3 Ir (big
+            // 92 -> 95, mixed +2.2) though none of them is large.
             let Some((p, fresh)) = self.span_from_segments(slices) else {
                 return (ptr::null_mut(), false);
             };
@@ -1500,6 +1545,19 @@ impl Heap {
     /// # Safety
     /// Owner thread; `reclaim` only when this heap will REMAIN live.
     unsafe fn collect_inner(&mut self, _force: bool, reclaim: bool) {
+        // Hand the cached large span back first, so a collect leaves no span
+        // carved that holds no block (see `large_cache`).
+        let c = self.large_cache;
+        if !c.is_null() {
+            self.large_cache = ptr::null_mut();
+            // SAFETY: a cached page is an unqueued, blockless span start of
+            // one of this heap's Normal segments (the page slot lives in its
+            // header, so the mask finds the segment).
+            unsafe {
+                let seg = segment_of(c.cast::<u8>());
+                let _ = self.retire_span(seg, c); // `seg` unused after
+            }
+        }
         // SAFETY: owner thread per contract.
         unsafe {
             // `force` RECLAIMS ABANDONED SEGMENTS. It used to be ignored
@@ -1709,7 +1767,20 @@ impl Heap {
             }
             // Adopted large spans that are already dead: retire them now that
             // the walk is over (the layout is ours to mutate again).
+            //
+            // ALL of them, restarting the walk after each retire (it coalesces,
+            // so `idx` may now sit inside a merged free span). This loop used
+            // to retire ONE and `break` with "leave the rest to later
+            // collects" — but a large span is never queued, so no collect ever
+            // visits it again: every other dead span stayed carved for the
+            // life of the process. That is how a model loaded on one thread,
+            // which then exited, and dropped on another stranded ~0.6 of the
+            // model's size whatever `purge_delay` said
+            // (`docs/plans/huge-free-retention.md`, mechanism 1). Upstream
+            // collects every concurrent free of an abandoned segment
+            // (`mi_segment_check_free` in `mi_segment_try_reclaim`).
             let mut idx = segment::HEADER_SLICES;
+            let mut retired_any = false;
             while saw_large_span && idx < (*seg).next_free_slice as usize {
                 let slot: *mut Page = &raw mut (*seg).pages[idx];
                 let len = ((*slot).slice_count as usize).max(1);
@@ -1725,11 +1796,29 @@ impl Heap {
                     if !self.retire_span(seg, slot) {
                         return false; // RELEASED during adoption
                     }
-                    break; // layout changed: leave the rest to later collects
+                    retired_any = true;
+                    // The retire coalesced: `idx` may now be inside the merged
+                    // free span. Every slot of a span points back to its start
+                    // (`slice_offset`, the invariant `debug_validate_segment`
+                    // checks), so resume at that start and step over the merged
+                    // span. Restarting from slice 0 instead is quadratic in the
+                    // span count; measured flat at 64 spans (139,722 vs 139,729
+                    // Ir per op), so this bounds the worst case and is not a
+                    // win. The +2.1 % that adoption costs over 2.2.3 there is
+                    // retiring the other 63 dead spans, which 2.2.3 stranded.
+                    idx -= (*slot).slice_offset as usize;
+                    continue;
                 }
                 idx += len;
             }
-            if (*seg).used_pages == 0 {
+            // A segment that ARRIVED empty is accounted here. One emptied by
+            // the retires above was already accounted by `retire_span` (it
+            // parked it as this heap's empty segment, or released it and
+            // returned false); counting it again released the very segment
+            // just parked, leaving `empty_segments == 1` with no empty segment
+            // behind it, after which this heap released every empty segment
+            // instead of keeping one.
+            if !retired_any && (*seg).used_pages == 0 {
                 if self.empty_segments == 0 {
                     self.empty_segments = 1;
                 } else if self.remove_segment(seg) {
@@ -1878,7 +1967,13 @@ impl Heap {
                 SegmentKind::Normal => {
                     self.stat_free();
                     if (*pg).bin as usize == BIN_HUGE {
-                        let _ = self.retire_span(seg, pg); // returns below
+                        // Its own function for readability; `#[inline]`. It was
+                        // `#[inline(never)]` while a +3 Ir regression on every
+                        // generic op was blamed on this function: bisected, the
+                        // regression was a flush-on-miss in `large_alloc`, and
+                        // inlining this back measured 2 MiB pair 147 -> 138 with
+                        // every other op unchanged.
+                        self.free_large_span(seg, pg);
                         return;
                     }
                     let used_now = page_push_local(pg, p.cast());
@@ -1922,6 +2017,57 @@ impl Heap {
                     }
                 }
             }
+        }
+    }
+
+    /// Free the one block of a large (single-block, unqueued) span: the
+    /// double-free check, then the per-heap large cache (`large_cache`).
+    ///
+    /// # Safety
+    /// Heap lock held; `pg` is a large span start of `seg`, owned by this
+    /// heap, whose block is being freed.
+    #[inline]
+    unsafe fn free_large_span(&mut self, seg: *mut Segment, pg: *mut Page) {
+        // SAFETY: forwarded contract.
+        unsafe {
+            // One block per large span: `used` is 1 while it
+            // lives and 0 once freed (and possibly cached), so a
+            // second free of it is a double free.
+            if (*pg).used == 0 {
+                crate::page::double_free_abort();
+            }
+            // Retire whatever is cached FIRST, so spans retire in
+            // free order and coalesce exactly as without a cache.
+            // (Retiring the cached one last cost +882 Ir per op on
+            // the exited-thread reload probe: later frees had
+            // coalesced into a run to its right, and absorbing it
+            // re-marked every slice.) `pg` stays carved, so its
+            // segment cannot empty here; `old`'s may.
+            let old = core::mem::replace(&mut self.large_cache, ptr::null_mut());
+            if !old.is_null() {
+                let _ = self.retire_span(segment_of(old.cast::<u8>()), old); // terminal: `old` and its segment are not touched after
+            }
+            // Cache only a LONE free: the first since the last
+            // large allocation, which is the alloc/free loop the
+            // cache serves. A run of large frees is a teardown
+            // (dropping a model, a batch, a request's buffers),
+            // and a span cached at its end is refilled out of
+            // address order by the next load, which then spills
+            // into a fresh segment: a same-thread model swap
+            // peaked at 1.04 models instead of 1.01 until this
+            // (2026-10-07 validation sweep). Flushing on a size
+            // miss alone did not fix it.
+            let lone = !self.large_freed;
+            self.large_freed = true;
+            if lone
+                && (*pg).slice_count as usize <= LARGE_CACHE_MAX_SLICES
+                && crate::options::get(15) < 0
+            {
+                (*pg).used = 0;
+                self.large_cache = pg;
+                return;
+            }
+            let _ = self.retire_span(seg, pg); // terminal: `seg` is not touched after
         }
     }
 

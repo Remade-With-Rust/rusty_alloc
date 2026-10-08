@@ -196,3 +196,51 @@ fn first_class_heap_abandoned_double_free_aborts() {
         "the second free of a first-class abandoned block RETURNED"
     );
 }
+
+const LARGE_MARKER: &str = "RUSTY_ALLOC_LARGE_DOUBLE_FREE_CHILD";
+
+/// A LARGE block (a single-block span) freed twice. Its span is now kept
+/// carved for same-size reuse (`Heap::large_cache`), with `used == 0`; the
+/// second free must find that and abort, where it used to reach a scrubbed
+/// slot and abort by a different route.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn large_double_free_aborts() {
+    if std::env::var(LARGE_MARKER).is_ok() {
+        let n = 2 << 20;
+        let p = rusty_alloc::alloc::malloc(n);
+        assert!(!p.is_null(), "child: malloc failed");
+        // SAFETY: p is live and ours.
+        unsafe { rusty_alloc::alloc::free(p) };
+        // SAFETY: DELIBERATELY WRONG — the bug under test.
+        unsafe { rusty_alloc::alloc::free(p) };
+        eprintln!("child: second free of a large block RETURNED");
+        std::process::exit(97);
+    }
+    let exe = std::env::current_exe().expect("current_exe");
+    let out = Command::new(exe)
+        .env(LARGE_MARKER, "1")
+        // `--nocapture`: the child's own line must reach `out.stderr`, which
+        // libtest's capture would otherwise swallow when the child aborts.
+        .args(["--exact", "large_double_free_aborts", "--nocapture"])
+        .output()
+        .expect("spawn child");
+    assert!(
+        !out.status.success(),
+        "a large double free was accepted silently"
+    );
+    assert_ne!(
+        out.status.code(),
+        Some(97),
+        "the second free RETURNED: detection did not fire"
+    );
+    // The exit code alone is not enough: when the second free returns, a debug
+    // build still dies later (the teardown flush retires the span twice and
+    // trips `debug_validate_segment`), so the abort must be the second free's.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("second free of a large block RETURNED"),
+        "the second free RETURNED and something later aborted instead:
+{stderr}"
+    );
+}

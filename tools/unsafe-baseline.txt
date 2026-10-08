@@ -1,6 +1,6 @@
    106  crates/rusty_alloc/src/alloc.rs
-    16  crates/rusty_alloc/src/arena.rs
-    77  crates/rusty_alloc/src/heap.rs
+    15  crates/rusty_alloc/src/arena.rs
+    80  crates/rusty_alloc/src/heap.rs
     42  crates/rusty_alloc/src/init.rs
      2  crates/rusty_alloc/src/lib.rs
     17  crates/rusty_alloc/src/options.rs
@@ -13,7 +13,7 @@
      6  crates/rusty_alloc/src/prim/wasm.rs
     34  crates/rusty_alloc/src/prim/windows.rs
      2  crates/rusty_alloc/src/random.rs
-    43  crates/rusty_alloc/src/segment.rs
+    45  crates/rusty_alloc/src/segment.rs
      3  crates/rusty_alloc/src/stats.rs
     16  crates/rusty_alloc_api/src/lib.rs
     15  crates/rusty_alloc_bench/src/kernels.rs
