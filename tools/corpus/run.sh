@@ -108,6 +108,37 @@ patch_shim() {
 
 # Did the candidate actually build THIS tree? A registry `source` on any
 # rusty_alloc crate in its lock means no — and such a row used to PASS.
+# `identity = "registry"`: build the candidate with rusty_alloc STILL a
+# crates.io package and only its SOURCE swapped for this tree's. A path
+# dependency gets a different package id, so different symbol hashes, and LLVM
+# makes different inlining decisions. 2.2.4's MSVC funclet defect fails
+# rusty_sloth from crates.io and builds clean as a path dependency
+# (docs/plans/msvc-funclet-asm-goto.md section 8). Moves the lock to this tree's
+# version when crates.io has it, vendors every dependency, overwrites the two
+# vendored `src/` trees, and prints the cargo flags that select the vendor.
+registry_swap() {
+  local tree="$1" vend="$1.vendor" ver
+  ver="$(grep -m1 '^version' "$root/Cargo.toml" | cut -d'"' -f2)"
+  (cd "$tree" && cargo update -q -p rusty_alloc-api --precise "$ver") >/dev/null 2>&1 || true
+  rm -rf "$vend"
+  # The config `cargo vendor` prints covers git sources too, not just crates.io.
+  (cd "$tree" && cargo vendor --versioned-dirs "$vend") >"$vend.toml" 2>/dev/null || return 1
+  local n=0 d
+  for d in "$vend"/rusty_alloc-[0-9]* "$vend"/rusty_alloc-api-[0-9]*; do
+    [ -d "$d" ] || continue
+    case "$d" in *rusty_alloc-api-*) src="$root/crates/rusty_alloc_api/src" ;; *) src="$root/crates/rusty_alloc/src" ;; esac
+    rm -rf "$d/src" && cp -r "$src" "$d/src" || return 1
+    python3 - "$d/.cargo-checksum.json" <<'PY2' || return 1
+import json, sys
+p = sys.argv[1]; j = json.load(open(p)); j['files'] = {}; json.dump(j, open(p, 'w'))
+PY2
+    n=$((n + 1))
+  done
+  [ "$n" -ge 1 ] || return 1
+  grep -q 'replace-with' "$vend.toml" || return 1
+  echo "--offline --config $vend.toml"
+}
+
 resolved_from_registry() {
   local lock="$1/Cargo.lock"
   [ -f "$lock" ] || return 1
@@ -155,7 +186,7 @@ PY
 }
 
 run_one() {
-  local name="$1" path="$2" feats="$3" pkg="$4" synth="$5" note="$6" build="${7:-}"
+  local name="$1" path="$2" feats="$3" pkg="$4" synth="$5" note="$6" build="${7:-}" ident="${8:-}"
   if [ ! -d "$path" ]; then
     echo "  SKIP  $name -- $path not on this machine"
     ROWS+=("SKIP|$name|not on this machine")
@@ -202,13 +233,24 @@ run_one() {
   # CANDIDATE: a copy, repointed at this tree.
   copy_tree "$dst"
   [ "${synth:-}" = "yes" ] && synth_workspace "$dst"
-  repoint "$dst"
-  patch_shim "$dst"
-  local cand_out cand_rc
-  cand_out="$(cd "$dst" && cargo "${cmd[@]}" --quiet "${fargs[@]}" 2>&1)"
+  local cand_out cand_rc vargs=()
+  if [ "$ident" = "registry" ]; then
+    local va
+    if ! va="$(registry_swap "$dst")"; then
+      echo "  NOT-SWAPPED  could not vendor or swap the crates.io source -- this row tests nothing"
+      ROWS+=("NOT-SWAPPED|$name|registry_swap failed")
+      fail=$((fail + 1))
+      return
+    fi
+    eval "vargs=($va)"
+  else
+    repoint "$dst"
+    patch_shim "$dst"
+  fi
+  cand_out="$(cd "$dst" && cargo "${cmd[@]}" --quiet "${fargs[@]}" "${vargs[@]}" 2>&1)"
   cand_rc=$?
 
-  if resolved_from_registry "$dst"; then
+  if [ "$ident" != "registry" ] && resolved_from_registry "$dst"; then
     echo "  NOT-REPOINTED  the candidate resolved rusty_alloc from crates.io -- this row tests nothing"
     ROWS+=("NOT-REPOINTED|$name|candidate still built the crates.io allocator")
     fail=$((fail + 1))
@@ -262,15 +304,15 @@ import re, sys
 s = open(sys.argv[1], encoding='utf-8').read()
 for blk in s.split('[[consumer]]')[1:]:
     g = lambda k: (re.search(rf'^{k}\s*=\s*"(.*)"', blk, re.M) or [None, ''])[1]
-    print('|'.join([g('name'), g('path'), g('features'), g('pkg'), g('synth'), g('note'), g('build')]))
+    print('|'.join([g('name'), g('path'), g('features'), g('pkg'), g('synth'), g('note'), g('build'), g('identity')]))
 PY
 mkdir -p "$work"
 # `|`, not tab: tab is IFS WHITESPACE, so bash collapses runs of it and an empty
 # `features` field silently shifts every column after it. That fed each
 # consumer's NOTE to `--features` and turned all five baselines red -- the
 # harness reporting on itself, again.
-while IFS='|' read -r n p f pk sy note bld; do
-  [ -n "$n" ] && run_one "$n" "$p" "$f" "$pk" "$sy" "$note" "$bld"
+while IFS='|' read -r n p f pk sy note bld idn; do
+  [ -n "$n" ] && run_one "$n" "$p" "$f" "$pk" "$sy" "$note" "$bld" "$idn"
 done < "$work.list"
 
 echo

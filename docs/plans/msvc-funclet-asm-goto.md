@@ -218,19 +218,39 @@ Rust `GlobalAlloc` workloads it cost maps +0.30 %, threads +0.40 %,
 overaligned +0.62 % and trees +3.56 % (free-heavy), with identical checksums.
 Outlining would have cost about +2 (call and return) and covered one caller.
 
-**Regression gate** (§5). A synthetic consumer did NOT reproduce. Four
-shapes, thin and fat LTO, all built clean on the unfixed code: a `Vec` owned
-across a panicking call, a `Heap::dealloc` in a `Drop`, a direct
-`GlobalAlloc::dealloc` in a `Drop`, and an unwind-only guard with an
-`#[inline(always)]` drop. The IR shows why: rustc marks calls in cleanup blocks
-cold, so the inliner leaves the drop out of line and the `callbr` stays on the
-normal path. Whatever rusty_sloth does to defeat that is not small. So the gate
-is **rusty_sloth itself**, as a corpus row built `--release`
-(`tools/corpus/corpus.toml`, `build = "release"`). It is a local gate, not a CI
-job, because rusty_sloth is not on CI's machines.
+**Regression gate** (§5). The defect depends on LLVM's inlining choices,
+and those depend on more than the code.
 
-**The row needs `--features cuda`.** Without it, rusty_sloth's release build
-is GREEN on unfixed 2.2.4 (corpus run, 2026-10-07): the drops that land in a
-funclet are in its CUDA paths. `cuda` is also the shape it ships, so the row
-builds that, and a machine without the CUDA toolkit reports BASELINE ALREADY
-RED rather than a pass.
+- **No small consumer reproduced it.** Four shapes, thin and fat LTO, all
+  built clean on the unfixed code: a `Vec` owned across a panicking call, a
+  `Heap::dealloc` in a `Drop`, a direct `GlobalAlloc::dealloc` in a `Drop`, an
+  unwind-only guard with an `#[inline(always)]` drop. The IR shows why: rustc
+  marks calls in cleanup blocks cold, so the inliner leaves the drop out of
+  line and the `callbr` stays on the normal path.
+- **rusty_sloth repointed to a PATH did not reproduce it either.** Unfixed
+  2.2.4 as a path dependency built green, with and without `--features cuda`.
+  The same source from crates.io failed. The source is byte-identical
+  (`diff -r` of the published crate against the tree). What differs is the
+  package id, which goes into every symbol hash and so into LLVM's inlining
+  order.
+- **What does reproduce it: crates.io identity, source swapped.**
+  `cargo vendor` plus source replacement keeps rusty_alloc a crates.io
+  package, so only its `src/` changes. rusty_sloth `--release --features cuda`:
+
+  | allocator source | result |
+  |---|---|
+  | 2.2.4 as published | **fails**, 4 × "Bogus funclet pad use" |
+  | 2.2.4 + this fix | **builds**; `sloth --help` runs |
+
+  A vendored package is immutable to Cargo: swapping its source does NOT
+  rebuild it. `cargo clean -p rusty_alloc -p rusty_alloc-api` first, or the
+  "fixed" build reuses the broken rlib (it did once here: 4 errors, nothing
+  recompiled).
+- **Deterministic check.** In `rusty_alloc`'s own IR for
+  `x86_64-pc-windows-msvc`, `callbr` count: unfixed 3 (unwind) / 3 (abort);
+  fixed **0** (unwind) / 3 (abort). With no `callbr` there is nothing for any
+  inlining order to misplace.
+
+The gate is the corpus row for rusty_sloth: `build = "release"` and
+`identity = "registry"` (`run.sh`'s `registry_swap`). It runs locally only,
+because CI has neither rusty_sloth nor CUDA.

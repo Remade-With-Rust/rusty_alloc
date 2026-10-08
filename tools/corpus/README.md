@@ -26,6 +26,14 @@ ML stack, twice. A candidate failing LLVM's verifier ("Broken module found")
 is blamed on us even though the error names no crate, because the baseline
 built and only the allocator differs between the two builds.
 
+`identity = "registry"` keeps the candidate's rusty_alloc a crates.io
+package, vendored with only its `src/` swapped for this tree's
+(`registry_swap`), instead of rewriting it to a path. Use it when a defect
+depends on codegen: a path dependency has a different package id, so
+different symbol hashes and different LLVM inlining. The funclet defect
+fails rusty_sloth from crates.io and builds clean as a path dependency of the
+very same source.
+
 ## What it does
 
 Two arms per consumer. **BASELINE** is the consumer as it sits on disk, with its

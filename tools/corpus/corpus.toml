@@ -64,11 +64,16 @@ note = "generated mirror of packages/spacedb; rusty_alloc-api =1.1.6, default-on
 name = "rusty_sloth"
 path = "F:/coding/rusty_sloth"
 pkg = "rusty_sloth-cli"
-# `cuda` is the shipped shape AND the trigger: without it the release build
-# is green on 2.2.4 (checked 2026-10-07). Needs the CUDA toolkit; a machine
-# without it reports BASELINE ALREADY RED, not a pass.
+# `cuda` is the shipped shape, and the one the defect was reproduced in. Needs
+# the CUDA toolkit; a machine without it reports BASELINE ALREADY RED, not a
+# pass.
 features = "cuda"
 build = "release"
+# AND with rusty_alloc kept a crates.io package (vendored, source swapped).
+# Repointed to a path, unfixed 2.2.4 built GREEN here, with and without cuda,
+# while the same source from crates.io failed: the package id changes the
+# symbol hashes, and with them LLVM's inlining (checked 2026-10-07).
+identity = "registry"
 # The shape no other consumer has: it UNWINDS (default panic strategy) and
 # ships thin LTO with one codegen unit, so the allocator's inlined free lands
 # in EH cleanup funclets on MSVC. 2.2.1-2.2.4 failed LLVM's verifier there
