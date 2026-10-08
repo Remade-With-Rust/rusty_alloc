@@ -129,7 +129,11 @@ something measurable.
 rusty_sloth was built on `7037d8d` through a temporary `[patch.crates-io]`; that patch is not
 committed, and rusty_sloth is back on 2.2.0.
 
-- **Build:** the release binary builds (`cargo build --release --features cuda -p rusty_sloth-cli`).
+- **Build: this proved nothing.** The release binary built, but through a path `[patch]`, and
+  as a path dependency even the unfixed 2.2.4 builds rusty_sloth green (the package id changes
+  the symbol hashes and with them LLVM's inlining). Only a crates.io-identity build tests a
+  funclet fix: §8's vendored A/B did (2.2.4 fails, the fix builds), and rusty_sloth's deploy
+  of the published 2.2.5 (`47daf51`) builds with `--features cuda`.
 - **Every rusty_sloth gate the same:**
   - Llama / Qwen3 SFT, DPO and two-turn census outputs;
   - a 200-token and a 3-turn chat;
