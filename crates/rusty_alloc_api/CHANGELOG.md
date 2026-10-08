@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- `GlobalAlloc::alloc` moves its natural-alignment arm out of line, so the
+  inlined method carries one malloc fast path, not two (maps -0.33 %,
+  overaligned -1.81 %); over-aligned `realloc` inlines its usable-size
+  query (-2.06 %); `dealloc` uses `free_inline_flags_first`. The core's
+  changelog has the rest.
+
 ## [2.2.5](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-api-v2.2.4...rusty_alloc-api-v2.2.5) - 2026-10-08
 
 ### Fixed

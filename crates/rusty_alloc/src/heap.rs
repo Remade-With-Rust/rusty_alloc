@@ -725,8 +725,8 @@ impl Heap {
             }
             return (r.0, u8::from(r.1));
         }
-        let bin = bins::bin(size);
         let w = wsize_from_size(size);
+        let bin = bins::bin_by_wsize(size, w);
         // SAFETY: `bin` indexes `self.pages`; the queue's first page, if any,
         // is a live page of this heap.
         unsafe {

@@ -2050,7 +2050,17 @@ pub fn new_impl(size: usize) -> *mut c_void {
     // would keep `size` alive across the slow-path call, and that single
     // live value gives every `operator new` export a frame. See
     // `alloc::malloc_or`.
-    alloc::malloc_or(size, new_oom).cast()
+    alloc::malloc_or_with::<NewOom>(size).cast()
+}
+
+/// [`new_oom`] as a compile-time handler, so the cold arm calls it directly.
+struct NewOom;
+
+impl alloc::OnOom for NewOom {
+    #[inline(always)]
+    fn on_oom(size: usize) -> *mut u8 {
+        new_oom(size)
+    }
 }
 
 /// `operator new` ran out of memory: collect once, retry, and abort if that

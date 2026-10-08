@@ -586,6 +586,41 @@ pub fn create_heap(tag: i32, allow_destroy: bool, arena_id: i32) -> *mut HeapBox
     create_heap_uninstalled(tag, allow_destroy, arena_id)
 }
 
+/// Released heap boxes kept for the next heap, as upstream keeps
+/// `mi_thread_data_t` (`TD_CACHE_SIZE`). A thread pool spawns and retires
+/// threads constantly; without this, every thread's heap box was a fresh
+/// `mmap` at its first allocation and a `munmap` at its exit, plus the
+/// first-touch fault on the new mapping. A box in the cache is unregistered
+/// and referenced by nothing (exactly the state in which it used to be
+/// unmapped), and `create_heap_uninstalled` rewrites the whole struct.
+static HEAP_BOX_CACHE: [AtomicPtr<HeapBox>; 8] = [const { AtomicPtr::new(ptr::null_mut()) }; 8];
+
+/// A cached heap box, or null.
+fn heap_box_cache_take() -> *mut HeapBox {
+    for slot in &HEAP_BOX_CACHE {
+        if !slot.load(Ordering::Relaxed).is_null() {
+            let hb = slot.swap(ptr::null_mut(), Ordering::Acquire);
+            if !hb.is_null() {
+                return hb;
+            }
+        }
+    }
+    ptr::null_mut()
+}
+
+/// Park a released heap box for reuse; false when the cache is full.
+fn heap_box_cache_put(hb: *mut HeapBox) -> bool {
+    for slot in &HEAP_BOX_CACHE {
+        if slot
+            .compare_exchange(ptr::null_mut(), hb, Ordering::Release, Ordering::Relaxed)
+            .is_ok()
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn create_heap_uninstalled(tag: i32, allow_destroy: bool, arena_id: i32) -> *mut HeapBox {
     let size = core::mem::size_of::<HeapBox>();
     // On a one-region target the FIRST descriptor is a static of the fixed
@@ -602,10 +637,15 @@ fn create_heap_uninstalled(tag: i32, allow_destroy: bool, arena_id: i32) -> *mut
     let hb: *mut HeapBox = match first {
         Some(p) => p,
         None => {
-            let Ok(block) = os::alloc_aligned(size, os::page_size(), true, false) else {
-                return ptr::null_mut();
-            };
-            block.ptr.cast()
+            let cached = heap_box_cache_take();
+            if cached.is_null() {
+                let Ok(block) = os::alloc_aligned(size, os::page_size(), true, false) else {
+                    return ptr::null_mut();
+                };
+                block.ptr.cast()
+            } else {
+                cached
+            }
         }
     };
     // SAFETY: fresh committed mapping large enough for HeapBox; we initialize
@@ -897,7 +937,11 @@ unsafe fn thread_done_one(hb: *mut HeapBox) {
         // first descriptor on a one-region target is a static, not a page:
         // nothing to return (and this path is unreachable there anyway).
         heaps_unregister(hb);
-        if !(crate::ONE_REGION && prim::fixed::is_first_heap_box(hb)) {
+        // A static first box is not a page and is never cached; any other
+        // box is cached when there is room, and unmapped otherwise.
+        let kept =
+            (crate::ONE_REGION && prim::fixed::is_first_heap_box(hb)) || heap_box_cache_put(hb);
+        if !kept {
             let size = core::mem::size_of::<HeapBox>();
             let blockdesc = os::OsBlock {
                 ptr: hb.cast(),
@@ -1040,6 +1084,9 @@ unsafe fn release_heap_box(hb: *mut HeapBox) {
     // handed the fixed backend's static descriptor; that is not a page and
     // must not be returned to the region.
     if crate::ONE_REGION && prim::fixed::is_first_heap_box(hb) {
+        return;
+    }
+    if heap_box_cache_put(hb) {
         return;
     }
     let size = core::mem::size_of::<HeapBox>();

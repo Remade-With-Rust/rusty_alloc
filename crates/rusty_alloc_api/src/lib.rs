@@ -169,20 +169,20 @@ unsafe impl GlobalAlloc for RustyAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if layout.align() <= WORD {
             rusty_alloc::alloc::malloc(layout.size())
-        } else if layout.align() <= NATURAL_ALIGN {
-            // See `NATURAL_ALIGN`: a class of two words or more is already
-            // aligned this far, so only a one-word request needs raising.
-            rusty_alloc::alloc::malloc(layout.size().max(NATURAL_ALIGN))
-        } else {
+        } else if layout.align() > NATURAL_ALIGN {
             // SAFETY: `Layout` guarantees a power-of-two alignment, the one
             // precondition `malloc_aligned_pow2` adds over `malloc_aligned`.
             unsafe { rusty_alloc::alloc::malloc_aligned_pow2(layout.size(), layout.align()) }
+        } else {
+            alloc_natural(layout.size())
         }
     }
 
     #[inline]
     unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
-        // `free_inline`, not `free`: `dealloc` IS a free and does nothing
+        // `free_inline_flags_first` (the body of `free_inline`, in the test
+        // order that keeps `__rust_dealloc` inlinable; see its doc), not
+        // `free`: `dealloc` IS a free and does nothing
         // else, the case `free_inline` exists for (the LD_PRELOAD export is
         // the other). Through `free` every Rust deallocation paid a `jmp`
         // into it and its null test; `GlobalAlloc` never passes null, and the
@@ -191,7 +191,7 @@ unsafe impl GlobalAlloc for RustyAlloc {
         // and is freed once.
         unsafe {
             core::hint::assert_unchecked(!ptr.is_null());
-            rusty_alloc::alloc::free_inline(ptr)
+            rusty_alloc::alloc::free_inline_flags_first(ptr)
         }
     }
 
@@ -254,4 +254,15 @@ unsafe impl GlobalAlloc for RustyAlloc {
             }
         }
     }
+}
+
+/// `GlobalAlloc::alloc` for an alignment above one word up to
+/// `NATURAL_ALIGN`, out of line. Inline, this arm was a SECOND copy of the
+/// malloc fast path in every `__rust_alloc`, which kept the method too big for
+/// LLVM to inline into its callers. See `NATURAL_ALIGN`: a class of two words
+/// or more is already aligned this far, so only a one-word request needs
+/// raising.
+#[inline(never)]
+fn alloc_natural(size: usize) -> *mut u8 {
+    rusty_alloc::alloc::malloc(size.max(NATURAL_ALIGN))
 }
