@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **2.2.1–2.2.4 failed to build in an MSVC consumer that unwinds, with LTO**
+  ("Bogus funclet pad use"): `GlobalAlloc::dealloc` inlined the core's
+  `asm!` goto into EH cleanup funclets. Fixed in `rusty_alloc` (see its
+  changelog); this crate's code is unchanged.
+
 ## [2.2.1](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-api-v2.2.0...rusty_alloc-api-v2.2.1) - 2026-09-25
 
 ### Performance

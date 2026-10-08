@@ -17,6 +17,15 @@ bash tools/corpus/run.sh --test   # + each consumer's test suite
 Consumers are registered in `corpus.toml`. Add one the moment it takes a
 dependency on this crate.
 
+A consumer with `build = "release"` is BUILT in its own release profile
+instead, in both modes. `check` never runs codegen and `test` never uses LTO,
+and some defects exist only in optimised codegen. 2.2.1–2.2.4 failed LLVM's
+verifier in rusty_sloth, an unwinding MSVC consumer with thin LTO
+(`docs/plans/msvc-funclet-asm-goto.md`). That row is slow: an LTO build of an
+ML stack, twice. A candidate failing LLVM's verifier ("Broken module found")
+is blamed on us even though the error names no crate, because the baseline
+built and only the allocator differs between the two builds.
+
 ## What it does
 
 Two arms per consumer. **BASELINE** is the consumer as it sits on disk, with its

@@ -1,6 +1,6 @@
 # 2.2.1–2.2.4 do not build in an unwinding MSVC consumer with LTO
 
-**Status:** fix written and verified in a consumer; **not merged, not released**. To do: §6.
+**Status:** fixed differently from §3, on branch `fix/msvc-funclet-asm-goto`, for 2.2.5. See §8.
 **Date:** 2026-10-07 · **Affects:** rusty_alloc-api 2.2.1, 2.2.2, 2.2.3, 2.2.4 ·
 **Platform:** `x86_64-pc-windows-msvc`, consumer built with `panic = "unwind"` (the default),
 `lto = "thin"`, `codegen-units = 1` ·
@@ -198,3 +198,33 @@ workspace (`tests/msvc-unwind-consumer/`, with `path` dependencies) built with
 - Would an LLVM / rustc issue be worth filing? A `callbr` inlined into a funclet should either be
   handled or refused at inline time, not left for the verifier. A minimal reproducer is an
   `asm!` goto in an `#[inline(always)]` function called from a `Drop` on MSVC with LTO.
+
+## 8. Resolution (2026-10-07, rusty_alloc session)
+
+**The fix is in `free_inline`, not in `dealloc`.** `7037d8d` outlined only
+`GlobalAlloc::dealloc`, so the other callers were still exposed:
+`rusty_alloc_api::Heap::dealloc` calls `rusty_alloc::alloc::free`, whose body
+is `free_inline`, and LTO is free to inline it into a consumer's drop. Instead,
+the asm goto's cfg in `free_inline` now excludes
+`all(target_env = "msvc", panic = "unwind")`. Those builds take the
+plain-Rust decrement that aarch64 and Miri already use. MSVC builds with
+`panic = "abort"`, which have no funclets, keep the asm. `7037d8d` is not
+merged; its branch is left in place.
+
+**Cost** (§6 step 3). Callgrind cannot run an MSVC build, so the same code was
+forced on Linux and counted there: +3 Ir per local free, exactly opps #6's
+figure. Opscan small 52.26 -> 55.26, big 94 -> 97, mixed 94.26 -> 97.26. On the
+Rust `GlobalAlloc` workloads it cost maps +0.30 %, threads +0.40 %,
+overaligned +0.62 % and trees +3.56 % (free-heavy), with identical checksums.
+Outlining would have cost about +2 (call and return) and covered one caller.
+
+**Regression gate** (§5). A synthetic consumer did NOT reproduce. Four
+shapes, thin and fat LTO, all built clean on the unfixed code: a `Vec` owned
+across a panicking call, a `Heap::dealloc` in a `Drop`, a direct
+`GlobalAlloc::dealloc` in a `Drop`, and an unwind-only guard with an
+`#[inline(always)]` drop. The IR shows why: rustc marks calls in cleanup blocks
+cold, so the inliner leaves the drop out of line and the `callbr` stays on the
+normal path. Whatever rusty_sloth does to defeat that is not small. So the gate
+is **rusty_sloth itself**, as a corpus row built `--release`
+(`tools/corpus/corpus.toml`, `build = "release"`). It is a local gate, not a CI
+job, because rusty_sloth is not on CI's machines.

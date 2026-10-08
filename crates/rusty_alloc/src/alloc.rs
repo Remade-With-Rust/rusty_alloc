@@ -1135,7 +1135,25 @@ pub unsafe fn free_inline(p: *mut u8) {
                 {
                     (*owner_heap(pg)).stats.frees += 1;
                 }
-                #[cfg(all(target_arch = "x86_64", not(miri)))]
+                // NOT on an MSVC target that unwinds. This function inlines
+                // into `GlobalAlloc::dealloc`, so into every Rust drop,
+                // including the drops a panic runs; on MSVC those are EH
+                // cleanup FUNCLETS, and LLVM cannot place an `asm!` goto
+                // (`callbr`) in a funclet: its successors lose the funclet
+                // colouring and the verifier rejects the module ("Bogus
+                // funclet pad use"). 2.2.1-2.2.4 failed to build in an
+                // unwinding MSVC consumer with LTO that way (rusty_sloth;
+                // docs/plans/msvc-funclet-asm-goto.md). Those builds take the
+                // plain-Rust decrement below (+3 Ir per local free, opps #6),
+                // which reaches every caller, not just `dealloc`. An MSVC
+                // build with `panic = "abort"` has no funclets and keeps the
+                // asm. Regression gate: the corpus's rusty_sloth row, built
+                // `--release` (no small consumer reproduces it).
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    not(miri),
+                    not(all(target_env = "msvc", panic = "unwind"))
+                ))]
                 {
                     // SAFETY: `pg` is a live page of this thread; `USED_OFFSET`
                     // is `offset_of!(Page, used)`, checked against the real
@@ -1180,7 +1198,11 @@ pub unsafe fn free_inline(p: *mut u8) {
                         options(nostack),
                     );
                 }
-                #[cfg(not(all(target_arch = "x86_64", not(miri))))]
+                #[cfg(not(all(
+                    target_arch = "x86_64",
+                    not(miri),
+                    not(all(target_env = "msvc", panic = "unwind"))
+                )))]
                 {
                     let u = (*pg).used.wrapping_sub(1);
                     (*pg).used = u;

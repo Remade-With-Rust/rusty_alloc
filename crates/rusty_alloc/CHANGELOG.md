@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **2.2.1–2.2.4 failed to build in an MSVC consumer that unwinds, with LTO.**
+  `free_inline`'s fast path is an `asm!` goto (LLVM `callbr`), and since
+  2.2.1 `GlobalAlloc::dealloc` inlines it into every Rust deallocation,
+  including the drops a panic runs. On MSVC targets those are EH cleanup
+  funclets, which cannot hold a `callbr`: LLVM rejected the module ("Bogus
+  funclet pad use ... Broken module found"). Reported by rusty_sloth (thin
+  LTO, one codegen unit, `panic = "unwind"`). On `target_env = "msvc"` with
+  `panic = "unwind"`, `free_inline` now uses the plain-Rust decrement that
+  aarch64 and Miri already use. The fix sits in `free_inline` itself, so it
+  covers every caller, `rusty_alloc::alloc::free` and
+  `rusty_alloc_api::Heap::dealloc` included, not just `dealloc`. MSVC builds
+  with `panic = "abort"` and every other target are unchanged.
+  Cost, on affected builds only: +3 instructions per local free (callgrind,
+  the same code forced on Linux: small 52.26 -> 55.26 Ir/op); Rust
+  `GlobalAlloc` workloads +0.30 % to +3.56 % whole-program, output identical.
+
 ## [2.2.4](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.2.3...rusty_alloc-v2.2.4) - 2026-10-08
 
 ### Semver note (read before upgrading)

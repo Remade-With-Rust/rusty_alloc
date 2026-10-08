@@ -155,7 +155,7 @@ PY
 }
 
 run_one() {
-  local name="$1" path="$2" feats="$3" pkg="$4" synth="$5" note="$6"
+  local name="$1" path="$2" feats="$3" pkg="$4" synth="$5" note="$6" build="${7:-}"
   if [ ! -d "$path" ]; then
     echo "  SKIP  $name -- $path not on this machine"
     ROWS+=("SKIP|$name|not on this machine")
@@ -169,6 +169,13 @@ run_one() {
   # bins and `rusty_alloc_default` both claim it), which is this harness picking
   # the wrong target rather than anything being wrong downstream.
   [ -n "${pkg:-}" ] && fargs+=(-p "$pkg")
+  # `build = "release"`: this consumer is built, not checked or tested, in ITS
+  # OWN release profile. Some defects exist only in optimised codegen: 2.2.1-
+  # 2.2.4 failed LLVM's verifier in an unwinding MSVC build with LTO (an asm
+  # goto inlined into an EH funclet), which `check` never codegens and `test`
+  # (no LTO) never inlines (docs/plans/msvc-funclet-asm-goto.md).
+  local cmd=("$mode")
+  [ "$build" = "release" ] && cmd=(build --release)
 
   echo "== $name"
   echo "   $note"
@@ -189,7 +196,7 @@ run_one() {
     synth_workspace "$base_dir"
   fi
   local base_out base_rc
-  base_out="$(cd "$base_dir" && cargo "$mode" --quiet "${fargs[@]}" 2>&1)"
+  base_out="$(cd "$base_dir" && cargo "${cmd[@]}" --quiet "${fargs[@]}" 2>&1)"
   base_rc=$?
 
   # CANDIDATE: a copy, repointed at this tree.
@@ -198,7 +205,7 @@ run_one() {
   repoint "$dst"
   patch_shim "$dst"
   local cand_out cand_rc
-  cand_out="$(cd "$dst" && cargo "$mode" --quiet "${fargs[@]}" 2>&1)"
+  cand_out="$(cd "$dst" && cargo "${cmd[@]}" --quiet "${fargs[@]}" 2>&1)"
   cand_rc=$?
 
   if resolved_from_registry "$dst"; then
@@ -226,7 +233,10 @@ run_one() {
     echo "  PASS  both arms green"
     ROWS+=("PASS|$name|both arms green")
     pass=$((pass + 1))
-  elif ! grep -qiE "rusty[_-]alloc" <<<"$cand_out"; then
+  # An LLVM verifier failure names no crate ("Bogus funclet pad use ...
+  # Broken module found"), yet the baseline built: with only the allocator
+  # changed between the arms, it is ours.
+  elif ! grep -qiE "rusty[_-]alloc|Broken module found" <<<"$cand_out"; then
     # The candidate is red but nothing in the error mentions us. A consumer can
     # be broken for its own reasons -- a missing dependency, a resolver shift
     # from the rewritten manifest -- and blaming the upgrade for it would make
@@ -236,10 +246,10 @@ run_one() {
     ROWS+=("UNRELATED|$name|$(echo "$cand_out" | grep -E '^error' | head -1 | cut -c1-70)")
     skip=$((skip + 1))
   else
-    echo "  FAIL  2.0.0 BREAKS THIS CONSUMER"
-    echo "$cand_out" | grep -E "^error" | head -3 | sed 's/^/        /'
+    echo "  FAIL  THIS TREE BREAKS THIS CONSUMER"
+    echo "$cand_out" | grep -E "^error|Bogus|Broken module" | head -3 | sed 's/^/        /'
     local first
-    first="$(echo "$cand_out" | grep -E "^error" | head -1 | cut -c1-110)"
+    first="$(echo "$cand_out" | grep -E "Bogus|Broken module|^error" | head -1 | cut -c1-110)"
     ROWS+=("FAIL|$name|$first")
     fail=$((fail + 1))
   fi
@@ -252,15 +262,15 @@ import re, sys
 s = open(sys.argv[1], encoding='utf-8').read()
 for blk in s.split('[[consumer]]')[1:]:
     g = lambda k: (re.search(rf'^{k}\s*=\s*"(.*)"', blk, re.M) or [None, ''])[1]
-    print('|'.join([g('name'), g('path'), g('features'), g('pkg'), g('synth'), g('note')]))
+    print('|'.join([g('name'), g('path'), g('features'), g('pkg'), g('synth'), g('note'), g('build')]))
 PY
 mkdir -p "$work"
 # `|`, not tab: tab is IFS WHITESPACE, so bash collapses runs of it and an empty
 # `features` field silently shifts every column after it. That fed each
 # consumer's NOTE to `--features` and turned all five baselines red -- the
 # harness reporting on itself, again.
-while IFS='|' read -r n p f pk sy note; do
-  [ -n "$n" ] && run_one "$n" "$p" "$f" "$pk" "$sy" "$note"
+while IFS='|' read -r n p f pk sy note bld; do
+  [ -n "$n" ] && run_one "$n" "$p" "$f" "$pk" "$sy" "$note" "$bld"
 done < "$work.list"
 
 echo
