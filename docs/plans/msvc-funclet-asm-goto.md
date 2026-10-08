@@ -30,6 +30,39 @@ error: could not compile `rusty_sloth-cli` (bin "sloth")
 The consumer's release profile is `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`, and the
 default `panic = "unwind"`. 2.2.0 builds in the same profile.
 
+### Reproduce (re-run 2026-10-07 from a clean rusty_sloth `main`, no patch)
+
+The consumer's `Cargo.lock` pins **2.2.0**. Cargo keeps a locked version until it is told to
+move. Without step 2 the build compiles 2.2.0 from crates.io and tests nothing; a `[patch]`
+entry is likewise left unused (cargo only warns "Patch … was not used in the crate graph").
+
+```sh
+cd rusty_sloth                                    # F:/coding/rusty_sloth
+cargo add rusty_alloc-api@2.2.4 -p rusty_sloth-alloc
+cargo update -p rusty_alloc-api -p rusty_alloc    # REQUIRED: moves the lock off 2.2.0
+cargo tree -i rusty_alloc-api -e normal           # must print "rusty_alloc-api v2.2.4"
+cargo build --release -p rusty_sloth-cli --features cuda
+```
+
+**Expected:** `Compiling rusty_alloc v2.2.4`, then four "Bogus funclet pad use" and `rustc-LLVM
+ERROR: Broken module found`. Reproduced with the published 2.2.4 (`source =
+"registry+…crates.io-index"` in the lock). The LTO link of the `sloth` binary is where it fails;
+building only the library crates passes.
+
+**To test a rusty_alloc tree instead** (the fix, or `main`), put the two entries in rusty_sloth's
+**existing** `[patch.crates-io]` table. It already holds `serde_json` and `tokenizers`, and a
+second `[patch.crates-io]` header is a duplicate-key error:
+
+```toml
+rusty_alloc = { path = "<tree>/crates/rusty_alloc" }
+rusty_alloc-api = { path = "<tree>/crates/rusty_alloc_api" }
+```
+
+Then the same `cargo add` (the requirement must admit the tree's version), `cargo update -p
+rusty_alloc-api -p rusty_alloc`, and check that the lock's two entries have **no `source =`
+line** (a path dependency) before building. Restore rusty_sloth afterwards (`git checkout
+Cargo.toml Cargo.lock crates/rusty_sloth-alloc/Cargo.toml`).
+
 ## 2. Mechanism
 
 - `free_inline` (`crates/rusty_alloc/src/alloc.rs`, `#[inline(always)]`) has the free fast path
