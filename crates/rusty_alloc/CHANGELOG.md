@@ -23,6 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   embedding (152 MiB) stayed resident for the life of the process. Details,
   measurements and the consumer report: `docs/plans/huge-free-retention.md`.
 
+- **A deferred-free hook that allocates is no longer undefined behaviour.**
+  `mi_register_deferred_free`'s hook fired inside the generic allocation
+  path while that path held `&mut Heap`, so a hook that allocated (or freed)
+  re-entered the heap under a protected exclusive borrow. Miri reported it
+  (Stacked Borrows, `tests/openheimer.rs`), and it had kept the `miri` CI job
+  red since 2.2.3. The hook now fires at the next allocation entry, before
+  any `&mut Heap` exists. Cost: one flag test per slow-path entry (perl and
+  sqlite allocator instructions +0.16 % / +0.22 %).
+
 ### Performance
 
 - **Recycled segments are no longer scrubbed whole.** Every thread's first

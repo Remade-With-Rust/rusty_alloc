@@ -205,6 +205,13 @@ pub struct Heap {
     /// conservative direction (it falls back to the behaviour that has always
     /// shipped).
     pub saw_remote_free: bool,
+    /// The heartbeat found a deferred-free hook registered: fire it at the
+    /// next allocation entry, BEFORE that entry forms `&mut Heap`. Firing it
+    /// from the heartbeat itself ran the user's hook while `&mut self` was
+    /// live, and a hook that allocates re-entered this heap through a raw
+    /// pointer under that protected borrow: undefined behaviour (Miri,
+    /// Stacked Borrows, `oh_f01_deferred_free_hook_that_mallocs_is_contained`).
+    pub deferred_due: bool,
     /// Trips of the generic path left before the next automatic collect.
     ///
     /// `mi_option_generic_collect`. Counts DOWN so the hot check is a compare
@@ -267,6 +274,7 @@ impl Heap {
             tag: 0,
             rng: crate::random::Random::new(),
             saw_remote_free: false,
+            deferred_due: false,
             generic_countdown: 0,
             guarded_rate: 0,
             guarded_count: 0,
@@ -670,10 +678,15 @@ impl Heap {
         }
         // Heartbeat: process cross-thread delayed frees at slow-path cadence
         // (this is what un-parks full pages whose blocks died remotely), and
-        // fire the registered deferred-free hook (mi_register_deferred_free).
+        // mark the registered deferred-free hook (mi_register_deferred_free)
+        // DUE. It is not called here: `&mut self` is live, and a hook that
+        // allocates would re-enter this heap under it. `alloc` fires it at
+        // the next entry, before any `&mut Heap` exists (`deferred_due`).
         // SAFETY: we are the owner thread.
         unsafe { self.process_delayed() };
-        crate::options::deferred_free(false);
+        if crate::options::deferred_registered() {
+            self.deferred_due = true;
+        }
         // Periodic collect (`mi_option_generic_collect`, default 10,000).
         //
         // Upstream runs an UNFORCED collect every N trips of this path. Ours

@@ -913,7 +913,17 @@ fn render_error(buf: &mut [u8; 32], err: i32) -> &str {
     )
 }
 
-/// Fire the deferred-free hook (called from the allocation heartbeat).
+/// Whether a deferred-free hook is registered: the function-pointer peek of
+/// [`deferred_free`], without calling anything. The generic path's heartbeat
+/// uses it to mark a hook call DUE; the call itself happens at the
+/// raw-pointer boundary in `alloc`, where no `&mut Heap` is alive.
+#[inline]
+pub fn deferred_registered() -> bool {
+    !DEFERRED_FUN.load_fun().is_null()
+}
+
+/// Fire the deferred-free hook. Called from `alloc`'s allocation entries
+/// when the heartbeat has marked it due, never with a `&mut Heap` live.
 pub fn deferred_free(force: bool) {
     // Peek at the FUNCTION pointer alone first. `mi_register_deferred_free` is
     // unregistered in nearly every process, and this runs on every slow-path
