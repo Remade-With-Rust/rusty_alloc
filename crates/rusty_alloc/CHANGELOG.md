@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.4](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.2.3...rusty_alloc-v2.2.4) - 2026-10-08
+
+### Semver note (read before upgrading)
+
+`rusty_alloc::heap::Heap` gained three public fields (`large_cache`,
+`large_freed`, `deferred_due`). Every field of `Heap` is public, so code that
+builds a `Heap` with a struct literal must add them; `cargo-semver-checks`
+reports this as a breaking change. It ships as a patch deliberately: `Heap`
+is allocator state that callers create with `Heap::new()`, and every known
+consumer (spacedb, rusty_alloc_default, rusty_zstd) compiles unchanged. If
+you build `Heap { .. }` yourself, start from `Heap::new()` instead.
+
 ### Fixed
 
 - **Freed model memory no longer stays stranded after a loader thread
