@@ -7,18 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- **A merged free span no longer hides a decommitted neighbour** (Windows,
-  purging on). When a freed span merged with an already-purged neighbour and
-  the merged span was not re-purged as a whole (the purge failed, or purging
-  had been switched off at runtime), the merged span kept a clear `purged`
-  flag over the neighbour's decommitted memory, and the next allocation wrote
-  to it: an access violation, reproduced as `STATUS_ACCESS_VIOLATION`. The
-  merged span now keeps the flag if any part of it was purged, so it is
-  re-committed before reuse. Cost: about 2 instructions per span free.
-  Mechanism B of `docs/plans/recommit-failure-ignored.md`.
-
 ### Performance
 
 Measured against 2.2.5 with callgrind, allocator instructions, outputs
@@ -52,6 +40,20 @@ within +-0.4 %. Details: `docs/opps.md`, "Vein census 3".
   OOM handler as a type.
 - `alloc::free_inline_flags_first`: `free_inline`'s body in the 2.2.5 test
   order, for Rust's `GlobalAlloc::dealloc`.
+
+## [2.2.6](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.2.5...rusty_alloc-v2.2.6) - 2026-10-09
+
+### Fixed
+
+- **A merged free span no longer hides a decommitted neighbour** (Windows,
+  purging on). When a freed span merged with an already-purged neighbour and
+  the merged span was not re-purged as a whole (the purge failed, or purging
+  had been switched off at runtime), the merged span kept a clear `purged`
+  flag over the neighbour's decommitted memory, and the next allocation wrote
+  to it: an access violation, reproduced as `STATUS_ACCESS_VIOLATION`. The
+  merged span now keeps the flag if any part of it was purged, so it is
+  re-committed before reuse. Cost: about 2 instructions per span free.
+  Mechanism B of `docs/plans/recommit-failure-ignored.md`.
 
 ## [2.2.5](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.2.4...rusty_alloc-v2.2.5) - 2026-10-08
 
