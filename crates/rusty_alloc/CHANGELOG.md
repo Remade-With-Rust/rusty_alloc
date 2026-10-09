@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A merged free span no longer hides a decommitted neighbour** (Windows,
+  purging on). When a freed span merged with an already-purged neighbour and
+  the merged span was not re-purged as a whole (the purge failed, or purging
+  had been switched off at runtime), the merged span kept a clear `purged`
+  flag over the neighbour's decommitted memory, and the next allocation wrote
+  to it: an access violation, reproduced as `STATUS_ACCESS_VIOLATION`. The
+  merged span now keeps the flag if any part of it was purged, so it is
+  re-committed before reuse. Cost: about 2 instructions per span free.
+  Mechanism B of `docs/plans/recommit-failure-ignored.md`.
+
 ### Performance
 
 Measured against 2.2.5 with callgrind, allocator instructions, outputs

@@ -1,8 +1,10 @@
 # An unbacked page reached `page_extend` on Windows, and a re-commit whose failure is ignored
 
-**Status:** one crash in a shipping consumer, **not reproduced**; mechanism A
-**fixed in the working tree 2026-10-04, uncommitted** (section 8); which of the
-two mechanisms caused the crash is still **open** ·
+**Status (2026-10-09):** mechanism A **fixed and released in 2.2.3**
+(`e6475c1`; `mata-master` pins `=2.2.3`). Mechanism B **found, reproduced as
+`STATUS_ACCESS_VIOLATION` and fixed** on branch `fix/purged-merge-flag`, not
+yet released (section 9). Which one caused the field crash is still unknown;
+the `secure` guard-page route is the one path not traced ·
 **Date:** 2026-10-04 · **Seen on:** 1.1.6 (`secure` on, `purge_delay = 0`) ·
 **Code checked against:** HEAD `86980ec` (2.2.2) · **Platform:** Windows 11,
 x86-64 · **From:** the MATA desktop session (`mata-master`, branch
@@ -222,3 +224,51 @@ the `bench/alloc-eval` replays of a recorded Endless Sky battle in WSL (about
 exhaustion. That load very likely contributed to the 98.5 % commit charge the
 dump recorded, which makes A's precondition more plausible than section 4
 assumed. It does not rule out B.
+
+## 9. Mechanism B, found (2026-10-09)
+
+**Where.** `span_recommit` is the only reader of the `purged` flag, and it
+reads a free span's FIRST slot only. `span_free` merges a freed span with free
+neighbours on both sides, then purges the WHOLE merged span and flags its
+start, but only if it is at least `MEDIUM_PAGE_SLICES` long and purging is on.
+When that re-purge does not happen, the merged span kept the flag of its first
+part, which can be clear while a merged-in neighbour is decommitted. Two ways:
+
+1. **The re-purge fails** (`os::purge` returns an error) after a merge with a
+   purged neighbour.
+2. **Purging was switched off at runtime** (`options::set`) after the
+   neighbour was purged, so the merge is not re-purged at all.
+
+Every other reuse path was checked and re-commits or never holds purged
+memory: the first-fit split (it re-commits the whole free span before
+splitting), the large-span cache, adoption's dead-span retirement, the 2.2.4
+huge purge (`restore_for_reuse`), and the heap-box cache. A stale TRUE flag on
+an interior slot is harmless (a re-commit of committed memory).
+
+**Reproduced.** `segment::recommit_tests::a_failed_repurge_of_a_merge_keeps_the_span_purged`
+(case 1, through a new test-only "fail the next N purges" hook beside the
+commit one) and `a_merge_after_purging_is_turned_off_keeps_the_span_purged`
+(case 2). With the fix disabled, both fail at the flag check. With the flag
+check also skipped, writing the merged span on Windows ends the test process
+with `0xc0000005 STATUS_ACCESS_VIOLATION`: the field crash's exception, from
+the same kind of write.
+
+**Fixed.** `span_free` ORs the merged neighbours' flags and, when the merged
+span is not re-purged, flags its start if any part was purged. Cost: about 2
+instructions per `span_free`. Opscan unchanged on every op; allocator Ir
+perl +455 (0.002 %), Endless Sky +68.
+
+**Does it explain the field crash?** Possibly, not provably. The MATA app sets
+purging once at start-up (no case 2), and case 1 needs a failed decommit,
+which is rare. The `failed commits` counter still separates A (non-zero) from
+the rest; a `MiniDumpWithFullMemoryInfo` dump would still settle it.
+
+**Test isolation.** The new tests set the process-wide `purge_delay`, as the
+mechanism-A test does, so all three now hold the arena adoption tests' lock
+(`arena::adopt_tests::lock`). Without it, `arena::adopt_tests::adjacent_adoption_extends_in_place`
+and the new tests each failed about once in a dozen runs (a segment allocation
+on another test thread can take a chunk from an arena that test just adopted).
+With it, 30 consecutive runs (15 default, 15 `secure`) were clean.
+
+**Still open:** the guard-page route (`secure`, a guard left no-access), not
+traced.
