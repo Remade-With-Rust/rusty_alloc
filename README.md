@@ -4,7 +4,7 @@
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![remade with rust](https://img.shields.io/badge/remade--with--rust-portfolio-orange.svg)](https://github.com/remade-with-rust)
 
-### In The Wild with 54,914 Active Installs
+### In The Wild with 64,223 Active Installs
 > [MATA Network](https://mata.network) uses `rusty_alloc` as their unified allocator
 > deploying across Windows, PC, MAC, Linux, Android, iPhone, WASM, and ESP-32 for Home devices.
 > This diverse ecosystem is battle testing our code base in every environment for performance,
