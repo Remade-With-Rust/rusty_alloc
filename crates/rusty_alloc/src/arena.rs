@@ -781,7 +781,7 @@ fn heapless_fmt(
 }
 
 #[cfg(test)]
-mod adopt_tests {
+pub(crate) mod adopt_tests {
     use super::*;
 
     /// One lock for all adoption tests. They are the only adopters on native
@@ -795,7 +795,11 @@ mod adopt_tests {
     /// written to survive LANDING in a shared or pre-extended arena, because
     /// arenas are never unregistered and an earlier test's arena can adopt a
     /// later test's adjacent block.
-    fn lock() -> std::sync::MutexGuard<'static, ()> {
+    ///
+    /// Visible to the crate: tests elsewhere that allocate whole segments (and so may
+    /// take a chunk from an arena one of these tests just adopted, before it
+    /// drains it) take this lock too. `segment::recommit_tests` does.
+    pub fn lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }

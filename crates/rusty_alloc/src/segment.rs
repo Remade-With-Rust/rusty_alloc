@@ -822,6 +822,14 @@ pub unsafe fn span_free(seg: *mut Segment, page: *mut Page) -> bool {
         (*page).free_is_zero = false;
 
         // Merge right: the slot at idx+len (if carved) is a span START.
+        // Whether any free neighbour merged in below is still purged. Only a
+        // span's FIRST slot carries the flag (`span_recommit` reads nothing
+        // else), so a merge that is not re-purged as a whole must carry its
+        // parts' flags onto the merged start, or a decommitted neighbour ends
+        // up behind a clear flag and is reused unbacked: the write fault of
+        // `docs/plans/recommit-failure-ignored.md`, mechanism B. A spurious
+        // flag costs only a re-commit of committed memory.
+        let mut merged_purged = false;
         let right = idx + len;
         if right < (*seg).next_free_slice as usize {
             let rslot: *mut Page = &raw mut (*seg).pages[right];
@@ -829,6 +837,7 @@ pub unsafe fn span_free(seg: *mut Segment, page: *mut Page) -> bool {
             if (*rslot).block_size == 0 {
                 span_list_remove(seg, rslot);
                 len += (*rslot).slice_count as usize;
+                merged_purged |= (*rslot).purged;
             }
         }
         // Merge left: follow the left slot back to its span start.
@@ -843,6 +852,7 @@ pub unsafe fn span_free(seg: *mut Segment, page: *mut Page) -> bool {
                 span_list_remove(seg, lstart);
                 len += idx - lstart_idx;
                 idx = lstart_idx;
+                merged_purged |= (*lstart).purged;
             }
         }
         // Re-mark only what does not already point to `idx`: with no left
@@ -873,6 +883,12 @@ pub unsafe fn span_free(seg: *mut Segment, page: *mut Page) -> bool {
                 (*seg).purged_any = true;
                 return true;
             }
+        }
+        // Not re-purged as a whole (purging off by now, the span too small,
+        // or the purge failed): the merged span is backed only if every part
+        // was. Never cleared here: the start may already be flagged.
+        if merged_purged {
+            (*seg).pages[idx].purged = true;
         }
         false
     }
@@ -1219,6 +1235,10 @@ mod recommit_tests {
     /// purged, so a later re-commit that succeeds makes it usable again.
     #[test]
     fn a_failed_recommit_is_a_failed_span_not_an_unbacked_one() {
+        // Serialised with each other (they set the PROCESS-WIDE `purge_delay`)
+        // and with the arena adoption tests (they allocate segments, which
+        // can take a chunk from an arena one of those tests just adopted).
+        let _g = crate::arena::adopt_tests::lock();
         // A span `span_free` will purge: at least MEDIUM_PAGE_SLICES slices.
         let span = SEGMENT_SLICE_SIZE * MEDIUM_PAGE_SLICES + SEGMENT_SLICE_SIZE;
         crate::options::set(15, 0); // purge_delay: purge at once
@@ -1273,5 +1293,123 @@ mod recommit_tests {
             free(pin);
         }
         crate::options::set(15, -1); // restore the shipped default
+    }
+
+    /// Two adjacent purge-eligible spans in one segment, pinned live on the
+    /// left so nothing merges past them. Returns `(pin, a, b, span)` with `b`
+    /// immediately right of `a`.
+    fn adjacent_pair() -> (*mut u8, *mut u8, *mut u8, usize) {
+        let span = SEGMENT_SLICE_SIZE * MEDIUM_PAGE_SLICES + SEGMENT_SLICE_SIZE;
+        let pin = malloc(span);
+        let a = malloc(span);
+        let b = malloc(span);
+        assert!(!pin.is_null() && !a.is_null() && !b.is_null());
+        let seg = segment_of(a);
+        assert!(
+            segment_of(pin) == seg && segment_of(b) == seg,
+            "setup: one segment"
+        );
+        // SAFETY: live blocks of this segment.
+        unsafe {
+            let pa = page_of(seg, a);
+            let pb = page_of(seg, b);
+            assert_eq!(
+                page_index(seg, pa) + (*pa).slice_count as usize,
+                page_index(seg, pb),
+                "setup: b must be a's right neighbour"
+            );
+            core::ptr::write_bytes(a, 1, span);
+            core::ptr::write_bytes(b, 1, span);
+        }
+        (pin, a, b, span)
+    }
+
+    /// Frees `b` with purging on, so its span is purged (decommitted on
+    /// Windows), and checks that it was.
+    fn purge_right(b: *mut u8) {
+        let seg = segment_of(b);
+        // SAFETY: `b` is live and freed once; its slot is read after.
+        unsafe {
+            let ib = page_index(seg, page_of(seg, b));
+            free(b);
+            collect(true);
+            assert!((*seg).pages[ib].purged, "setup: b's span was not purged");
+        }
+    }
+
+    /// After `a` merged with the purged `b`: the merged span must still say
+    /// purged, and reusing the whole of it must be backed. On Windows the
+    /// write is the check (a decommitted page faults); the flag assertion
+    /// fails first everywhere.
+    fn merged_span_is_backed(a: *mut u8, a_idx: usize, span: usize) {
+        let seg = segment_of(a);
+        // SAFETY: `seg` is pinned live; slot reads only.
+        unsafe {
+            assert!(
+                (*seg).pages[a_idx].purged,
+                "a merge kept a clear flag over a purged neighbour: the next tenant gets unbacked memory"
+            );
+        }
+        let whole = 2 * span;
+        let c = malloc(whole);
+        assert!(!c.is_null());
+        assert_eq!(c, a, "setup: the merged span should be reused first-fit");
+        // SAFETY: a live block of `whole` bytes.
+        unsafe {
+            core::ptr::write_bytes(c, 3, whole);
+            free(c);
+        }
+    }
+
+    /// Mechanism B (`docs/plans/recommit-failure-ignored.md`): a freed span
+    /// merges with a PURGED right neighbour, and re-purging the merged span
+    /// FAILS. The merged start is the freed span's slot, whose flag is clear,
+    /// so without carrying the neighbour's flag the decommitted half is
+    /// handed out as if it were backed.
+    #[test]
+    fn a_failed_repurge_of_a_merge_keeps_the_span_purged() {
+        // Serialised with each other (they set the PROCESS-WIDE `purge_delay`)
+        // and with the arena adoption tests (they allocate segments, which
+        // can take a chunk from an arena one of those tests just adopted).
+        let _g = crate::arena::adopt_tests::lock();
+        crate::options::set(15, 0); // purge_delay: purge at once
+        let (pin, a, b, span) = adjacent_pair();
+        let seg = segment_of(a);
+        // SAFETY: `a` is live.
+        let ia = unsafe { page_index(seg, page_of(seg, a)) };
+        purge_right(b);
+        crate::os::test_hooks::fail_next_purges(1);
+        // SAFETY: `a` is live and freed once.
+        unsafe { free(a) };
+        collect(true);
+        crate::os::test_hooks::fail_next_purges(0);
+        merged_span_is_backed(a, ia, span);
+        // SAFETY: live, freed once.
+        unsafe { free(pin) };
+        crate::options::set(15, -1);
+    }
+
+    /// The same merge with purging switched OFF at runtime after the
+    /// neighbour was purged: the merged span is not re-purged at all.
+    #[test]
+    fn a_merge_after_purging_is_turned_off_keeps_the_span_purged() {
+        // Serialised with each other (they set the PROCESS-WIDE `purge_delay`)
+        // and with the arena adoption tests (they allocate segments, which
+        // can take a chunk from an arena one of those tests just adopted).
+        let _g = crate::arena::adopt_tests::lock();
+        crate::options::set(15, 0);
+        let (pin, a, b, span) = adjacent_pair();
+        let seg = segment_of(a);
+        // SAFETY: `a` is live.
+        let ia = unsafe { page_index(seg, page_of(seg, a)) };
+        purge_right(b);
+        crate::options::set(15, -1); // purging off from here
+        // SAFETY: `a` is live and freed once; `collect` flushes the large
+        // cache, so its span reaches `span_free` and merges.
+        unsafe { free(a) };
+        collect(true);
+        merged_span_is_backed(a, ia, span);
+        // SAFETY: live, freed once.
+        unsafe { free(pin) };
     }
 }

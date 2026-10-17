@@ -217,6 +217,22 @@ pub(crate) mod test_hooks {
 
     std::thread_local! {
         static FAIL_COMMITS: Cell<usize> = const { Cell::new(0) };
+        static FAIL_PURGES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Fail this thread's next `n` purges.
+    pub fn fail_next_purges(n: usize) {
+        FAIL_PURGES.with(|c| c.set(n));
+    }
+
+    pub(super) fn take_purge_failure() -> bool {
+        FAIL_PURGES.with(|c| {
+            let n = c.get();
+            if n > 0 {
+                c.set(n - 1);
+            }
+            n > 0
+        })
     }
 
     /// Fail this thread's next `n` commits.
@@ -250,6 +266,10 @@ pub unsafe fn decommit(ptr: *mut u8, size: usize) -> Result<bool, PrimError> {
 /// # Safety
 /// As [`commit`]; contents are lost either way.
 pub unsafe fn purge(ptr: *mut u8, size: usize, purge_decommits: bool) -> Result<bool, PrimError> {
+    #[cfg(all(test, feature = "std"))]
+    if test_hooks::take_purge_failure() {
+        return Err(test_hooks::INJECTED);
+    }
     if purge_decommits {
         // SAFETY: forwarded contract.
         unsafe { decommit(ptr, size) }
