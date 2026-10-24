@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.8](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-api-v2.2.7...rusty_alloc-api-v2.2.8) - 2026-10-24
+
+### Other
+
+- record 2.2.7 on main
+- record 2.2.6 on main
+- vein census 3 -- nine deterministic wins from real-program profiles
+
 ### Performance
 
 - `GlobalAlloc::alloc` moves its natural-alignment arm out of line, so the
