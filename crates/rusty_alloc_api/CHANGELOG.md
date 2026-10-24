@@ -15,6 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   query (-2.06 %); `dealloc` uses `free_inline_flags_first`. The core's
   changelog has the rest.
 
+## [2.2.7](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-api-v2.2.6...rusty_alloc-api-v2.2.7) - 2026-10-24
+
+### Fixed
+
+- Picks up `rusty_alloc` 2.2.7: a multithreaded process no longer hangs in
+  `ExitProcess` on Windows when a thread was killed holding an allocator
+  lock. This crate's code is unchanged.
+
 ## [2.2.6](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-api-v2.2.5...rusty_alloc-api-v2.2.6) - 2026-10-09
 
 ### Fixed
