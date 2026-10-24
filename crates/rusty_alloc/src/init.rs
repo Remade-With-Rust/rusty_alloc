@@ -793,6 +793,18 @@ fn done_slot() -> prim::TlsSlot {
 
 #[cfg(all(windows, not(miri)))]
 unsafe extern "system" fn thread_done_cb(v: *const c_void) {
+    // Inside `ExitProcess` this runs on the exiting thread AFTER the kernel
+    // has terminated every other thread wherever it stood — possibly inside
+    // one of our spin-locked critical sections (`HEAPS_LOCK`,
+    // `abandoned_lock`, an arena lock) or with a page held in
+    // `XFLAG_FREEING`. Teardown then waits on a thread that no longer exists,
+    // forever, in a process `TerminateProcess` can no longer end: the 2.2.6
+    // exit hang (ArtCraft, spinning in `heaps_unregister`;
+    // `tests/exit_hang.rs`). Nothing will ever adopt what we would abandon,
+    // and the address space is about to go, so there is nothing to do.
+    if prim::process_exiting() {
+        return;
+    }
     if !v.is_null() {
         // SAFETY: v is the HeapBox this thread stored in the done slot.
         unsafe { thread_done(v.cast_mut().cast()) };

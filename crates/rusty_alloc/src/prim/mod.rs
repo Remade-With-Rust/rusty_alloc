@@ -250,6 +250,13 @@ pub fn clock_now() -> u64 {
     sys::clock_now()
 }
 
+/// Whether the process is exiting: `ExitProcess` has started, and every other
+/// thread has already been terminated wherever it stood.
+#[cfg(all(windows, not(miri)))]
+pub fn process_exiting() -> bool {
+    sys::process_exiting()
+}
+
 /// Platform-native TLS destructor signature. On x86-64/aarch64 the `"system"`
 /// and `"C"` ABIs coincide; the alias exists so each backend hands its OS the
 /// exact type it expects.

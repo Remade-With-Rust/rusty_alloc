@@ -312,6 +312,26 @@ pub(super) fn clock_now() -> u64 {
     ticks_to_ns(count.max(0) as u64, freq, SCALE.load(Ordering::Relaxed))
 }
 
+// Exported by ntdll since NT 4 but absent from windows-sys, so there is no
+// import library to name; `raw-dylib` needs none. On x86 the default import
+// name would be stdcall-decorated, which ntdll does not export.
+#[cfg_attr(
+    target_arch = "x86",
+    link(name = "ntdll", kind = "raw-dylib", import_name_type = "undecorated")
+)]
+#[cfg_attr(not(target_arch = "x86"), link(name = "ntdll", kind = "raw-dylib"))]
+unsafe extern "system" {
+    fn RtlDllShutdownInProgress() -> u8;
+}
+
+/// True once `ExitProcess` has begun: the loader sets this flag in
+/// `LdrShutdownProcess`, after the kernel has terminated every other thread
+/// and before it runs the exiting thread's FLS callbacks.
+pub(super) fn process_exiting() -> bool {
+    // SAFETY: no arguments, no preconditions; it reads a loader flag.
+    unsafe { RtlDllShutdownInProgress() != 0 }
+}
+
 pub(super) struct TlsSlotImpl(u32);
 
 pub(super) fn tls_new(dtor: Option<TlsDtor>) -> Option<TlsSlotImpl> {

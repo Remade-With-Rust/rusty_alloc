@@ -41,6 +41,22 @@ within +-0.4 %. Details: `docs/opps.md`, "Vein census 3".
 - `alloc::free_inline_flags_first`: `free_inline`'s body in the 2.2.5 test
   order, for Rust's `GlobalAlloc::dealloc`.
 
+## [2.2.7](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.2.6...rusty_alloc-v2.2.7) - 2026-10-24
+
+### Fixed
+
+- **A process no longer hangs in `ExitProcess`** (Windows, multithreaded).
+  `ExitProcess` terminates every other thread wherever it stands, then runs
+  the exiting thread's FLS callbacks, including the one that abandons its
+  heap. A thread killed while it held the heap-registry lock (for example a
+  pool worker in its own teardown) left that teardown spinning on the lock
+  forever, at 100 % of a core, in a process `TerminateProcess` cannot end.
+  Reported by ArtCraft: 2 hangs in about 1,060 runs of a rayon program, one
+  core, loaded box. The callback now does nothing once process shutdown has
+  begun (`RtlDllShutdownInProgress`); the address space is about to be
+  discarded and nothing could adopt the abandoned heap anyway. Ordinary
+  thread exits are unchanged. Regression test: `tests/exit_hang.rs`.
+
 ## [2.2.6](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.2.5...rusty_alloc-v2.2.6) - 2026-10-09
 
 ### Fixed
