@@ -65,11 +65,16 @@ jobs:
       # The shared light heap prototype (docs/plans/shared-light-heap.md) is a
       # cfg, so no step above builds it. Its gates are tests/shared_light_heap.rs;
       # the rest of the suite must also pass with it on, in both geometries.
+      # NOT the small profile on macOS: the runners are Apple Silicon, whose
+      # 16 KiB pages the small profile's 4 KiB slice cannot serve, and the
+      # page-size guard rightly aborts there (`os::config_init`).
       - name: test + clippy (shared light heap)
         shell: bash
         run: |
           set -euo pipefail
-          for flags in "" "--cfg ra_small_profile"; do
+          geometries=("" "--cfg ra_small_profile")
+          if [ "$RUNNER_OS" = "macOS" ]; then geometries=(""); fi
+          for flags in "${geometries[@]}"; do
             echo "::group::--cfg ra_shared_light_heap $flags"
             RUSTFLAGS="--cfg ra_shared_light_heap $flags" cargo test -p rusty_alloc -p rusty_alloc-api
             RUSTFLAGS="--cfg ra_shared_light_heap $flags" cargo clippy -p rusty_alloc --all-targets -- -D warnings
