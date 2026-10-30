@@ -390,9 +390,19 @@ a large peak keeps reading near that peak in `RSS` / working set afterwards
 (a consumer measured 461 MB retained after freeing 456 MB of huge blocks,
 where the Windows heap fell back to 4 MB — and mimalloc read the same 461 MB).
 That is the trade that makes re-use fast. To hand freed spans back, set
-`RUSTY_ALLOC_PURGE_DELAY` (or `MIMALLOC_PURGE_DELAY`) to a delay in
-milliseconds, `0` for as soon as a span is free, or call
-`options::set(15, delay)` before the first allocation.
+`RUSTY_ALLOC_PURGE_DELAY` (or `MIMALLOC_PURGE_DELAY`) to `0`, or call
+`options::set(15, 0)` before the first allocation. Only the sign is read:
+any value `>= 0` purges a freed span as soon as it is free, and there is no
+delayed purge.
+
+**Options** — every mimalloc option name and index is accepted (they are
+ABI), but only ten change behaviour: `show_errors`, `purge_decommits`,
+`purge_delay`, `arena_reserve`, `disallow_arena_alloc`, `guarded_min`,
+`guarded_max`, `guarded_sample_rate`, `guarded_sample_seed` and
+`generic_collect`. The rest, including `eager_commit`,
+`arena_eager_commit`, `reserve_os_memory`, `show_stats` and
+`retry_on_oom`, are stored and returned but have no effect. The table is
+in the `options` module docs, and a test holds it to the source.
 
 ## Install
 

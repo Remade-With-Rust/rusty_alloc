@@ -6,6 +6,31 @@
 //! `MIMALLOC_SHOW_STATS=1`, `MIMALLOC_PURGE_DELAY=0`. Parsed once on first
 //! option access. Values follow mimalloc: booleans accept 1/0/true/false/
 //! yes/no/on/off; sizes are plain integers (`_size` options are KiB).
+//!
+//! # Which options take effect
+//!
+//! Every option is ACCEPTED — set, parsed from the environment, and returned
+//! by `get` / `mi_option_get` — because the indices and names are ABI. Only
+//! these change what the allocator does:
+//!
+//! | option | effect |
+//! |---|---|
+//! | `show_errors` (0) | print error codes to stderr when no error hook is registered |
+//! | `purge_decommits` (5) | purge by decommit (on) or by reset (off) |
+//! | `purge_delay` (15) | **sign only**: `>= 0` purges a freed span of at least `MEDIUM_PAGE_SLICES` slices at once, `< 0` (default) never does. The value is not a delay. |
+//! | `arena_reserve` (23) | size of the arena reservation (KiB) |
+//! | `disallow_arena_alloc` (27) | never place segments in the arena |
+//! | `guarded_min` / `guarded_max` (30, 31) | size bounds for guard-page sampling |
+//! | `guarded_sample_rate` / `guarded_sample_seed` (33, 34) | guard-page sampling |
+//! | `generic_collect` (36) | generic-path trips between automatic collects |
+//!
+//! The other 28 have NO effect, including `show_stats`, `verbose`,
+//! `eager_commit`, `arena_eager_commit`, `eager_commit_delay`,
+//! `reserve_os_memory`, `abandoned_page_purge` (an abandoned segment's free
+//! spans are always purged; see `segment::purge_free_spans`), `retry_on_oom`,
+//! `allow_thp` and `guarded_precise`. Setting one is harmless and changes
+//! nothing. `honoured_matches_the_source` fails the build's tests if this list
+//! and the code disagree, in either direction.
 
 use core::cell::Cell;
 use core::ffi::c_void;
@@ -176,6 +201,68 @@ pub const OPTION_COUNT: usize = 38;
 /// starve on its own per-class page cache and never recover.
 pub const GENERIC_COLLECT: usize = 36;
 const _: () = assert!(GENERIC_COLLECT < OPTION_COUNT);
+
+#[cfg(all(test, feature = "std", not(miri)))]
+mod honoured_tests {
+    use super::{GENERIC_COLLECT, OPTION_COUNT};
+
+    /// The options the allocator actually reads: the module docs' table.
+    const HONOURED: [usize; 10] = [0, 5, 15, 23, 27, 30, 31, 33, 34, GENERIC_COLLECT];
+
+    /// Every option index read in `src/`, by call shape: `get(N)`,
+    /// `is_enabled(N)`, `get_size(N)`, plus the named `GENERIC_COLLECT`.
+    fn read_in_source() -> std::collections::BTreeSet<usize> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<String>) {
+            for e in std::fs::read_dir(dir).expect("read src") {
+                let p = e.expect("dir entry").path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(std::fs::read_to_string(&p).expect("read .rs"));
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        let mut read = std::collections::BTreeSet::new();
+        for src in &files {
+            for call in ["get(", "is_enabled(", "get_size("] {
+                for (at, _) in src.match_indices(call) {
+                    // A method like `.get(` on a slice is not an option read.
+                    if src[..at].ends_with('.')
+                        || src[..at].ends_with(|c: char| c.is_alphanumeric() || c == '_')
+                    {
+                        continue;
+                    }
+                    let rest = &src[at + call.len()..];
+                    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                    if !digits.is_empty() && rest[digits.len()..].starts_with(')') {
+                        read.insert(digits.parse().expect("digits"));
+                    }
+                }
+            }
+            if src.contains("options::GENERIC_COLLECT") {
+                read.insert(GENERIC_COLLECT);
+            }
+        }
+        read
+    }
+
+    #[test]
+    fn honoured_matches_the_source() {
+        let documented: std::collections::BTreeSet<usize> = HONOURED.into_iter().collect();
+        assert!(documented.iter().all(|&i| i < OPTION_COUNT));
+        assert_eq!(
+            read_in_source(),
+            documented,
+            "options read in src/ differ from HONOURED: update HONOURED and the \
+             module docs' table together"
+        );
+    }
+}
 
 /// Default trips of the generic path between automatic collects.
 ///

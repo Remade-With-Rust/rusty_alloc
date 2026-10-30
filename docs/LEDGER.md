@@ -2980,6 +2980,15 @@ neither fix touches the fast path.
 reproduced the tail. The A/B is free: `MIMALLOC_ABANDONED_PAGE_PURGE=0` vs `1`
 on the same binary, N=5, comparing max and spread rather than median.
 
+> **Correction (2026-10-30): that A/B is a NULL A/B.** Fix 1 was never gated
+> on `abandoned_page_purge` — `purge_free_spans` runs unconditionally and
+> nothing reads option 12 — so `=0` and `=1` run identical code. Any
+> validation done with it compared a build against itself. A real A/B needs
+> two builds, with and without the `purge_free_spans` call. The option is now
+> listed as no-effect in the `options` module docs, and
+> `options::honoured_tests` fails if a documented option and the source
+> disagree.
+
 ## RSS INVESTIGATION — mechanism confirmed, our retention NOT implicated (2026-08-06)
 
 **External measurement (FFAI/Diana, their harness, their null arm):** speed at

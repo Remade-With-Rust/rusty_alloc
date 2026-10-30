@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A build whose segment slice is smaller than the OS page now refuses to
+  run** instead of misbehaving. `--cfg ra_small_profile` uses a 4 KiB slice,
+  which a 16 KiB-page (Apple Silicon, some arm64 Linux) or 64 KiB-page kernel
+  cannot serve. The first OS-configuration read now checks the page size
+  and aborts with a message naming the flag. The default 64 KiB slice fits
+  every page size in use, so default builds are unaffected.
+
+### Documentation
+
+- **Which options take effect.** All 38 mimalloc options are accepted (the
+  indices and names are ABI), but only 10 change behaviour: `show_errors`,
+  `purge_decommits`, `purge_delay`, `arena_reserve`, `disallow_arena_alloc`,
+  `guarded_min`, `guarded_max`, `guarded_sample_rate`, `guarded_sample_seed`
+  and `generic_collect`. The other 28, including `eager_commit`,
+  `arena_eager_commit`, `reserve_os_memory`, `abandoned_page_purge`,
+  `show_stats` and `retry_on_oom`, are stored but have no effect. The
+  `options` module docs carry the table, and a new test fails if it and the
+  source disagree.
+- **`purge_delay` is read for its sign only.** The README said to set it "to
+  a delay in milliseconds". Any value `>= 0` purges a freed span at once, and
+  there is no delayed purge.
+- `docs/LEDGER.md`: the `MIMALLOC_ABANDONED_PAGE_PURGE=0` vs `1` A/B it
+  prescribed compared identical code, because nothing reads that option.
+
 ### Performance
 
 Measured against 2.2.5 with callgrind, allocator instructions, outputs
