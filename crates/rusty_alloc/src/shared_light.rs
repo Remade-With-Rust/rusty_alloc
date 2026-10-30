@@ -40,6 +40,18 @@ pub const SHARED_MAX_SIZE: usize = SMALL_OBJ_SIZE_MAX;
 static SHARED_BOX: AtomicPtr<HeapBox> = AtomicPtr::new(ptr::null_mut());
 static SHARED_LOCK: AtomicBool = AtomicBool::new(false);
 
+/// Set by the first thread that ever allocates, which takes a heap of its own
+/// at once instead of starting light.
+///
+/// That thread is the process's main thread in practice, and the one most
+/// likely to be busy. Started light, a busy main thread promotes after 64 KiB
+/// and then pays for pages in BOTH heaps, because its early blocks stay live
+/// in shared pages: rusty_WRT's boot census measured single-threaded daemons
+/// +72 KiB (odhcpd) and +28 KiB (logd) that way, which cancelled the
+/// multi-threaded win (procd −96 KiB) and left the system neutral. Exempting
+/// it also means a single-threaded process never touches the shared heap.
+static FIRST_CLAIMED: AtomicBool = AtomicBool::new(false);
+
 ra_thread_local! {
     /// Bytes this thread has taken from the shared heap.
     static LIGHT_BYTES: Cell<usize> = const { Cell::new(0) };
@@ -159,6 +171,11 @@ pub(crate) fn try_alloc(size: usize, zero: bool) -> Option<*mut u8> {
     // heap) must not wait on a lock it holds; it gets its own heap, whose
     // segments `stamp_if_shared` leaves alone because it is not this heap.
     if in_shared() || !init::in_default_subproc() {
+        return None;
+    }
+    // The first allocating thread is never light (see `FIRST_CLAIMED`). The
+    // load keeps the common case to a read; the swap decides the race.
+    if !FIRST_CLAIMED.load(Ordering::Relaxed) && !FIRST_CLAIMED.swap(true, Ordering::Relaxed) {
         return None;
     }
     let used = LIGHT_BYTES.with(Cell::get);

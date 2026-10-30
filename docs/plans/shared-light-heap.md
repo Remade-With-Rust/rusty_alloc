@@ -47,9 +47,14 @@ one process-wide SHARED heap behind a lock.
    light thread has allocated `SHARED_LIGHT_BYTES` (64 KiB) from the shared
    heap it gets its own heap and never returns. A busy thread is promoted
    within its first few hundred allocations.
-5. **Excluded threads:** a thread in a non-default subprocess (adoption reads
-   the caller's subprocess tag), and any re-entry while the thread already
-   holds the shared lock (a hook that allocates). Both are promoted instead.
+5. **Excluded threads:** the FIRST thread that ever allocates (in practice
+   the main thread, the one most likely to be busy), a thread in a
+   non-default subprocess (adoption reads the caller's subprocess tag), and
+   any re-entry while the thread already holds the shared lock (a hook that
+   allocates). All get their own heap at once. The first-thread rule came
+   from rusty_WRT's boot census (Results): without it a busy main thread
+   started light, promoted, and paid for pages in both heaps, and a
+   single-threaded process paid for the shared heap at all.
 6. **Contention promotes.** A light thread spins at most `SPIN_LIMIT` (128)
    for the lock and then takes its own heap. Finding the lock taken means
    allocating at the same moment as another thread, which is what busy
@@ -108,10 +113,29 @@ words, all panic-location line numbers moved by the inserted lines (+8 in
 | main | 164 | 1772 | 100.5 |
 | flag on, waiting lock (first draft) | 168 | 912 | 46.5 |
 | flag on, contention promotes | 168 | 1084 | 57.3 |
+| flag on, + first thread never light | 168 | 1092 | 57.8 |
 
 The probe starts all its threads at once, so with contention-promotes some
 collide and promote; daemon threads that start one after another stay
-nearer the first-draft figure.
+nearer the first-draft figure. With the first-thread rule, one thread costs
+what main does (T=1: 272 KiB against main's 268).
+
+**rusty_WRT boot census** (real daemons, x86_64 musl, Anonymous PSS KiB, two
+boots per arm, at `2122d4e`, i.e. BEFORE the first-thread rule):
+
+| daemon | threads | flag off | flag on | |
+|---|---|---|---|---|
+| procd | 3 | 756 / 752 | 656 / 660 | −96 |
+| odhcpd | 1 | 240 / 240 | 312 / 312 | +72 |
+| logd | 1 | 132 / 132 | 160 / 160 | +28 |
+| dnsmasq | 1 | 108–112 | 108–112 | 0 |
+| system | | 7022 / 7040 | 7037 / 7029 | neutral |
+
+The single-threaded daemons paid for the shared heap and then for their own
+heap after promoting, which cancelled the multi-threaded win. That is what
+the first-thread rule removes: re-measured, single-threaded perl and sqlite
+are within 200 Ir of the flag-off build (−181 and −196 on 772 M and 316 M).
+The census has not been re-run with the rule yet.
 
 **Busy threads** (`bench/opscan.sh` method, Ir/op, flag on vs main): identical
 on 12 of 13 ops; `mixed` +0.01 Ir/op (0.01 %), consistent with the shared
@@ -148,5 +172,8 @@ test failed.
 
 - loom model of the shared lock + remote free into a `SHARED_TID` page.
 - Wall-clock contention on a quiet box (above).
-- rusty_WRT's boot census on a real daemon set.
+- rusty_WRT's boot census re-run with the first-thread rule.
+- Giving a promoted thread's shared pages back (or letting it adopt them):
+  a busy SECOND thread still pays for pages in both heaps after it
+  promotes, bounded by the 64 KiB it took while light.
 - A runtime switch: the threshold and spin limit are constants.

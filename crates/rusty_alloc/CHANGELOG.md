@@ -70,10 +70,13 @@ within +-0.4 %. Details: `docs/opps.md`, "Vein census 3".
   `docs/plans/shared-light-heap.md`). A thread's small requests come from one
   shared heap until it has allocated 64 KiB, asks for anything larger than a
   small-page class or aligned, or finds the shared lock contended; then it
-  gets its own heap as before. On rusty_WRT's daemon shape it cut the
-  per-thread floor from 100.5 to 46.5–57 KiB (glibc: 44), with busy-thread
-  instruction counts unchanged. Without the cfg the build's machine code is
-  byte-identical to before. Adds the `shared_light` module (cfg-only).
+  gets its own heap as before. The first thread that ever allocates (the
+  main thread, in practice) is never light, so a single-threaded process
+  never touches the shared heap. On rusty_WRT's daemon shape it cut the
+  per-thread floor from 100.5 to 46.5–58 KiB (glibc: 44), with busy-thread
+  and single-threaded instruction counts unchanged. Without the cfg the
+  build's machine code is byte-identical to before. Adds the `shared_light`
+  module (cfg-only).
 
 ## [2.2.7](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.2.6...rusty_alloc-v2.2.7) - 2026-10-24
 

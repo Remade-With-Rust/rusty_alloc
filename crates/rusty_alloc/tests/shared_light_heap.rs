@@ -20,7 +20,22 @@ use rusty_alloc::{init, segment};
 static SERIAL: Mutex<()> = Mutex::new(());
 
 fn serial() -> std::sync::MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    let g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    claim_first_thread();
+    g
+}
+
+/// The first thread that ever allocates gets a heap of its own and is never
+/// light. Spend that on a throwaway thread so the threads under test start
+/// light; `first_allocating_thread_is_never_light` tests the rule itself.
+fn claim_first_thread() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        on_fresh(|| {
+            // SAFETY: a live block, freed once.
+            unsafe { free(malloc(16)) }
+        });
+    });
 }
 
 /// The owner id stamped on the segment holding `p`.
@@ -322,6 +337,48 @@ fn stress_light_threads_freeing_each_others_blocks() {
     assert_shared_pages_return();
 }
 
+/// The first thread that ever allocates (in practice the main thread, and the
+/// one most likely to be busy) gets its own heap at once, so a
+/// single-threaded process never touches the shared heap; the second is
+/// light. Needs a fresh process, because the first claim is process-wide.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn first_allocating_thread_is_never_light() {
+    const MARKER: &str = "RUSTY_ALLOC_SHARED_FIRST_CHILD";
+    if std::env::var(MARKER).is_ok() {
+        let first = on_fresh(|| {
+            let p = malloc(64);
+            let r = owner(p) == init::thread_id() && !light();
+            // SAFETY: live and ours.
+            unsafe { free(p) };
+            r
+        });
+        let second = on_fresh(|| {
+            let p = malloc(64);
+            let r = owner(p) == SHARED_TID && light();
+            // SAFETY: live and ours.
+            unsafe { free(p) };
+            r
+        });
+        std::process::exit(if first && second {
+            0
+        } else {
+            1 + i32::from(first) * 2 + i32::from(second)
+        });
+    }
+    let _g = serial();
+    let out = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+        .env(MARKER, "1")
+        .args(["--exact", "first_allocating_thread_is_never_light"])
+        .output()
+        .expect("spawn child");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "first thread own heap / second thread light did not hold (code 1+2*first+second)"
+    );
+}
+
 /// The 2.2.7 hang class, for the shared lock: a thread `ExitProcess` killed
 /// while it held the lock, and the exiting thread allocating afterwards (an
 /// FLS callback, as rusty_alloc's own teardown is). The allocation must give
@@ -345,6 +402,10 @@ fn exit_with_the_shared_lock_held_by_a_killed_thread_does_not_hang() {
         assert!(!p.is_null());
     }
     if std::env::var(MARKER).is_ok() {
+        // Otherwise the exiting thread would be this process's FIRST
+        // allocating thread, take its own heap without ever touching the
+        // shared lock, and the test would pass without testing anything.
+        claim_first_thread();
         std::thread::spawn(|| {
             rusty_alloc::shared_light::test_hold_lock();
             HELD.store(true, Ordering::Release);
