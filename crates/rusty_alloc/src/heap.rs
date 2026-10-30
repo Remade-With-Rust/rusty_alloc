@@ -1072,6 +1072,8 @@ impl Heap {
                 }
             }
             let seg = segment::segment_alloc(self.arena_id).ok()?;
+            #[cfg(ra_shared_light_heap)]
+            crate::shared_light::stamp_if_shared(self, seg);
             self.stats.segments += 1;
             (*seg).next = self.segments;
             self.segments = seg;
@@ -1194,6 +1196,10 @@ impl Heap {
                 // metadata. DELAYED + xheap route remote frees through our
                 // delayed list, unifying huge with the protocol.
                 unsafe {
+                    // Unreachable for the shared heap (it serves only small
+                    // classes); kept so an ownership stamp cannot be missed.
+                    #[cfg(ra_shared_light_heap)]
+                    crate::shared_light::stamp_if_shared(self, seg);
                     let pg: *mut Page = &raw mut (*seg).pages[1];
                     (*pg).xheap.store(self.delayed as usize, Ordering::Release);
                     (*pg).flags.fetch_or(
@@ -1683,6 +1689,8 @@ impl Heap {
         // SAFETY: we are the sole owner as of now; walking spans follows the
         // segment invariants (every span start is marked).
         unsafe {
+            #[cfg(ra_shared_light_heap)]
+            crate::shared_light::stamp_if_shared(self, seg);
             if (*seg).kind == SegmentKind::Huge {
                 // Single-block segment: re-home, collect any NEVER-pushed
                 // free, release if its block already died.

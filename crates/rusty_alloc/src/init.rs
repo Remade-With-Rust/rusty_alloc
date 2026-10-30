@@ -492,6 +492,35 @@ fn init_tid() -> usize {
     t
 }
 
+/// A new heap box for the shared light heap: registered, never installed in
+/// any thread's TLS, owned by `shared_light::SHARED_TID`.
+///
+/// The owner is patched after registration, UNDER the registry lock: a dying
+/// thread's `take_heap_owned_by` reads every registered box's `owner_tid`
+/// under that lock, so an unlocked write would be a data race whatever the
+/// values. Until the patch the box carries the caller's id, and no dying
+/// thread can match it because the caller is alive.
+#[cfg(ra_shared_light_heap)]
+pub(crate) fn create_shared_heap_box() -> *mut HeapBox {
+    let hb = create_heap_uninstalled(0, false, -1);
+    if !hb.is_null() {
+        heaps_lock();
+        // SAFETY: a live, registered box; `owner_tid` is guarded by the lock
+        // held here.
+        unsafe { (*hb).owner_tid = crate::shared_light::SHARED_TID };
+        heaps_unlock();
+    }
+    hb
+}
+
+/// Whether the calling thread is in the default subprocess (the shared light
+/// heap adopts orphans by the caller's subprocess tag, so only these threads
+/// may use it).
+#[cfg(ra_shared_light_heap)]
+pub(crate) fn in_default_subproc() -> bool {
+    my_subproc() == 0
+}
+
 /// Snapshot-visit every registered heap (stats aggregation). The visitor
 /// receives a COPY of the heap's counters.
 ///

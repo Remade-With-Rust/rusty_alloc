@@ -196,6 +196,13 @@ pub(crate) const ONE_THREAD: bool = cfg!(any(
     )
 ));
 
+/// `--cfg ra_shared_light_heap`: a lightly-used thread serves its small
+/// allocations from one shared heap until it has allocated enough to earn its
+/// own (`docs/plans/shared-light-heap.md`). Off by default, and never on a
+/// single-context build, which has one heap already.
+#[cfg(ra_shared_light_heap)]
+pub(crate) const SHARED_LIGHT: bool = !ONE_THREAD;
+
 /// `true` where `prim::protect` can actually protect a page: the OS backends
 /// and the miri mock.
 ///
@@ -294,6 +301,8 @@ mod proofs;
 pub mod random;
 pub mod segment;
 pub mod segment_map;
+#[cfg(ra_shared_light_heap)]
+pub mod shared_light;
 // Wired into the segment paths only on wasm (F2, docs/plans/segment-tax.md);
 // native builds compile it for its unit tests, so its items are "unused"
 // there by design.

@@ -481,6 +481,12 @@ fn fire_deferred_now() {
 #[cold]
 #[inline(never)]
 fn malloc_first(size: usize) -> *mut u8 {
+    // A light thread's small request is served by the shared heap and the
+    // thread stays heapless (`docs/plans/shared-light-heap.md`).
+    #[cfg(ra_shared_light_heap)]
+    if let Some(p) = crate::shared_light::try_alloc(size, false) {
+        return p;
+    }
     let hb = init::ensure_heap(init::empty_heap_box_ptr());
     if hb.is_null() {
         // Heap creation failed (memory exhaustion): the malloc contract on
@@ -559,6 +565,10 @@ unsafe fn zalloc_slow(hb: *mut init::HeapBox, size: usize) -> *mut u8 {
 #[cold]
 #[inline(never)]
 fn zalloc_first(size: usize) -> *mut u8 {
+    #[cfg(ra_shared_light_heap)]
+    if let Some(p) = crate::shared_light::try_alloc(size, true) {
+        return p;
+    }
     let h = my_heap();
     if h.is_null() {
         return ptr::null_mut(); // heap creation failed: OOM ⇒ null
@@ -1822,6 +1832,12 @@ pub fn is_in_heap_region(p: *const u8) -> bool {
 /// `mi_collect`: drain cross-thread frees and retire empty pages of the
 /// calling thread's heap.
 pub fn collect(force: bool) {
+    // A light thread has no heap to collect; collect the shared one rather
+    // than create a heap only to sweep it.
+    #[cfg(ra_shared_light_heap)]
+    if init::heap_box_fast() == init::empty_heap_box_ptr() && crate::shared_light::collect(force) {
+        return;
+    }
     let h = my_heap();
     if h.is_null() {
         return; // heapless thread: nothing to collect

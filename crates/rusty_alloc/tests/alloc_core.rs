@@ -80,6 +80,18 @@ fn block_reuse_same_size_class() {
     // Pin the page with a live block: since M8, a page whose last block is
     // freed is RETIRED (its span returns to the segment), so an unpinned page
     // legitimately never hands the same address back.
+    //
+    // Under `ra_shared_light_heap` a light thread is promoted to its own heap
+    // the first time it finds the shared lock contended, which other tests in
+    // this binary can cause at any moment; its later allocations then come
+    // from a different heap and `p1` is recycled there, not here (2 runs in
+    // 60 observed it). This test is about ONE heap's free lists, so give the
+    // thread its heap first: a request this size always promotes.
+    #[cfg(ra_shared_light_heap)]
+    // SAFETY: a live block, freed once.
+    unsafe {
+        free(malloc(1 << 20))
+    };
     let pin = malloc(64);
     let p1 = malloc(64);
     // SAFETY: live then freed once.

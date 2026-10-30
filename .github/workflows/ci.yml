@@ -62,6 +62,19 @@ jobs:
           done
       - name: test (all features)
         run: cargo test --workspace --all-features
+      # The shared light heap prototype (docs/plans/shared-light-heap.md) is a
+      # cfg, so no step above builds it. Its gates are tests/shared_light_heap.rs;
+      # the rest of the suite must also pass with it on, in both geometries.
+      - name: test + clippy (shared light heap)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for flags in "" "--cfg ra_small_profile"; do
+            echo "::group::--cfg ra_shared_light_heap $flags"
+            RUSTFLAGS="--cfg ra_shared_light_heap $flags" cargo test -p rusty_alloc -p rusty_alloc-api
+            RUSTFLAGS="--cfg ra_shared_light_heap $flags" cargo clippy -p rusty_alloc --all-targets -- -D warnings
+            echo "::endgroup::"
+          done
 
   # H-06/H-08/H-09: the supply-chain gate — policy (deny) + advisories (audit)
   # on every PR, tools version-pinned so the gate itself is reproducible.
