@@ -25,8 +25,32 @@ static PAGE_SIZE: AtomicUsize = AtomicUsize::new(0);
 static ALLOC_GRANULARITY: AtomicUsize = AtomicUsize::new(0);
 static LARGE_PAGE_SIZE: AtomicUsize = AtomicUsize::new(usize::MAX); // MAX = uninit (0 is a valid value)
 
+/// Whether this build's segment slice can be served by an OS page of `page`
+/// bytes. A slice must be a whole number of OS pages: pages are committed,
+/// purged and protected one slice at a time, and the large path hands out
+/// exact slices, so `usable_size >= good_size` holds only while a slice is at
+/// least a page (`types::SEGMENT_SLICE_SIZE`).
+const fn slice_fits_os_page(page: usize) -> bool {
+    page != 0 && crate::types::SEGMENT_SLICE_SIZE.is_multiple_of(page)
+}
+
 fn config_init() {
     let cfg = prim::mem_init();
+    // The default 64 KiB slice fits every OS page size in use. The small
+    // profile's 4 KiB slice does not fit a 16 KiB (Apple Silicon, some arm64
+    // Linux) or 64 KiB (some arm64 / ppc64 Linux) kernel, and nothing else
+    // would notice: the slice arithmetic would quietly hand out memory the OS
+    // cannot map at that granularity. Refuse loudly, once, before the first
+    // segment exists.
+    if !slice_fits_os_page(cfg.page_size) {
+        crate::options::out_fmt(if cfg!(ra_small_profile) {
+            "rusty_alloc: the OS page size is larger than this build's 4 KiB \
+             segment slice; build without --cfg ra_small_profile for this kernel\n"
+        } else {
+            "rusty_alloc: the OS page size does not divide this build's segment slice\n"
+        });
+        crate::abort();
+    }
     // Benign race: idempotent stores of identical values.
     PAGE_SIZE.store(cfg.page_size, Ordering::Relaxed);
     ALLOC_GRANULARITY.store(cfg.alloc_granularity, Ordering::Relaxed);
@@ -287,4 +311,33 @@ pub unsafe fn purge(ptr: *mut u8, size: usize, purge_decommits: bool) -> Result<
 pub unsafe fn protect(ptr: *mut u8, size: usize, on: bool) -> Result<(), PrimError> {
     // SAFETY: forwarded contract.
     unsafe { prim::protect(ptr, page_align_up(size), on) }
+}
+
+#[cfg(test)]
+mod slice_page_tests {
+    use super::slice_fits_os_page;
+    use crate::types::SEGMENT_SLICE_SIZE;
+
+    #[test]
+    fn the_running_os_page_fits() {
+        assert!(slice_fits_os_page(super::page_size()));
+    }
+
+    /// The case the guard exists for: a 4 KiB small-profile slice on a 16 or
+    /// 64 KiB-page kernel. The default 64 KiB slice takes every one of them.
+    #[test]
+    fn a_page_larger_than_the_slice_is_refused() {
+        assert!(slice_fits_os_page(4096));
+        assert!(slice_fits_os_page(SEGMENT_SLICE_SIZE));
+        assert!(!slice_fits_os_page(SEGMENT_SLICE_SIZE * 2));
+        assert!(!slice_fits_os_page(0));
+        assert_eq!(
+            slice_fits_os_page(16 * 1024),
+            SEGMENT_SLICE_SIZE >= 16 * 1024
+        );
+        assert_eq!(
+            slice_fits_os_page(64 * 1024),
+            SEGMENT_SLICE_SIZE >= 64 * 1024
+        );
+    }
 }
