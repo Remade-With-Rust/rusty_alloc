@@ -389,10 +389,19 @@ suite asserts the allocator *aborts* on a poisoned free list.
 mimalloc. A span or chunk re-used inside that window is never purged, so a
 loop that frees and re-allocates a buffer runs at the speed of no purging at
 all (WSL2, per iteration: 1 MiB 0.76 us, 64 MiB 206 us, where glibc maps and
-unmaps the 64 MiB buffer at 17.7 ms). Purges run as the allocator works: on
-later frees in the same segment and on its periodic collect, so an idle
-thread purges at its next allocation, its exit or an explicit `collect`
-(a forced `collect` purges everything pending at once). Set
+unmaps the 64 MiB buffer at 17.7 ms). There is no purge thread: purges run
+as the allocator works, on later frees in the same segment and on the
+heap's periodic collect (every `generic_collect` = 10,000 slow-path
+allocations), and a forced `collect` purges everything pending at once.
+So memory a thread frees and then leaves idle is purged only when that
+thread allocates enough again, exits, or calls `collect(true)`. A daemon
+that frees during setup and then parks in an event loop keeps it for good:
+call `collect(true)` before entering the loop, or set `purge_delay` to `0`.
+Neither reaches the free slots of a page that still holds a live block: a
+512 KiB medium page (8-64 KiB requests) pinned by one long-lived object
+keeps every slot it ever used resident whatever the purge settings
+(`docs/plans/free-slot-purge.md`).
+Set
 `RUSTY_ALLOC_PURGE_DELAY` (or `MIMALLOC_PURGE_DELAY`) to `0` to purge as soon
 as memory is free, or to `-1` to keep freed memory resident for the fastest
 re-use, or call `options::set(15, ..)` before the first allocation.
