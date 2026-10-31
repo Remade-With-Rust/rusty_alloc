@@ -14,8 +14,11 @@
 //!   the left neighbor of any span is found by one follow-back.
 //! - Free spans link through `next`/`prev` into `Segment::free_spans`.
 //!
-//! Eager commit (the oracle's default); decommit/purge of free spans is the
-//! purge policy work of M7.
+//! Commit: a Normal segment on Windows or Unix commits its slices as the
+//! bump cursor reaches them ([`LAZY_COMMIT`], `Segment::commit_end`); Huge
+//! segments, and every segment on targets whose commit is a no-op, are
+//! committed when reserved. Decommit/purge of free spans is the purge policy
+//! work of M7.
 
 use core::ptr;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -45,6 +48,13 @@ pub struct Segment {
     pub total_size: usize,
     /// Bump cursor: slices at/after this index have never been carved.
     pub next_free_slice: u32,
+    /// Slices below this index are committed, apart from free spans flagged
+    /// `purged`; slices at/after it are reserved only. Always
+    /// `>= next_free_slice`, because only the bump cursor advances into new
+    /// slices ([`span_alloc`] commits ahead of it) and freed spans never
+    /// rejoin the frontier. `SLICES_PER_SEGMENT` for a segment committed when
+    /// it was reserved.
+    pub commit_end: u32,
     /// Live pages carved from this segment.
     pub used_pages: u32,
     /// Owning thread id (`prim::thread_id`); 0 = abandoned. Gates the
@@ -108,6 +118,28 @@ const _: () = assert!(
     core::mem::size_of::<Segment>() <= SEGMENT_SLICE_SIZE,
     "segment header must fit in slice 0"
 );
+
+/// Normal segments commit their slices on demand instead of all 32 MiB when
+/// reserved.
+///
+/// Measured on Windows before this (2.3.1, threads that each allocate 100
+/// bytes and wait): commit charge 33 MiB with no extra thread, 65 with one,
+/// 162 with four, 547 with sixteen, every one with a 4 MiB working set. Each
+/// thread's first allocation claims a segment, and each segment charged its
+/// whole 32 MiB. Linux charges `Committed_AS` the same way under
+/// `overcommit_memory = 2` (`MAP_NORESERVE` is ignored there).
+///
+/// Only where commit is a real OS call: the fixed-region, wasm and miri prims
+/// commit nothing, and a small-profile segment (64 KiB) is too small for the
+/// syscalls to buy anything.
+pub const LAZY_COMMIT: bool =
+    cfg!(all(any(windows, unix), not(miri))) && !crate::FIXED_REGION && SEGMENT_SIZE >= 4 << 20;
+
+/// The most a frontier commit extends `commit_end` past what it must: commits
+/// double from the header up to this step, so a full segment costs about a
+/// dozen commit calls and the committed-but-uncarved tail stays under
+/// max(the carved size, 4 MiB).
+const COMMIT_STEP_MAX_SLICES: usize = (4 << 20) / SEGMENT_SLICE_SIZE;
 
 /// Slices reserved for the header.
 pub const HEADER_SLICES: usize = 1;
@@ -193,9 +225,13 @@ pub fn segment_of(p: *mut u8) -> *mut Segment {
 /// round of `want`, not the chunk round. This is where the segment tax
 /// dies: a 33 MiB huge block reserves 33.06 MiB instead of 64 MiB, and on
 /// free every slice of it becomes serviceable again.
-fn reserve_backing(want: usize) -> Result<(*mut u8, usize, bool), PrimError> {
+///
+/// `commit = false` reserves without committing (native only; wasm memory is
+/// always committed).
+fn reserve_backing(want: usize, commit: bool) -> Result<(*mut u8, usize, bool), PrimError> {
     #[cfg(all(target_arch = "wasm32", not(miri)))]
     {
+        let _ = commit;
         let size = os::page_align_up(want); // wasm page == slice == 64 KiB
         debug_assert!(size.is_multiple_of(SEGMENT_SLICE_SIZE));
         if let Some(addr) = crate::slice_pool::alloc_run(size / SEGMENT_SLICE_SIZE) {
@@ -208,7 +244,7 @@ fn reserve_backing(want: usize) -> Result<(*mut u8, usize, bool), PrimError> {
     }
     #[cfg(not(all(target_arch = "wasm32", not(miri))))]
     {
-        let b = os::alloc_aligned(want, SEGMENT_SIZE, true, false)?;
+        let b = os::alloc_aligned(want, SEGMENT_SIZE, commit, false)?;
         Ok((b.ptr, b.size, b.is_zero))
     }
 }
@@ -411,19 +447,44 @@ unsafe fn scrub_recycled(seg: *mut Segment, slots: usize, owner_table: bool) {
 }
 
 /// Reserve a Normal segment — from an arena when one qualifies (respecting a
-/// heap's `arena_id` restriction), else eagerly-committed fresh OS memory —
-/// and register it in the segment map.
+/// heap's `arena_id` restriction), else fresh OS memory — and register it in
+/// the segment map. Under [`LAZY_COMMIT`] only the header is committed here.
 pub fn segment_alloc(arena_id: i32) -> Result<*mut Segment, PrimError> {
-    let (ptr_, size, mem_zero) = match crate::arena::chunk_alloc(arena_id) {
-        Some((p, zero)) => (p, SEGMENT_SIZE, zero),
+    let claim = if LAZY_COMMIT {
+        crate::arena::chunk_claim(arena_id)
+    } else {
+        crate::arena::chunk_alloc(arena_id).map(|(p, zero)| (p, zero, true))
+    };
+    let (ptr_, size, mem_zero, committed) = match claim {
+        Some((p, zero, committed)) => (p, SEGMENT_SIZE, zero, committed),
         None => {
             if arena_id >= 0 {
                 return Err(0); // exclusive-arena heap and its arena is full
             }
-            let (p, sz, zero) = reserve_backing(SEGMENT_SIZE)?;
-            (p, sz, zero)
+            let (p, sz, zero) = reserve_backing(SEGMENT_SIZE, !LAZY_COMMIT)?;
+            (p, sz, zero, !LAZY_COMMIT)
         }
     };
+    if !committed {
+        // The header is written next, so it is committed first. On refusal
+        // the memory goes back untouched: its chunk keeps a clear
+        // `committed` bit, a fresh reservation is released whole.
+        // SAFETY: the header slice lies inside the reservation just obtained.
+        if unsafe { os::commit(ptr_, HEADER_SLICES * SEGMENT_SLICE_SIZE) }.is_err() {
+            crate::stats::commit_failed();
+            if !crate::arena::chunk_free_marked(ptr_, false) {
+                let block = os::OsBlock {
+                    ptr: ptr_,
+                    size,
+                    is_large: false,
+                    is_zero: false,
+                };
+                // SAFETY: the reservation obtained above, never published.
+                let _ = unsafe { os::free(block) };
+            }
+            return Err(0);
+        }
+    }
     let seg: *mut Segment = ptr_.cast();
     // SAFETY: 32 MiB mapping (fresh or recycled arena chunk); header written
     // in full. A recycled chunk's stale bytes are all overwritten here and
@@ -439,6 +500,11 @@ pub fn segment_alloc(arena_id: i32) -> Result<*mut Segment, PrimError> {
         (*seg).kind = SegmentKind::Normal;
         (*seg).total_size = size;
         (*seg).next_free_slice = HEADER_SLICES as u32;
+        (*seg).commit_end = if committed {
+            SLICES_PER_SEGMENT
+        } else {
+            HEADER_SLICES
+        } as u32;
         (*seg).used_pages = 0;
         (*seg).thread_id = AtomicUsize::new(crate::init::thread_id());
         (*seg).mem_is_zero = mem_zero;
@@ -489,8 +555,21 @@ pub unsafe fn segment_free(seg: *mut Segment) -> Result<(), PrimError> {
     // SAFETY: seg is live per the contract; this only reads atomics.
     unsafe { wait_no_remote_in_flight(seg) };
     segment_map::unregister(seg);
+    if LAZY_COMMIT {
+        // Nothing to restore: guard pages live only in Huge segments, and
+        // purged or never-committed slices are recorded on the chunk instead
+        // of committed back, so the next tenant commits only what it carves.
+        // SAFETY: seg is live per the contract; reading its header.
+        let full = unsafe {
+            debug_assert!(!(*seg).guarded, "guard page in a Normal segment");
+            (*seg).commit_end as usize == SLICES_PER_SEGMENT && !(*seg).purged_any
+        };
+        if crate::arena::chunk_free_marked(seg.cast(), full) {
+            return Ok(());
+        }
+    }
     // SAFETY: seg is live and empty per the contract.
-    let usable = unsafe { restore_for_reuse(seg) };
+    let usable = LAZY_COMMIT || unsafe { restore_for_reuse(seg) };
     if !usable {
         // The memory could not be made accessible and committed again, so it
         // must not be re-tenanted. Outside an arena, releasing it to the OS
@@ -766,6 +845,11 @@ pub unsafe fn span_alloc(seg: *mut Segment, slices: usize) -> (*mut Page, bool) 
         if idx + slices > SLICES_PER_SEGMENT {
             return (ptr::null_mut(), false);
         }
+        // Commit ahead of the cursor before anything is carved. A refusal is
+        // a failed span, exactly as a refused re-commit above.
+        if idx + slices > (*seg).commit_end as usize && !commit_frontier(seg, idx + slices) {
+            return (ptr::null_mut(), false);
+        }
         // First carve of these slots in this tenancy: on a recycled chunk
         // they still hold the previous tenant's bytes (`scrub_recycled` left
         // them), and a stale `free_is_zero` or `xthread_free` would be read
@@ -961,6 +1045,37 @@ unsafe fn span_recommit(seg: *mut Segment, idx: usize, len: usize) -> bool {
     }
 }
 
+/// Commit `seg` up to at least slice `need` (`need > commit_end`): doubling
+/// the committed prefix, by at most [`COMMIT_STEP_MAX_SLICES`] beyond `need`,
+/// and falling back to exactly `need` if the OS refuses the larger range.
+/// Returns false, counted in [`crate::stats::commit_failures`], when even
+/// that is refused; `commit_end` is then unchanged.
+///
+/// # Safety
+/// `seg` is a live Normal segment under its owner; `need <= SLICES_PER_SEGMENT`.
+#[cold]
+unsafe fn commit_frontier(seg: *mut Segment, need: usize) -> bool {
+    // SAFETY: caller contract; every range lies inside the reservation.
+    unsafe {
+        let have = (*seg).commit_end as usize;
+        debug_assert!(need > have && need <= SLICES_PER_SEGMENT);
+        let want = need
+            .max(have + have.min(COMMIT_STEP_MAX_SLICES))
+            .min(SLICES_PER_SEGMENT);
+        let base = seg.cast::<u8>().add(have * SEGMENT_SLICE_SIZE);
+        let end = if os::commit(base, (want - have) * SEGMENT_SLICE_SIZE).is_ok() {
+            want
+        } else if want > need && os::commit(base, (need - have) * SEGMENT_SLICE_SIZE).is_ok() {
+            need
+        } else {
+            crate::stats::commit_failed();
+            return false;
+        };
+        (*seg).commit_end = end as u32;
+        true
+    }
+}
+
 /// Allocate a dedicated huge segment for one block of `size` bytes, placed so
 /// `(block + offset) % align == 0` (align ≤ SEGMENT_SIZE/2). Returns
 /// (segment, block ptr).
@@ -1027,7 +1142,7 @@ pub fn huge_alloc(
             if arena_id >= 0 {
                 return Err(0); // exclusive-arena heap and its arena is full
             }
-            let (p, sz, zero) = reserve_backing(want)?;
+            let (p, sz, zero) = reserve_backing(want, true)?;
             (p, sz, zero)
         }
     };
@@ -1054,6 +1169,7 @@ pub fn huge_alloc(
         (*seg).kind = SegmentKind::Huge;
         (*seg).total_size = b.size;
         (*seg).next_free_slice = SLICES_PER_SEGMENT as u32;
+        (*seg).commit_end = SLICES_PER_SEGMENT as u32;
         (*seg).used_pages = 1;
         (*seg).thread_id = AtomicUsize::new(crate::init::thread_id());
         (*seg).mem_is_zero = b.is_zero;
@@ -1411,5 +1527,144 @@ mod recommit_tests {
         merged_span_is_backed(a, ia, span);
         // SAFETY: live, freed once.
         unsafe { free(pin) };
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod lazy_commit_tests {
+    use super::*;
+    use crate::os::test_hooks::fail_next_commits;
+
+    /// One exclusive reserve-only arena of one chunk for these tests: the
+    /// arena table holds 32 per process and is never emptied.
+    fn arena() -> i32 {
+        static ID: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+        *ID.get_or_init(|| {
+            crate::arena::reserve_os_memory_ex(SEGMENT_SIZE, false, false, true)
+                .expect("32 MiB reserve-only arena")
+        })
+    }
+
+    /// Carve `slices` slices from `seg` and write every byte of them: on
+    /// Windows a reserved page faults on touch and on Linux a PROT_NONE one
+    /// does, so an uncommitted slice crashes the test here.
+    ///
+    /// # Safety
+    /// `seg` is a live Normal segment this test owns.
+    unsafe fn carve_and_touch(seg: *mut Segment, slices: usize) -> *mut Page {
+        // SAFETY: caller contract.
+        unsafe {
+            let (pg, _) = span_alloc(seg, slices);
+            assert!(!pg.is_null(), "span of {slices} slices refused");
+            ptr::write_bytes((*pg).area, 0xA5, slices * SEGMENT_SLICE_SIZE);
+            pg
+        }
+    }
+
+    /// A segment commits its header when claimed and then only what its bump
+    /// cursor reaches, doubling; it hands its chunk back marked uncommitted,
+    /// and a tenant that carved the whole segment hands it back committed.
+    #[test]
+    fn a_segment_commits_what_it_carves_and_its_chunk_remembers() {
+        if !LAZY_COMMIT {
+            return;
+        }
+        let _g = crate::arena::adopt_tests::lock();
+        let id = arena();
+        // SAFETY: segments from our own exclusive arena, used by this thread
+        // alone, freed empty.
+        unsafe {
+            let seg = segment_alloc(id).expect("segment from the arena");
+            assert_eq!(
+                (*seg).commit_end as usize,
+                HEADER_SLICES,
+                "claimed with more than its header"
+            );
+            let pg = carve_and_touch(seg, 3);
+            assert_eq!(
+                (*seg).commit_end,
+                4,
+                "the first carve commits max(need, double)"
+            );
+            let pg2 = carve_and_touch(seg, 1);
+            assert_eq!((*seg).commit_end, 8, "committed past need by doubling");
+            span_free(seg, pg);
+            span_free(seg, pg2);
+            segment_free(seg).expect("free");
+
+            let (p, _, committed) = crate::arena::chunk_claim(id).expect("the chunk came back");
+            assert_eq!(p, seg.cast(), "the arena has one chunk");
+            assert!(
+                !committed,
+                "a partly committed chunk came back marked committed"
+            );
+            assert!(crate::arena::chunk_free_marked(p, false));
+
+            // The whole segment, carved: the chunk returns committed in full,
+            // and the next tenant commits nothing.
+            let seg = segment_alloc(id).expect("second tenant");
+            let pg = carve_and_touch(seg, USABLE_SLICES);
+            assert_eq!((*seg).commit_end as usize, SLICES_PER_SEGMENT);
+            span_free(seg, pg);
+            segment_free(seg).expect("free");
+            let seg = segment_alloc(id).expect("third tenant");
+            assert_eq!(
+                (*seg).commit_end as usize,
+                SLICES_PER_SEGMENT,
+                "a fully committed chunk was committed again"
+            );
+            segment_free(seg).expect("free");
+            let (p, _, committed) = crate::arena::chunk_claim(id).expect("the chunk came back");
+            assert!(committed, "an untouched tenant lost the chunk's commit");
+            // Leave it uncommitted for the next test, as a fresh arena would be.
+            assert!(crate::arena::chunk_free_marked(p, false));
+        }
+    }
+
+    /// A refused frontier commit is a failed span: nothing is carved, the
+    /// committed prefix is unchanged, the failure is counted, and the next
+    /// attempt with commit available succeeds; a refused doubled range falls
+    /// back to exactly the slices needed.
+    #[test]
+    fn a_refused_frontier_commit_is_a_failed_span() {
+        if !LAZY_COMMIT {
+            return;
+        }
+        let _g = crate::arena::adopt_tests::lock();
+        let id = arena();
+        // SAFETY: as above.
+        unsafe {
+            let seg = segment_alloc(id).expect("segment from the arena");
+            let (cursor, end) = ((*seg).next_free_slice, (*seg).commit_end);
+            let failures = crate::stats::commit_failures();
+            fail_next_commits(2);
+            let (pg, _) = span_alloc(seg, 2);
+            fail_next_commits(0);
+            assert!(pg.is_null(), "a span was carved over uncommitted memory");
+            assert_eq!((*seg).next_free_slice, cursor, "the cursor moved");
+            assert_eq!((*seg).commit_end, end, "the committed prefix moved");
+            assert_eq!((*seg).used_pages, 0);
+            assert!(
+                crate::stats::commit_failures() > failures,
+                "the refusal was not counted"
+            );
+
+            // With commit available the span is carved. Then one refusal of
+            // a carve that would commit past its need (slices 2..4 for a
+            // need of 3): the doubled range fails, exactly `need` succeeds.
+            let pg = carve_and_touch(seg, 1);
+            assert_eq!((*seg).commit_end, 2);
+            fail_next_commits(1);
+            let pg2 = carve_and_touch(seg, 1);
+            fail_next_commits(0);
+            assert_eq!(
+                (*seg).commit_end,
+                3,
+                "the fallback commits exactly what is needed"
+            );
+            span_free(seg, pg);
+            span_free(seg, pg2);
+            segment_free(seg).expect("free");
+        }
     }
 }

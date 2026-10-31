@@ -65,11 +65,13 @@ pub struct Arena {
     pub numa_node: i32,
     used: [AtomicBitWord; MAX_CHUNKS / WORD_BITS],
     dirty: [AtomicBitWord; MAX_CHUNKS / WORD_BITS],
-    /// The chunk's memory is committed. Clear in a reserve-only arena until a
-    /// claim commits it (`commit_claimed`); set from the start for memory
-    /// that arrives committed. Never cleared: a segment re-commits any span
-    /// it purged before its chunk returns here (`Segment::purged_any`), so a
-    /// free chunk with its bit set is usable as-is.
+    /// The chunk's memory is committed in full. Clear in a reserve-only arena
+    /// until a claim commits it (`commit_claimed`); set from the start for
+    /// memory that arrives committed. A Normal segment claims its chunk
+    /// without committing it and commits its slices as it carves them, so it
+    /// returns the chunk with the bit cleared unless it ended fully committed
+    /// and unpurged ([`chunk_free_marked`]). A free chunk with its bit set is
+    /// usable as-is.
     committed: [AtomicBitWord; MAX_CHUNKS / WORD_BITS],
 }
 
@@ -358,10 +360,22 @@ fn reserve_default_arena_on_miss() -> bool {
     }
 }
 
-/// Allocate one chunk. `restrict_id >= 0` → only that arena; else any
-/// NON-exclusive arena (reserving the default arena on first miss). Returns
-/// (chunk ptr, chunk-is-zero).
+/// Allocate one chunk, committed. `restrict_id >= 0` → only that arena; else
+/// any NON-exclusive arena (reserving the default arena on first miss).
+/// Returns (chunk ptr, chunk-is-zero).
 pub fn chunk_alloc(restrict_id: i32) -> Option<(*mut u8, bool)> {
+    chunk_alloc_ex(restrict_id, true).map(|(p, zero, _)| (p, zero))
+}
+
+/// Claim one chunk WITHOUT committing it, for a Normal segment, which commits
+/// its slices as it carves them (`segment::LAZY_COMMIT`). Returns (chunk ptr,
+/// chunk-is-zero, chunk-is-committed-in-full); the caller commits whatever it
+/// touches unless the last is true.
+pub fn chunk_claim(restrict_id: i32) -> Option<(*mut u8, bool, bool)> {
+    chunk_alloc_ex(restrict_id, false)
+}
+
+fn chunk_alloc_ex(restrict_id: i32, commit: bool) -> Option<(*mut u8, bool, bool)> {
     // No arenas on a one-region target: every segment comes straight from the
     // region. Folding this here is what removes the registry scan from the
     // segment-allocation path on a chip.
@@ -371,7 +385,7 @@ pub fn chunk_alloc(restrict_id: i32) -> Option<(*mut u8, bool)> {
     if restrict_id < 0 && crate::options::is_enabled(27) {
         return None; // disallow_arena_alloc
     }
-    match chunk_alloc_inner(restrict_id) {
+    match chunk_alloc_inner(restrict_id, commit) {
         Ok(Some(r)) => return Some(r),
         // The OS refused to commit a claimed chunk. Another reservation would
         // be refused the same way at its first claim, so stop here rather
@@ -384,14 +398,17 @@ pub fn chunk_alloc(restrict_id: i32) -> Option<(*mut u8, bool)> {
     if restrict_id >= 0 || !reserve_default_arena_on_miss() {
         return None;
     }
-    chunk_alloc_inner(restrict_id).ok().flatten()
+    chunk_alloc_inner(restrict_id, commit).ok().flatten()
 }
 
 /// A claimed chunk could not be committed; the claim was released.
 struct CommitRefused;
 
 #[allow(clippy::needless_range_loop)] // indexed scan over a fixed atomic table
-fn chunk_alloc_inner(restrict_id: i32) -> Result<Option<(*mut u8, bool)>, CommitRefused> {
+fn chunk_alloc_inner(
+    restrict_id: i32,
+    commit: bool,
+) -> Result<Option<(*mut u8, bool, bool)>, CommitRefused> {
     let n = ARENA_COUNT.load(Ordering::Acquire).min(MAX_ARENAS);
     for id in 0..n {
         if restrict_id >= 0 && id != restrict_id as usize {
@@ -440,13 +457,18 @@ fn chunk_alloc_inner(restrict_id: i32) -> Result<Option<(*mut u8, bool)>, Commit
                     let idx = w * WORD_BITS + bit;
                     // Before the dirty bit: a refused commit leaves the chunk
                     // untouched, and still zero.
-                    if !commit_claimed(a, idx, 1) {
-                        return Err(CommitRefused);
-                    }
+                    let committed = if commit {
+                        if !commit_claimed(a, idx, 1) {
+                            return Err(CommitRefused);
+                        }
+                        true
+                    } else {
+                        (*a).committed[w].load(Ordering::Acquire) & (1 << bit) != 0
+                    };
                     let was_dirty =
                         (*a).dirty[w].fetch_or(1 << bit, Ordering::AcqRel) & (1 << bit) != 0;
                     let p = (*a).base.add(idx * SEGMENT_SIZE);
-                    return Ok(Some((p, !was_dirty)));
+                    return Ok(Some((p, !was_dirty, committed)));
                 }
             }
         }
@@ -685,9 +707,8 @@ pub fn chunk_free_n(p: *mut u8, n: usize) -> bool {
 /// [`chunk_free`] answers as a side effect, asked without freeing anything.
 ///
 /// A segment whose memory cannot be made usable again must not be returned
-/// to its arena (a chunk is committed once, at reservation or at its first
-/// claim, and handed out as-is after that), and a chunk inside an arena's
-/// reservation cannot be released
+/// to its arena (a chunk whose `committed` bit is set is handed out as-is),
+/// and a chunk inside an arena's reservation cannot be released
 /// to the OS on its own either. Such a segment is retired in place, and this
 /// is how the release path tells the two cases apart.
 pub fn owns(p: *const u8) -> bool {
@@ -696,6 +717,33 @@ pub fn owns(p: *const u8) -> bool {
 
 /// Return a chunk to its arena. True when the address belonged to one.
 pub fn chunk_free(p: *mut u8) -> bool {
+    chunk_free_n(p, 1)
+}
+
+/// Return a chunk claimed with [`chunk_claim`], recording whether its memory
+/// is now committed in full. A false `fully_committed` clears the chunk's
+/// `committed` bit, so the next tenant commits what it touches instead of
+/// trusting memory that was never committed or was decommitted. True when
+/// the address belonged to an arena.
+pub fn chunk_free_marked(p: *mut u8, fully_committed: bool) -> bool {
+    let Some((a, off, chunks)) = find_arena(p.addr()) else {
+        return false;
+    };
+    if !off.is_multiple_of(SEGMENT_SIZE) || off / SEGMENT_SIZE >= chunks {
+        return false;
+    }
+    let j = off / SEGMENT_SIZE;
+    // SAFETY: live descriptor; `j` is one of its live chunks, still claimed
+    // by the caller, so no other thread reads or writes its bit until the
+    // `used` release in `chunk_free_n` publishes it.
+    unsafe {
+        let w = &(*a).committed[j / WORD_BITS];
+        if fully_committed {
+            w.fetch_or(1 << (j % WORD_BITS), Ordering::AcqRel);
+        } else {
+            w.fetch_and(!(1 << (j % WORD_BITS)), Ordering::AcqRel);
+        }
+    }
     chunk_free_n(p, 1)
 }
 

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A thread no longer costs 32 MiB of commit.** Every segment committed its
+  whole 32 MiB when it was claimed, and each thread's first allocation claims
+  one, so on Windows the commit charge grew by 32 MiB per live thread however
+  little it allocated (measured, threads that allocate 100 bytes and wait:
+  33 / 65 / 162 / 547 MiB for 0 / 1 / 4 / 16 threads, with a 4 MiB working
+  set). Segments now commit their slices as they carve them, doubling from
+  the header to steps of at most 4 MiB, and return their chunk to the arena
+  marked uncommitted unless they ended fully committed; the same threads now
+  charge 2 / 2 / 3 / 5 MiB, and 64 threads 14 MiB. Linux under
+  `overcommit_memory = 2` charges `Committed_AS` the same way. A refused
+  commit is a failed span, as a refused re-commit already was. Off on targets
+  whose commit is a no-op (fixed region, wasm) and in the small profile.
+
 ## [2.3.1](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.3.0...rusty_alloc-v2.3.1) - 2026-10-31
 
 ### Fixed
