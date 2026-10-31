@@ -17,7 +17,7 @@
 //! |---|---|
 //! | `show_errors` (0) | print error codes to stderr when no error hook is registered |
 //! | `purge_decommits` (5) | purge by decommit (on) or by reset (off) |
-//! | `purge_delay` (15) | milliseconds a freed span of at least `MEDIUM_PAGE_SLICES` slices stays resident before it is purged: `0` purges at once, `> 0` purges once the span's segment deadline passes (checked on the segment's later span frees and on each collect; a forced collect purges at once), `< 0` (default) never purges. |
+//! | `purge_delay` (15) | milliseconds a freed span of at least `MEDIUM_PAGE_SLICES` slices, or a chunk returned to an arena, stays resident before it is purged: `> 0` (default 10 on Windows and Unix, as upstream) purges once it has stayed free that long (checked on the segment's later span frees and on each collect; a forced collect purges at once), `0` purges at once, `< 0` never purges (the default where purging is a no-op). |
 //! | `arena_reserve` (23) | size of the arena reservation (KiB) |
 //! | `disallow_arena_alloc` (27) | never place segments in the arena |
 //! | `guarded_min` / `guarded_max` (30, 31) | size bounds for guard-page sampling |
@@ -362,6 +362,22 @@ pub const OPTION_NAMES: [&str; OPTION_COUNT] = [
     "allow_thp",
 ];
 
+/// `purge_delay`'s default: upstream's 10 ms wherever a purge returns memory
+/// to an OS, and off where it is a no-op (the fixed-region and wasm prims;
+/// miri's mock).
+///
+/// It shipped at -1 from v1 on, first because purging widened the state
+/// space while the M8 defect was open (closed in M8b), then because the
+/// option was sign-only: `0` purged every freed span as it was freed, which
+/// made a loop over a 1 MiB buffer 300x slower. With a real delay a span or
+/// chunk is purged only once it has stayed free for 10 ms, and the same loops
+/// run at the speed of purging off (`docs/plans/free-slot-purge.md`).
+const PURGE_DELAY_DEFAULT: i64 = if cfg!(all(any(windows, unix), not(miri))) {
+    10
+} else {
+    -1
+};
+
 const DEFAULTS: [i64; OPTION_COUNT] = [
     0,  // show_errors
     0,  // show_stats
@@ -379,23 +395,23 @@ const DEFAULTS: [i64; OPTION_COUNT] = [
     0,
     0,
     0,
-    1,         // deprecated x3 / abandoned_page_purge(1)
-    1,         // eager_commit_delay
-    -1,        // purge_delay: v1 ships purging OPT-IN (see LEDGER M8 open defect)
-    0,         // use_numa_nodes
-    0,         // disallow_os_alloc
-    100,       // os_tag
-    32,        // max_errors
-    32,        // max_warnings
-    10,        // max_segment_reclaim (%)
-    0,         // destroy_on_exit
-    1_048_576, // arena_reserve (KiB = 1 GiB)
-    10,        // arena_purge_mult
-    1,         // purge_extend_delay
-    1,         // abandoned_reclaim_on_free
-    0,         // disallow_arena_alloc
-    400,       // retry_on_oom (ms)
-    0,         // visit_abandoned
+    1,                   // deprecated x3 / abandoned_page_purge(1)
+    1,                   // eager_commit_delay
+    PURGE_DELAY_DEFAULT, // purge_delay (ms)
+    0,                   // use_numa_nodes
+    0,                   // disallow_os_alloc
+    100,                 // os_tag
+    32,                  // max_errors
+    32,                  // max_warnings
+    10,                  // max_segment_reclaim (%)
+    0,                   // destroy_on_exit
+    1_048_576,           // arena_reserve (KiB = 1 GiB)
+    10,                  // arena_purge_mult
+    1,                   // purge_extend_delay
+    1,                   // abandoned_reclaim_on_free
+    0,                   // disallow_arena_alloc
+    400,                 // retry_on_oom (ms)
+    0,                   // visit_abandoned
     0,
     0,
     0,                       // guarded_min/max/precise

@@ -164,8 +164,14 @@ fn heaps_arenas_subprocs_options() {
     unsafe { alloc::free(leaked as *mut u8) };
 
     // --- options + stats smoke ---------------------------------------------
-    // v1 default: purging is opt-in (-1) pending the M8 open defect.
-    assert_eq!(options::get(15), -1, "purge_delay default");
+    // Purging is on by default where a purge returns memory: upstream's
+    // 10 ms delay (options::PURGE_DELAY_DEFAULT).
+    let want = if cfg!(all(any(windows, unix), not(miri))) {
+        10
+    } else {
+        -1
+    };
+    assert_eq!(options::get(15), want, "purge_delay default");
     options::set(15, 0);
     assert_eq!(options::get(15), 0);
     assert!(

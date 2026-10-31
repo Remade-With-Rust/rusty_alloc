@@ -384,16 +384,18 @@ suite asserts the allocator *aborts* on a poisoned free list.
 **Portability** — x86-64 and aarch64, Linux, macOS and Windows, plus
 `wasm32-unknown-unknown` via `memory.grow`.
 
-**Memory** — freed memory stays mapped and committed by default, as it does
-in upstream mimalloc: `purge_delay` ships at `-1`, so a process that once held
-a large peak keeps reading near that peak in `RSS` / working set afterwards
-(a consumer measured 461 MB retained after freeing 456 MB of huge blocks,
-where the Windows heap fell back to 4 MB — and mimalloc read the same 461 MB).
-That is the trade that makes re-use fast. To hand freed spans back, set
-`RUSTY_ALLOC_PURGE_DELAY` (or `MIMALLOC_PURGE_DELAY`) to `0`, or call
-`options::set(15, 0)` before the first allocation. Only the sign is read:
-any value `>= 0` purges a freed span as soon as it is free, and there is no
-delayed purge.
+**Memory** — freed memory goes back to the OS once it has stayed free for
+`purge_delay` milliseconds: 10 by default on Windows and Unix, as in upstream
+mimalloc. A span or chunk re-used inside that window is never purged, so a
+loop that frees and re-allocates a buffer runs at the speed of no purging at
+all (WSL2, per iteration: 1 MiB 0.76 us, 64 MiB 206 us, where glibc maps and
+unmaps the 64 MiB buffer at 17.7 ms). Purges run as the allocator works: on
+later frees in the same segment and on its periodic collect, so an idle
+thread purges at its next allocation, its exit or an explicit `collect`
+(a forced `collect` purges everything pending at once). Set
+`RUSTY_ALLOC_PURGE_DELAY` (or `MIMALLOC_PURGE_DELAY`) to `0` to purge as soon
+as memory is free, or to `-1` to keep freed memory resident for the fastest
+re-use, or call `options::set(15, ..)` before the first allocation.
 
 **Options** — every mimalloc option name and index is accepted (they are
 ABI), but only ten change behaviour: `show_errors`, `purge_decommits`,

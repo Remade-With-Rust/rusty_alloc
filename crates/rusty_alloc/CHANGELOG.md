@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Purging is on by default: `purge_delay` defaults to 10 ms on Windows and
+  Unix**, upstream's value, instead of -1. Freed spans of 512 KiB or more
+  and chunks returned to an arena go back to the OS once they have stayed
+  free for 10 ms, so a process that once held a large peak no longer keeps
+  reading near it. Re-use inside the window is unaffected (WSL2, a loop
+  that frees and re-allocates a buffer, per iteration: 1 MiB 0.76 us, 8 MiB
+  6.7 us, 64 MiB 206 us, against 0.69 / 6.9 / 300 us with purging off); on
+  perl, sqlite and lua the cost is at most 0.012 % of instructions and 0-4
+  syscalls. Set `purge_delay` to `-1` for the old behaviour or `0` to purge
+  at once. The fixed-region and wasm targets, where a purge returns nothing,
+  keep -1.
 - **`purge_delay` is a delay now**, in milliseconds as upstream's is. It was
   sign-only: any value `>= 0` purged a freed span of 512 KiB or more the
   moment it was freed (and turned the large-span cache off), so a loop that
@@ -19,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   segment's later span frees and on every collect (a forced `collect` purges
   at once). With `purge_delay = 10` the same loops run at 0.67 and 6.48 us,
   the speed of purging off, with no extra faults. `0` still purges at once
-  and `< 0` (the default) never purges.
+  and `< 0` never purges.
 - **Under a positive `purge_delay`, chunks go back to the arena pending, not
   purged.** A freed huge block's chunks, and an emptied segment's chunk,
   were purged as they went back, so a loop that frees and re-allocates a

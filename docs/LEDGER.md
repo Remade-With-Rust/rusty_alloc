@@ -4,6 +4,31 @@ One entry per milestone/brick: what landed, the numbers with their method lines,
 what was reverted and **which kind** of revert (measured-worse vs within-noise).
 Newest first.
 
+## PURGING ON BY DEFAULT — `purge_delay` becomes a delay, 10 ms (2026-10-31)
+
+Purging shipped opt-in (`purge_delay = -1`) since M8, first while the M8
+defect was open (closed in M8b), then because the option was sign-only:
+`0` purged each freed span of 512 KiB or more as it was freed. The planned
+flip to `0` was measured first and refused (`bigloop.c`, WSL2, a loop that
+allocates, touches every page and frees, per iteration):
+
+| buffer | off | `0` (sign-only) | glibc |
+|---|---|---|---|
+| 1 MiB | 0.69 us | 214 us (1.02 M faults) | 0.80 us |
+| 8 MiB | 6.9 us | 1,979 us | 7.2 us |
+| 64 MiB | 300 us | 17,545 us | 17,735 us |
+
+The lua/perl/sqlite cost run done for the same decision had missed it: none
+of them churns a large buffer. Built instead, in three commits: a free span
+records when it was freed (in its slot's `capacity`, so `Page` stays 88
+bytes) and is purged only once free for the whole delay, on its segment's
+later frees and on every collect; chunks returned to an arena (huge blocks,
+emptied segments) wait the same way (`arena::purge_due`); then the default
+became 10 on Windows and Unix. Under 10 the loops run at 0.76 / 6.7 / 206 us.
+perl, sqlite, lua: +911 / +1,896 / +118,125 Ir (at most 0.012 %), 0-4 more
+madvise/mprotect calls, peak RSS 0-192 KiB lower. `0` and `-1` keep their
+meanings for the consumers who set them (rusty_WRT, the MATA app).
+
 ## DOWNSTREAM CORPUS — real consumers on this tree after four curiosity rounds (2026-09-25)
 
 Every consumer below built against THIS working tree, verified per row from
