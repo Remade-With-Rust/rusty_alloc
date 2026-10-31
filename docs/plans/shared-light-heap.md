@@ -135,7 +135,26 @@ The single-threaded daemons paid for the shared heap and then for their own
 heap after promoting, which cancelled the multi-threaded win. That is what
 the first-thread rule removes: re-measured, single-threaded perl and sqlite
 are within 200 Ir of the flag-off build (−181 and −196 on 772 M and 316 M).
-The census has not been re-run with the rule yet.
+
+**Census re-run with the rule** (three arms, two alternating boots each,
+every arm extracted with `git archive` and built with
+`-C relocation-model=static`; Anonymous PSS KiB except the system row, which
+is total PSS). rusty_WRT changed between the two censuses (procd no longer
+reads `/sbin/ujail` whole, and odhcpd's baseline moved for a reason on their
+side that shows in every arm alike), so compare these arms with each other,
+not with the table above:
+
+| daemon | threads | off @`f782f94` | on @`2122d4e` | on @`f782f94` | on @`f782f94` − off |
+|---|---|---|---|---|---|
+| procd | 3 | 580 / 580 | 484 / 480 | 484 / 480 | −96 |
+| odhcpd | 1 | 432 / 436 | 524 / 524 | 436 / 432 | 0 |
+| logd | 1 | 136 / 136 | 164 / 168 | 136 / 136 | 0 |
+| dnsmasq | 1 | 108 / 112 | 112 / 112 | 112 / 112 | 0 to +4 |
+| system | | 7118 / 7109 | 7097 / 7079 | 7023 / 7018 | about −93 |
+
+The first-thread rule removes the single-threaded penalties completely
+(odhcpd +90 and logd +30 at `2122d4e`) and keeps procd's saving. The two
+boots of each arm agree to within 4 KiB.
 
 **Busy threads** (`bench/opscan.sh` method, Ir/op, flag on vs main): identical
 on 12 of 13 ops; `mixed` +0.01 Ir/op (0.01 %), consistent with the shared
@@ -172,7 +191,6 @@ test failed.
 
 - loom model of the shared lock + remote free into a `SHARED_TID` page.
 - Wall-clock contention on a quiet box (above).
-- rusty_WRT's boot census re-run with the first-thread rule.
 - Giving a promoted thread's shared pages back (or letting it adopt them):
   a busy SECOND thread still pays for pages in both heaps after it
   promotes, bounded by the 64 KiB it took while light.

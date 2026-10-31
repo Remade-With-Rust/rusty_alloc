@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.0](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.2.7...rusty_alloc-v2.3.0) - 2026-10-30
+
 ### Fixed
 
 - **A build whose segment slice is smaller than the OS page now refuses to
@@ -74,7 +76,10 @@ within +-0.4 %. Details: `docs/opps.md`, "Vein census 3".
   main thread, in practice) is never light, so a single-threaded process
   never touches the shared heap. On rusty_WRT's daemon shape it cut the
   per-thread floor from 100.5 to 46.5–58 KiB (glibc: 44), with busy-thread
-  and single-threaded instruction counts unchanged. Without the cfg the
+  and single-threaded instruction counts unchanged. In a whole-system
+  rusty_WRT boot it cut procd (3 threads) by 96 KiB of anonymous PSS, left
+  the single-threaded daemons unchanged, and lowered total PSS by about
+  93 KiB. Without the cfg the
   build's machine code is byte-identical to before. Adds the `shared_light`
   module (cfg-only).
 
