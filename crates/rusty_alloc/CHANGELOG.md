@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.3.1...rusty_alloc-v3.0.0) - 2026-10-31
+
+### Fixed
+
+- *(segment)* commit a guarded segment before lifting its guard
+- *(segment)* commit slices as the bump cursor carves them
+
 ### Fixed
 
 - **A thread no longer costs 32 MiB of commit.** Every segment committed its
