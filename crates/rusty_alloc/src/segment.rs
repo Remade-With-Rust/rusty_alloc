@@ -568,15 +568,11 @@ pub unsafe fn segment_free(seg: *mut Segment) -> Result<(), PrimError> {
     // SAFETY: seg is live per the contract; this only reads atomics.
     unsafe { wait_no_remote_in_flight(seg) };
     segment_map::unregister(seg);
-    // Under a positive `purge_delay` the dying segment's free span may still
-    // be waiting for its deadline. It must not go back to the arena resident:
-    // nothing would ever purge it there. Under `0` it was purged as it was
-    // freed; under `< 0` nothing is purged.
-    if crate::options::get(15) > 0 && crate::arena::owns(seg.cast()) {
-        // SAFETY: seg is live and empty per the contract, so its free-span
-        // list is stable and holds every slice.
-        unsafe { purge_free_spans(seg) };
-    }
+    // Under a positive `purge_delay` the chunk goes back resident and marked
+    // pending, so the arena purges it once it has stayed free for the delay
+    // and a segment claimed again inside the window refaults nothing. Under
+    // `0` its spans were purged as they were freed; under `< 0` nothing is.
+    let pending = crate::options::get(15) > 0;
     if LAZY_COMMIT {
         // Nothing to restore: guard pages live only in Huge segments, and
         // purged or never-committed slices are recorded on the chunk instead
@@ -586,7 +582,7 @@ pub unsafe fn segment_free(seg: *mut Segment) -> Result<(), PrimError> {
             debug_assert!(!(*seg).guarded, "guard page in a Normal segment");
             (*seg).commit_end as usize == SLICES_PER_SEGMENT && !(*seg).purged_any
         };
-        if crate::arena::chunk_free_marked(seg.cast(), full) {
+        if crate::arena::chunk_release(seg.cast(), 1, Some(full), pending) {
             return Ok(());
         }
     }
@@ -600,7 +596,7 @@ pub unsafe fn segment_free(seg: *mut Segment) -> Result<(), PrimError> {
         if crate::arena::owns(seg.cast()) {
             return Ok(());
         }
-    } else if crate::arena::chunk_free(seg.cast()) {
+    } else if crate::arena::chunk_release(seg.cast(), 1, None, pending) {
         return Ok(());
     }
     // wasm: the slice pool is the free list (F2) — `expose_provenance` so a
@@ -1440,7 +1436,13 @@ pub unsafe fn huge_free(seg: *mut Segment) -> Result<(), PrimError> {
         // re-commits it (checked since 2.2.3) and the next tenant gets
         // demand-zero pages, not a decommitted range. A segment outside an
         // arena is released whole below and needs none of this.
-        if chunked && crate::options::get(15) >= 0 && crate::arena::owns(seg.cast()) {
+        //
+        // That is under `purge_delay = 0`. A positive delay returns the
+        // chunks resident and pending instead, for the arena to purge once
+        // they have stayed free that long (`arena::purge_due`): a loop that
+        // frees and re-allocates a huge buffer then refaults nothing.
+        let delay = crate::options::get(15);
+        if chunked && delay == 0 && crate::arena::owns(seg.cast()) {
             let base = seg.cast::<u8>().add(HEADER_SLICES * SEGMENT_SLICE_SIZE);
             let bytes = (*seg).total_size - HEADER_SLICES * SEGMENT_SLICE_SIZE;
             if os::purge(base, bytes, crate::options::is_enabled(5)).is_ok() {
@@ -1453,7 +1455,12 @@ pub unsafe fn huge_free(seg: *mut Segment) -> Result<(), PrimError> {
                 if crate::arena::owns(seg.cast()) {
                     return Ok(());
                 }
-            } else if crate::arena::chunk_free_n(seg.cast(), (*seg).total_size / SEGMENT_SIZE) {
+            } else if crate::arena::chunk_release(
+                seg.cast(),
+                (*seg).total_size / SEGMENT_SIZE,
+                None,
+                delay > 0,
+            ) {
                 return Ok(());
             }
         }
@@ -2073,5 +2080,43 @@ mod purge_delay_tests {
         crate::options::set(15, -1);
         // SAFETY: live, freed once.
         unsafe { free(pin) };
+    }
+
+    /// The same loop for a huge buffer (a dedicated segment, released to the
+    /// arena on every free): under a delay its chunks go back pending and
+    /// resident, so 20 rounds purge nothing; a forced collect then purges
+    /// them through the arena pass.
+    #[test]
+    fn a_huge_buffer_loop_under_a_delay_never_purges_until_collected() {
+        use crate::alloc::{collect, free, malloc, stats};
+        let _g = crate::arena::adopt_tests::lock();
+        let size = crate::types::LARGE_OBJ_SIZE_MAX + SEGMENT_SIZE / 2;
+        crate::options::set(15, 10_000);
+        let before = stats().purges;
+        for i in 0..20u8 {
+            let p = malloc(size);
+            assert!(!p.is_null());
+            assert!(
+                crate::arena::owns(p),
+                "setup: the huge block is not arena memory"
+            );
+            // SAFETY: a live block of `size` bytes, freed once; one byte per
+            // OS page is enough to make it resident.
+            unsafe {
+                let mut o = 0;
+                while o < size {
+                    p.add(o).write(i);
+                    o += 4096;
+                }
+                free(p);
+            }
+        }
+        assert_eq!(stats().purges, before, "the huge loop purged under a delay");
+        collect(true);
+        assert!(
+            stats().purges > before,
+            "a forced collect did not purge the chunks"
+        );
+        crate::options::set(15, -1);
     }
 }

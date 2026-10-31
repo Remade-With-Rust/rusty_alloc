@@ -1683,6 +1683,9 @@ impl Heap {
                     }
                     s = (*s).next;
                 }
+                // Chunks returned to their arena pending (emptied segments,
+                // freed huge blocks).
+                self.stats.purges += crate::arena::purge_due(force) as u64;
             }
         }
     }

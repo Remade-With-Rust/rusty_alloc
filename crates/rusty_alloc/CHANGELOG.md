@@ -19,9 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   segment's later span frees and on every collect (a forced `collect` purges
   at once). With `purge_delay = 10` the same loops run at 0.67 and 6.48 us,
   the speed of purging off, with no extra faults. `0` still purges at once
-  and `< 0` (the default) never purges. An emptied segment purges before its
-  chunk goes back to the arena, so a delay never parks resident memory
-  there.
+  and `< 0` (the default) never purges.
+- **Under a positive `purge_delay`, chunks go back to the arena pending, not
+  purged.** A freed huge block's chunks, and an emptied segment's chunk,
+  were purged as they went back, so a loop that frees and re-allocates a
+  buffer above 32 MiB refaulted all of it on every iteration. They now go
+  back resident with the time they were freed, and the arena purges those
+  free for the whole delay on every collect (a forced `collect` purges them
+  at once). Each is claimed before it is purged, so no tenant receives a
+  chunk mid-purge, and a decommit marks it uncommitted for its next tenant.
 
 ### Fixed
 

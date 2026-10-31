@@ -73,6 +73,49 @@ pub struct Arena {
     /// and unpurged ([`chunk_free_marked`]). A free chunk with its bit set is
     /// usable as-is.
     committed: [AtomicBitWord; MAX_CHUNKS / WORD_BITS],
+    /// The chunk was returned under a positive `purge_delay` and is still
+    /// resident: [`purge_due`] purges it once it has stayed free for the
+    /// delay. A bit left set on a chunk that was claimed again is stale and
+    /// harmless: the pass skips chunks in use, and a purge of a free chunk is
+    /// always safe.
+    purge_pending: [AtomicBitWord; MAX_CHUNKS / WORD_BITS],
+    /// When each pending chunk was returned, in wrapping milliseconds of
+    /// `prim::clock_now` (as a free span's stamp in `segment`).
+    freed_ms: [AtomicU32; MAX_CHUNKS],
+    /// Wrapping milliseconds at which the earliest pending chunk falls due; 0
+    /// when none is pending.
+    purge_due_ms: AtomicU32,
+}
+
+/// Milliseconds of `prim::clock_now`, wrapping in `u32`, never 0 (0 marks
+/// "nothing pending" in [`Arena::purge_due_ms`]).
+fn now_ms() -> u32 {
+    ((crate::prim::clock_now() / 1_000_000) as u32).max(1)
+}
+
+/// The `purge_delay` option in milliseconds for the wrapping compares.
+fn delay_ms() -> u32 {
+    crate::options::get(15).clamp(0, i64::from(u32::MAX / 4)) as u32
+}
+
+/// Arm `a`'s deadline for `due` unless an earlier one is already armed.
+fn arm(a: &Arena, due: u32) {
+    let due = due.max(1);
+    let mut cur = a.purge_due_ms.load(Ordering::Acquire);
+    loop {
+        // "Earlier" in wrapping time: `due` is before `cur` when `cur - due`
+        // is a small forward distance.
+        if cur != 0 && cur.wrapping_sub(due) > u32::MAX / 2 {
+            return;
+        }
+        match a
+            .purge_due_ms
+            .compare_exchange_weak(cur, due, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => return,
+            Err(c) => cur = c,
+        }
+    }
 }
 
 /// Set bits `from..to` of a chunk bitmap.
@@ -674,6 +717,16 @@ fn find_arena(addr: usize) -> Option<(*mut Arena, usize, usize)> {
 
 /// Free `n` contiguous chunks. True when the address belonged to an arena.
 pub fn chunk_free_n(p: *mut u8, n: usize) -> bool {
+    chunk_release(p, n, None, false)
+}
+
+/// Return `n` chunks starting at `p` to their arena. `committed` records
+/// whether their memory is now committed in full (`None` leaves the bits as
+/// they are); `pending` returns them resident, for [`purge_due`] to purge
+/// once they have stayed free for `purge_delay` (a positive delay), instead
+/// of the caller purging them now. True when the address belonged to an
+/// arena.
+pub fn chunk_release(p: *mut u8, n: usize, committed: Option<bool>, pending: bool) -> bool {
     // Zero / overflowing `n` is false, not `start..start+n` OOB on the bitmap
     // (OH-rusty_alloc-25).
     if n == 0 {
@@ -694,13 +747,126 @@ pub fn chunk_free_n(p: *mut u8, n: usize) -> bool {
     if end > chunks {
         return false;
     }
-    // SAFETY: live descriptor; `start..end` lies inside its live chunks.
+    // SAFETY: live descriptor; `start..end` lies inside its live chunks,
+    // still claimed by the caller, so no other thread reads or writes their
+    // `committed` bits or stamps until the `used` release below publishes
+    // them.
     unsafe {
+        if let Some(full) = committed {
+            for j in start..end {
+                let w = &(*a).committed[j / WORD_BITS];
+                if full {
+                    w.fetch_or(1 << (j % WORD_BITS), Ordering::AcqRel);
+                } else {
+                    w.fetch_and(!(1 << (j % WORD_BITS)), Ordering::AcqRel);
+                }
+            }
+        }
+        if pending {
+            let now = now_ms();
+            for j in start..end {
+                (*a).freed_ms[j].store(now, Ordering::Relaxed);
+                (*a).purge_pending[j / WORD_BITS].fetch_or(1 << (j % WORD_BITS), Ordering::AcqRel);
+            }
+            arm(&*a, now.wrapping_add(delay_ms()));
+        }
         for j in start..end {
             (*a).used[j / WORD_BITS].fetch_and(!(1 << (j % WORD_BITS)), Ordering::AcqRel);
         }
     }
     true
+}
+
+/// Purge the chunks returned under a positive `purge_delay` that have stayed
+/// free for the whole delay, or all of them when `force` (a forced collect).
+/// Each is claimed through its `used` bit first, so no tenant can receive a
+/// chunk mid-purge; a chunk in use is skipped. A decommit clears the chunk's
+/// `committed` bit, so the next tenant commits what it touches. Returns how
+/// many chunks were purged.
+///
+/// While the pass holds a chunk, a concurrent `chunk_alloc` sees it used. If
+/// it was the last free chunk, that claim reserves another arena instead:
+/// address space only, and only in that window.
+#[allow(clippy::needless_range_loop)] // indexed scan over a fixed atomic table
+pub fn purge_due(force: bool) -> usize {
+    if crate::FIXED_REGION {
+        return 0;
+    }
+    let count = ARENA_COUNT.load(Ordering::Acquire).min(MAX_ARENAS);
+    let mut now = 0u32;
+    let mut purged = 0;
+    for id in 0..count {
+        let a = ARENAS[id].load(Ordering::Acquire);
+        if a.is_null() {
+            continue;
+        }
+        // SAFETY: arena descriptors are live for the process; every chunk
+        // touched is held through its `used` bit while it is touched.
+        unsafe {
+            let due = (*a).purge_due_ms.load(Ordering::Acquire);
+            if due == 0 {
+                continue;
+            }
+            if now == 0 {
+                now = now_ms();
+            }
+            if !force && due.wrapping_sub(now) < u32::MAX / 2 && due != now {
+                continue; // not yet due
+            }
+            // One pass per arena at a time: whoever clears the deadline runs
+            // it, and re-arms it for what is left.
+            if (*a)
+                .purge_due_ms
+                .compare_exchange(due, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+            let delay = delay_ms();
+            let decommits = crate::options::is_enabled(5); // purge_decommits
+            let chunks = (*a).chunks_live.load(Ordering::Acquire);
+            let mut next: Option<u32> = None;
+            for w in 0..chunks.div_ceil(WORD_BITS) {
+                let mut pend = (*a).purge_pending[w].load(Ordering::Acquire);
+                while pend != 0 {
+                    let bit = pend.trailing_zeros() as usize;
+                    pend &= pend - 1;
+                    let j = w * WORD_BITS + bit;
+                    let m: BitWord = 1 << bit;
+                    if !force {
+                        let age = now.wrapping_sub((*a).freed_ms[j].load(Ordering::Relaxed));
+                        if age < delay {
+                            let at = now.wrapping_add(delay - age);
+                            next = Some(next.map_or(at, |n: u32| {
+                                if at.wrapping_sub(n) > u32::MAX / 2 {
+                                    at
+                                } else {
+                                    n
+                                }
+                            }));
+                            continue;
+                        }
+                    }
+                    if (*a).used[w].fetch_or(m, Ordering::AcqRel) & m != 0 {
+                        continue; // in use: its tenant owns it now
+                    }
+                    let p = (*a).base.add(j * SEGMENT_SIZE);
+                    if os::purge(p, SEGMENT_SIZE, decommits).is_ok() {
+                        if decommits {
+                            (*a).committed[w].fetch_and(!m, Ordering::AcqRel);
+                        }
+                        purged += 1;
+                    }
+                    (*a).purge_pending[w].fetch_and(!m, Ordering::AcqRel);
+                    (*a).used[w].fetch_and(!m, Ordering::AcqRel);
+                }
+            }
+            if let Some(at) = next {
+                arm(&*a, at);
+            }
+        }
+    }
+    purged
 }
 
 /// Whether `p` lies inside any arena's live chunks — the question
@@ -726,25 +892,7 @@ pub fn chunk_free(p: *mut u8) -> bool {
 /// trusting memory that was never committed or was decommitted. True when
 /// the address belonged to an arena.
 pub fn chunk_free_marked(p: *mut u8, fully_committed: bool) -> bool {
-    let Some((a, off, chunks)) = find_arena(p.addr()) else {
-        return false;
-    };
-    if !off.is_multiple_of(SEGMENT_SIZE) || off / SEGMENT_SIZE >= chunks {
-        return false;
-    }
-    let j = off / SEGMENT_SIZE;
-    // SAFETY: live descriptor; `j` is one of its live chunks, still claimed
-    // by the caller, so no other thread reads or writes its bit until the
-    // `used` release in `chunk_free_n` publishes it.
-    unsafe {
-        let w = &(*a).committed[j / WORD_BITS];
-        if fully_committed {
-            w.fetch_or(1 << (j % WORD_BITS), Ordering::AcqRel);
-        } else {
-            w.fetch_and(!(1 << (j % WORD_BITS)), Ordering::AcqRel);
-        }
-    }
-    chunk_free_n(p, 1)
+    chunk_release(p, 1, Some(fully_committed), false)
 }
 
 /// Adopt an OS block that cannot be returned to the host, making its memory
@@ -1139,5 +1287,63 @@ mod commit_tests {
         let (p, zero) = chunk_alloc_n(id2, 2).expect("the released run is claimable");
         assert!(zero);
         assert!(chunk_free_n(p, 2));
+    }
+
+    fn is_pending(id: i32, p: *mut u8) -> bool {
+        let a = ARENAS[id as usize].load(Ordering::Acquire);
+        // SAFETY: live descriptor; `p` is one of its chunks.
+        unsafe {
+            let j = (p.addr() - (*a).base.addr()) / SEGMENT_SIZE;
+            (*a).purge_pending[j / WORD_BITS].load(Ordering::Acquire) & (1 << (j % WORD_BITS)) != 0
+        }
+    }
+
+    /// A chunk returned pending stays resident and committed until it has
+    /// been free for `purge_delay`; a forced pass purges it at once, and a
+    /// decommit leaves it marked uncommitted for its next tenant.
+    #[test]
+    fn a_pending_chunk_is_purged_after_the_delay_or_when_forced() {
+        // The tests that set the process-wide `purge_delay` share this lock.
+        let _g = adopt_tests::lock();
+        let id = reserve_os_memory_ex(SEGMENT_SIZE, true, false, true).expect("committed arena");
+        crate::options::set(15, 60_000);
+        let (p, _) = chunk_alloc(id).expect("claim");
+        // SAFETY: a claimed chunk of our own arena.
+        unsafe { p.write_bytes(0x5A, 4096) };
+        assert!(chunk_release(p, 1, None, true));
+        assert!(is_pending(id, p) && is_committed(id, p));
+        assert_eq!(
+            purge_due(false),
+            0,
+            "a pending chunk was purged before its delay"
+        );
+        assert!(is_pending(id, p));
+
+        // Forced: purged now. Decommit is the default `purge_decommits`.
+        assert!(
+            purge_due(true) >= 1,
+            "a forced pass did not purge the chunk"
+        );
+        assert!(!is_pending(id, p), "the purged chunk is still pending");
+        assert_eq!(
+            is_committed(id, p),
+            !crate::options::is_enabled(5),
+            "a decommitted chunk kept its committed bit"
+        );
+
+        // Due: freed under a 1 ms delay, purged by an unforced pass after it.
+        crate::options::set(15, 1);
+        let (q, _) = chunk_alloc(id).expect("re-claim");
+        assert_eq!(q, p, "the arena has one chunk");
+        // SAFETY: as above; `chunk_alloc` committed it again.
+        unsafe { q.write_bytes(0xA5, 4096) };
+        assert!(chunk_release(q, 1, None, true));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(
+            purge_due(false) >= 1,
+            "an expired pending chunk was not purged"
+        );
+        assert!(!is_pending(id, q));
+        crate::options::set(15, -1);
     }
 }
