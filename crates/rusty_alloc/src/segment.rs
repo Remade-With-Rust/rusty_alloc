@@ -68,6 +68,12 @@ pub struct Segment {
     /// the next tenant bump-allocates from it and would otherwise touch
     /// decommitted pages (Windows access violation — the M8 defect).
     pub purged_any: bool,
+    /// `prim::clock_now` deadline after which this segment's purge candidates
+    /// (free, unpurged spans of at least `MEDIUM_PAGE_SLICES` slices) are
+    /// purged; 0 = none scheduled. Set by the first candidate freed under a
+    /// positive `purge_delay`, cleared when the candidates are purged
+    /// ([`purge_scheduled`]).
+    pub purge_expire: u64,
     /// This segment carries a PROT_NONE guard page (guarded allocation). The
     /// protection MUST be lifted before the memory is recycled through an
     /// arena, or the next tenant faults on a page it legitimately owns —
@@ -509,6 +515,7 @@ pub fn segment_alloc(arena_id: i32) -> Result<*mut Segment, PrimError> {
         (*seg).thread_id = AtomicUsize::new(crate::init::thread_id());
         (*seg).mem_is_zero = mem_zero;
         (*seg).purged_any = false;
+        (*seg).purge_expire = 0;
         (*seg).guarded = false;
         (*seg).next = ptr::null_mut();
         (*seg).free_spans = ptr::null_mut();
@@ -561,6 +568,15 @@ pub unsafe fn segment_free(seg: *mut Segment) -> Result<(), PrimError> {
     // SAFETY: seg is live per the contract; this only reads atomics.
     unsafe { wait_no_remote_in_flight(seg) };
     segment_map::unregister(seg);
+    // Under a positive `purge_delay` the dying segment's free span may still
+    // be waiting for its deadline. It must not go back to the arena resident:
+    // nothing would ever purge it there. Under `0` it was purged as it was
+    // freed; under `< 0` nothing is purged.
+    if crate::options::get(15) > 0 && crate::arena::owns(seg.cast()) {
+        // SAFETY: seg is live and empty per the contract, so its free-span
+        // list is stable and holds every slice.
+        unsafe { purge_free_spans(seg) };
+    }
     if LAZY_COMMIT {
         // Nothing to restore: guard pages live only in Huge segments, and
         // purged or never-committed slices are recorded on the chunk instead
@@ -837,6 +853,8 @@ pub unsafe fn span_alloc(seg: *mut Segment, slices: usize) -> (*mut Page, bool) 
                 if len > slices {
                     // The remainder starts at a new slice: re-mark all of it.
                     span_mark_free(seg, idx + slices, len - slices, 1);
+                    // It has been free as long as the span it came from.
+                    (*seg).pages[idx + slices].capacity = (*s).capacity;
                 }
                 // The FRONT of a free span: its interiors already point here.
                 span_mark(seg, idx, slices, slices);
@@ -879,12 +897,14 @@ pub unsafe fn span_alloc(seg: *mut Segment, slices: usize) -> (*mut Page, bool) 
 /// (caught by the spans G1c gate, 2026-08-05).
 /// The page must already be unlinked from heap queues.
 ///
-/// Returns whether the freed span was purged back to the OS.
+/// Returns how many spans were purged back to the OS: the freed one under
+/// `purge_delay = 0`, or every due candidate when a positive delay had
+/// expired ([`schedule_purge`]).
 ///
 /// # Safety
 /// `page` must be a live span-start of `seg` with no live blocks, under the
 /// heap lock.
-pub unsafe fn span_free(seg: *mut Segment, page: *mut Page) -> bool {
+pub unsafe fn span_free(seg: *mut Segment, page: *mut Page) -> usize {
     // SAFETY: caller contract — seg is live under the owner.
     unsafe { debug_validate_segment(seg, "span_free:enter") };
     // SAFETY: heap lock held; boundary reads follow the span invariants.
@@ -964,23 +984,148 @@ pub unsafe fn span_free(seg: *mut Segment, page: *mut Page) -> bool {
         // Length FIRST: it is in a register, the option is a table load, a
         // bounds test and a sentinel test — and most freed spans are short, so
         // most frees never need the option at all.
-        if len >= crate::types::MEDIUM_PAGE_SLICES && crate::options::get(15) >= 0 {
+        //
+        // `purge_delay = 0` purges here. A positive delay only schedules: the
+        // span is purged once it has stayed free past the segment's deadline,
+        // so a span reused inside the window is never purged and refaulted.
+        // Purging at once turned a loop that frees and re-allocates a 1 MiB
+        // buffer from 0.7 to 207 us per iteration, every page refaulted
+        // (`docs/plans/free-slot-purge.md`).
+        let delay = if len >= crate::types::MEDIUM_PAGE_SLICES {
+            crate::options::get(15)
+        } else {
+            -1
+        };
+        if delay == 0 {
             let area = page_area(seg, idx);
             let bytes = len * SEGMENT_SLICE_SIZE;
             let decommits = crate::options::is_enabled(5); // purge_decommits
             if os::purge(area, bytes, decommits).is_ok() {
                 (*seg).pages[idx].purged = true;
                 (*seg).purged_any = true;
-                return true;
+                return 1;
             }
         }
         // Not re-purged as a whole (purging off by now, the span too small,
-        // or the purge failed): the merged span is backed only if every part
-        // was. Never cleared here: the start may already be flagged.
+        // the purge failed or is only scheduled): the merged span is backed
+        // only if every part was. Never cleared here: the start may already
+        // be flagged.
         if merged_purged {
             (*seg).pages[idx].purged = true;
         }
-        false
+        if delay > 0 {
+            return schedule_purge(seg, idx, delay as u64);
+        }
+        0
+    }
+}
+
+/// When a free span became free, in milliseconds of `prim::clock_now`,
+/// truncated to `u32` and compared with wrapping arithmetic (a free span's
+/// age is far below 49 days). Kept in the span-start slot's `capacity`, which
+/// no reader looks at while the span is free (every reader runs on a live
+/// page, and a span taken from the free list has it re-initialised), so
+/// `Page` keeps its 88 bytes. A free span whose slot was never stamped reads
+/// 0: free since long ago, the right answer for a span freed while purging
+/// was off.
+#[inline]
+fn now_ms(now_ns: u64) -> u32 {
+    (now_ns / 1_000_000) as u32
+}
+
+/// The `purge_delay` option as a millisecond count the wrapping age compare
+/// can use.
+fn delay_ms() -> u32 {
+    crate::options::get(15).clamp(0, i64::from(u32::MAX / 2)) as u32
+}
+
+/// The purge candidate starting at slot `idx` was just freed under a positive
+/// `purge_delay` of `delay_ms`: stamp when, then start the segment's deadline
+/// if none is running, or, if it has passed, purge the candidates that are
+/// due. Returns how many spans were purged.
+///
+/// Only a span that has stayed free for the whole delay is purged, so the one
+/// just freed never is: a loop that frees and re-allocates a span within the
+/// delay never refaults it, however long the loop runs.
+///
+/// # Safety
+/// `seg` is a live Normal segment under its owner; `idx` a free span start.
+#[cold]
+unsafe fn schedule_purge(seg: *mut Segment, idx: usize, delay_ms: u64) -> usize {
+    let now = crate::prim::clock_now();
+    // SAFETY: caller contract.
+    unsafe {
+        (*seg).pages[idx].capacity = now_ms(now);
+        let exp = (*seg).purge_expire;
+        if exp == 0 {
+            (*seg).purge_expire = now
+                .saturating_add(delay_ms.saturating_mul(1_000_000))
+                .max(1);
+            0
+        } else if now >= exp {
+            purge_candidates(seg, Some(now))
+        } else {
+            0
+        }
+    }
+}
+
+/// Purge `seg`'s due candidates if its deadline has passed at `now`, or all
+/// of them when `now` is `None` (a forced collect). Returns how many spans
+/// were purged.
+///
+/// # Safety
+/// `seg` is a live Normal segment under its owner.
+pub unsafe fn purge_scheduled(seg: *mut Segment, now: Option<u64>) -> usize {
+    // SAFETY: caller contract.
+    unsafe {
+        let exp = (*seg).purge_expire;
+        if exp == 0 || now.is_some_and(|t| t < exp) {
+            return 0;
+        }
+        purge_candidates(seg, now)
+    }
+}
+
+/// Purge the candidates of `seg` (free, unpurged spans of at least
+/// `MEDIUM_PAGE_SLICES` slices, the spans `purge_delay = 0` purges as they
+/// are freed) that have been free for the whole delay at `now`, or all of
+/// them when `now` is `None`; then set the deadline to when the next one left
+/// falls due, or clear it. Each purged span is marked so reuse re-commits it.
+/// Returns how many were purged.
+///
+/// # Safety
+/// `seg` is a live Normal segment under its owner.
+unsafe fn purge_candidates(seg: *mut Segment, now: Option<u64>) -> usize {
+    // SAFETY: caller contract; free spans hold no live blocks.
+    unsafe {
+        let delay = delay_ms();
+        let decommits = crate::options::is_enabled(5); // purge_decommits
+        let mut next = u64::MAX;
+        let mut n = 0;
+        let mut s = (*seg).free_spans;
+        while !s.is_null() {
+            let len = (*s).slice_count as usize;
+            if !(*s).purged && len >= crate::types::MEDIUM_PAGE_SLICES {
+                // Milliseconds this span must still wait; none when forced.
+                let wait = now.map_or(0, |t| {
+                    delay.saturating_sub(now_ms(t).wrapping_sub((*s).capacity))
+                });
+                if let (Some(t), true) = (now, wait > 0) {
+                    next = next.min(t.saturating_add(u64::from(wait) * 1_000_000));
+                } else {
+                    let area = page_area(seg, page_index(seg, s));
+                    if os::purge(area, len * SEGMENT_SLICE_SIZE, decommits).is_ok() {
+                        (*s).purged = true;
+                        (*seg).purged_any = true;
+                        n += 1;
+                    }
+                }
+            }
+            s = (*s).next;
+        }
+        (*seg).purge_expire = if next == u64::MAX { 0 } else { next.max(1) };
+        n
     }
 }
 
@@ -1180,6 +1325,7 @@ pub fn huge_alloc(
         (*seg).thread_id = AtomicUsize::new(crate::init::thread_id());
         (*seg).mem_is_zero = b.is_zero;
         (*seg).purged_any = false;
+        (*seg).purge_expire = 0;
         (*seg).guarded = false;
         (*seg).next = ptr::null_mut();
         (*seg).free_spans = ptr::null_mut();
@@ -1625,6 +1771,9 @@ mod lazy_commit_tests {
         unsafe {
             let (pg, _) = span_alloc(seg, slices);
             assert!(!pg.is_null(), "span of {slices} slices refused");
+            // Live, as the page layer would mark it: `span_free` reads a
+            // zero `block_size` on a neighbour as a free span to merge.
+            (*pg).block_size = SEGMENT_SLICE_SIZE;
             ptr::write_bytes((*pg).area, 0xA5, slices * SEGMENT_SLICE_SIZE);
             pg
         }
@@ -1735,5 +1884,194 @@ mod lazy_commit_tests {
             span_free(seg, pg2);
             segment_free(seg).expect("free");
         }
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod purge_delay_tests {
+    use super::*;
+    use crate::types::MEDIUM_PAGE_SLICES;
+
+    /// One exclusive reserve-only arena of one chunk (see `lazy_commit_tests`).
+    fn arena() -> i32 {
+        static ID: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+        *ID.get_or_init(|| {
+            crate::arena::reserve_os_memory_ex(SEGMENT_SIZE, false, false, true)
+                .expect("reserve-only arena")
+        })
+    }
+
+    /// A purge candidate (`MEDIUM_PAGE_SLICES + 1` slices) freed between two
+    /// live spans, so it cannot merge, under `purge_delay = delay_ms`.
+    /// Returns (segment, the candidate's slot index, the two pins).
+    ///
+    /// # Safety
+    /// The caller holds the options lock and frees everything it is given.
+    unsafe fn freed_candidate(delay_ms: i64) -> (*mut Segment, usize, [*mut Page; 2]) {
+        let n = MEDIUM_PAGE_SLICES + 1;
+        // SAFETY: a segment of our own exclusive arena, this thread only.
+        unsafe {
+            let seg = segment_alloc(arena()).expect("segment");
+            let (a, _) = span_alloc(seg, 1);
+            let (v, _) = span_alloc(seg, n);
+            let (b, _) = span_alloc(seg, 1);
+            assert!(!a.is_null() && !v.is_null() && !b.is_null());
+            // Live, as the page layer would mark them: `span_free` reads a
+            // zero `block_size` on a neighbour as a free span to merge.
+            for pg in [a, v, b] {
+                (*pg).block_size = SEGMENT_SLICE_SIZE;
+            }
+            ptr::write_bytes((*v).area, 0x5A, n * SEGMENT_SLICE_SIZE);
+            let idx = page_index(seg, v);
+            crate::options::set(15, delay_ms);
+            assert_eq!(span_free(seg, v), 0, "a delayed purge ran at once");
+            (seg, idx, [a, b])
+        }
+    }
+
+    /// # Safety
+    /// As [`freed_candidate`]'s results.
+    unsafe fn release(seg: *mut Segment, pins: [*mut Page; 2]) {
+        crate::options::set(15, -1);
+        // SAFETY: the pins are live spans of `seg`, freed once; then empty.
+        unsafe {
+            for p in pins {
+                span_free(seg, p);
+            }
+            segment_free(seg).expect("free");
+        }
+    }
+
+    /// Freed under a delay, the span is scheduled, not purged, and a reuse
+    /// inside the window takes it back unpurged: no refault.
+    #[test]
+    fn a_span_reused_inside_the_delay_is_not_purged() {
+        let _g = crate::arena::adopt_tests::lock();
+        // SAFETY: as documented on the helpers.
+        unsafe {
+            let (seg, idx, pins) = freed_candidate(60_000);
+            assert_ne!((*seg).purge_expire, 0, "no deadline was set");
+            assert!(!(*seg).pages[idx].purged);
+            let (v, _) = span_alloc(seg, MEDIUM_PAGE_SLICES + 1);
+            assert_eq!(page_index(seg, v), idx, "the freed span was not reused");
+            assert!(!(*v).purged, "a span reused inside the window was purged");
+            (*v).block_size = SEGMENT_SLICE_SIZE;
+            assert_eq!(
+                purge_scheduled(seg, None),
+                0,
+                "a reused span is not a candidate"
+            );
+            span_free(seg, v);
+            release(seg, pins);
+        }
+    }
+
+    /// Once the deadline has passed, a purge pass purges the candidate and
+    /// clears the deadline; before it, an unforced pass does nothing and a
+    /// forced one purges at once.
+    #[test]
+    fn an_expired_deadline_purges_and_a_forced_pass_does_not_wait() {
+        let _g = crate::arena::adopt_tests::lock();
+        // SAFETY: as documented on the helpers.
+        unsafe {
+            let (seg, idx, pins) = freed_candidate(1);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            assert_eq!(purge_scheduled(seg, Some(crate::prim::clock_now())), 1);
+            assert!(
+                (*seg).pages[idx].purged,
+                "the expired candidate was not purged"
+            );
+            assert_eq!((*seg).purge_expire, 0, "the deadline was not cleared");
+            release(seg, pins);
+
+            let (seg, idx, pins) = freed_candidate(60_000);
+            let now = crate::prim::clock_now();
+            assert_eq!(
+                purge_scheduled(seg, Some(now)),
+                0,
+                "purged before its deadline"
+            );
+            assert!(!(*seg).pages[idx].purged);
+            assert_eq!(purge_scheduled(seg, None), 1, "a forced pass waited");
+            assert!((*seg).pages[idx].purged);
+            release(seg, pins);
+        }
+    }
+
+    /// The deadline passing does not purge a span freed a moment ago: only a
+    /// span free for the whole delay is due. A is freed, the delay passes, B
+    /// is freed in the same segment: A is purged, B is not, and the deadline
+    /// is re-armed for B.
+    #[test]
+    fn an_expired_deadline_spares_a_span_freed_just_now() {
+        let _g = crate::arena::adopt_tests::lock();
+        let n = MEDIUM_PAGE_SLICES + 1;
+        // SAFETY: a segment of our own exclusive arena, this thread only;
+        // every span is freed once and the segment freed empty.
+        unsafe {
+            let seg = segment_alloc(arena()).expect("segment");
+            let mut spans = [ptr::null_mut(); 5]; // pin, A, pin, B, pin
+            for (k, slot) in spans.iter_mut().enumerate() {
+                let (pg, _) = span_alloc(seg, if k % 2 == 1 { n } else { 1 });
+                assert!(!pg.is_null());
+                (*pg).block_size = SEGMENT_SLICE_SIZE;
+                *slot = pg;
+            }
+            let (ia, ib) = (page_index(seg, spans[1]), page_index(seg, spans[3]));
+            crate::options::set(15, 2);
+            assert_eq!(span_free(seg, spans[1]), 0);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            assert_eq!(span_free(seg, spans[3]), 1, "the expired A was not purged");
+            assert!(
+                (*seg).pages[ia].purged,
+                "A, free past the delay, was not purged"
+            );
+            assert!(!(*seg).pages[ib].purged, "B, freed just now, was purged");
+            assert_ne!(
+                (*seg).purge_expire,
+                0,
+                "the deadline was not re-armed for B"
+            );
+            crate::options::set(15, -1);
+            for k in [0, 2, 4] {
+                span_free(seg, spans[k]);
+            }
+            segment_free(seg).expect("free");
+        }
+    }
+
+    /// The loop the delay exists for, through the heap: a 1 MiB buffer freed
+    /// and allocated again 200 times under a 10 s delay purges nothing (under
+    /// `purge_delay = 0` every free purged and every reuse refaulted), and a
+    /// forced collect afterwards still gives the span back.
+    #[test]
+    fn a_large_buffer_loop_under_a_delay_never_purges_until_collected() {
+        use crate::alloc::{collect, free, malloc, stats};
+        let _g = crate::arena::adopt_tests::lock();
+        let size = (MEDIUM_PAGE_SLICES + 8) * SEGMENT_SLICE_SIZE;
+        if size > crate::types::LARGE_OBJ_SIZE_MAX {
+            return; // a huge block in this geometry: released, not purged
+        }
+        crate::options::set(15, 10_000);
+        let pin = malloc(64);
+        let before = stats().purges;
+        for i in 0..200u8 {
+            let p = malloc(size);
+            assert!(!p.is_null());
+            // SAFETY: a live block of `size` bytes, freed once.
+            unsafe {
+                p.write_bytes(i, size);
+                free(p);
+            }
+        }
+        assert_eq!(stats().purges, before, "the loop purged under a delay");
+        collect(true);
+        assert!(
+            stats().purges > before,
+            "a forced collect did not purge the span"
+        );
+        crate::options::set(15, -1);
+        // SAFETY: live, freed once.
+        unsafe { free(pin) };
     }
 }

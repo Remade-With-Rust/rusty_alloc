@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`purge_delay` is a delay now**, in milliseconds as upstream's is. It was
+  sign-only: any value `>= 0` purged a freed span of 512 KiB or more the
+  moment it was freed (and turned the large-span cache off), so a loop that
+  frees and re-allocates a buffer refaulted every page of it on every
+  iteration (WSL2, per iteration: 1 MiB 0.7 -> 206 us, 8 MiB 7.0 -> 1,887
+  us). A positive value now purges a span only once it has stayed free that
+  long: the span records when it was freed, and due spans are purged on the
+  segment's later span frees and on every collect (a forced `collect` purges
+  at once). With `purge_delay = 10` the same loops run at 0.67 and 6.48 us,
+  the speed of purging off, with no extra faults. `0` still purges at once
+  and `< 0` (the default) never purges. An emptied segment purges before its
+  chunk goes back to the arena, so a delay never parks resident memory
+  there.
+
 ### Fixed
 
 - **A thread no longer costs 32 MiB of commit.** Every segment committed its

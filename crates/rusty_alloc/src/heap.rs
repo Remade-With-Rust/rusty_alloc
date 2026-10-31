@@ -178,8 +178,10 @@ pub struct Heap {
     /// otherwise carved fresh on every allocation and retired on every free:
     /// a 2 MiB malloc/free pair cost 293 Ir, against 92 for the queued sizes
     /// below it, and this cache takes it to ~124 (`docs/opps.md`, vein
-    /// census 2026-10-07, vein 2). Cached only with purging off, where a
-    /// freed span stays resident anyway, and only up to
+    /// census 2026-10-07, vein 2). Cached unless `purge_delay` is 0: with
+    /// purging off a freed span stays resident anyway, and a positive delay
+    /// would keep it resident for that long; under 0 a freed span is purged
+    /// at once and caching it would defeat that. Only up to
     /// [`LARGE_CACHE_MAX_SLICES`], so it cannot hold back much space other
     /// sizes could have used; flushed by every collect, which includes the
     /// heartbeat and thread teardown. A cached page has `used == 0`, which is
@@ -1563,7 +1565,7 @@ impl Heap {
 
     /// # Safety
     /// Owner thread; `reclaim` only when this heap will REMAIN live.
-    unsafe fn collect_inner(&mut self, _force: bool, reclaim: bool) {
+    unsafe fn collect_inner(&mut self, force: bool, reclaim: bool) {
         // Hand the cached large span back first, so a collect leaves no span
         // carved that holds no block (see `large_cache`).
         let c = self.large_cache;
@@ -1661,6 +1663,26 @@ impl Heap {
                 }
                 bin += 1;
                 q = q.wrapping_add(1);
+            }
+            // Scheduled purges (positive `purge_delay`): those past their
+            // deadline, or all of them on a forced collect, which is what
+            // `mi_collect(true)` asks for. After the sweep, so spans it just
+            // retired are included. The clock is read only if some segment
+            // has a deadline running.
+            if crate::options::get(15) > 0 {
+                let mut now = None;
+                let mut s = self.segments;
+                while !s.is_null() {
+                    if (*s).purge_expire != 0 {
+                        let at = if force {
+                            None
+                        } else {
+                            Some(*now.get_or_insert_with(crate::prim::clock_now))
+                        };
+                        self.stats.purges += segment::purge_scheduled(s, at) as u64;
+                    }
+                    s = (*s).next;
+                }
             }
         }
     }
@@ -2082,7 +2104,7 @@ impl Heap {
             self.large_freed = true;
             if lone
                 && (*pg).slice_count as usize <= LARGE_CACHE_MAX_SLICES
-                && crate::options::get(15) < 0
+                && crate::options::get(15) != 0
             {
                 (*pg).used = 0;
                 self.large_cache = pg;
@@ -2108,9 +2130,7 @@ impl Heap {
         unsafe {
             // span_free coalesces, then purges the merged span (the RSS
             // lever) and reports whether it did.
-            if span_free(seg, pg) {
-                self.stats.purges += 1;
-            }
+            self.stats.purges += span_free(seg, pg) as u64;
             self.stats.pages_retired += 1;
             if (*seg).used_pages == 0 {
                 if self.empty_segments == 0 {

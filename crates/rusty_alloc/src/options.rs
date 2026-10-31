@@ -17,7 +17,7 @@
 //! |---|---|
 //! | `show_errors` (0) | print error codes to stderr when no error hook is registered |
 //! | `purge_decommits` (5) | purge by decommit (on) or by reset (off) |
-//! | `purge_delay` (15) | **sign only**: `>= 0` purges a freed span of at least `MEDIUM_PAGE_SLICES` slices at once, `< 0` (default) never does. The value is not a delay. |
+//! | `purge_delay` (15) | milliseconds a freed span of at least `MEDIUM_PAGE_SLICES` slices stays resident before it is purged: `0` purges at once, `> 0` purges once the span's segment deadline passes (checked on the segment's later span frees and on each collect; a forced collect purges at once), `< 0` (default) never purges. |
 //! | `arena_reserve` (23) | size of the arena reservation (KiB) |
 //! | `disallow_arena_alloc` (27) | never place segments in the arena |
 //! | `guarded_min` / `guarded_max` (30, 31) | size bounds for guard-page sampling |
