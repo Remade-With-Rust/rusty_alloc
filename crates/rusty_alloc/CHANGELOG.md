@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The free-slot purge: a page that still holds live blocks gives back the
+  free ones.** One long-lived block keeps its 512 KiB medium page from ever
+  emptying, and the span purge only reaches free spans, so every 8-64 KiB
+  slot the page ever used stayed resident whatever the purge settings. Now,
+  while purging is on, a collect gives back each free block's whole OS pages
+  past its first (which keeps the free-list link): at once under
+  `purge_delay = 0` or a forced `collect`, otherwise once the block has been
+  seen free for the delay. Linux uses `MADV_DONTNEED`, Windows `MEM_RESET`:
+  the slots stay mapped and are re-used as before. Measured on WSL2 (one
+  block pinned, the rest of the page churned, then `collect(true)`): 64 KiB
+  blocks +452 -> +32 KiB, 32 KiB +484 -> +64, 16 KiB +500 -> +128 (glibc
+  +132). Churn loops over 16 and 64 KiB blocks and perl / sqlite / lua are
+  unchanged within noise.
+
 ### Changed
 
 - **Purging is on by default: `purge_delay` defaults to 10 ms on Windows and

@@ -304,6 +304,32 @@ pub unsafe fn purge(ptr: *mut u8, size: usize, purge_decommits: bool) -> Result<
     }
 }
 
+/// Give back the physical pages of a range that must STAY ACCESSIBLE: the
+/// free slots of a live page (`page::page_purge_free_slots`). Contents are
+/// lost (Linux and macOS: zero on next touch; Windows: undefined).
+///
+/// Never a Windows decommit, which would make the slots fault: `MEM_RESET`
+/// there. On Unix, `purge_decommits` picks the immediate form (`MADV_DONTNEED`,
+/// or the remap on macOS: both leave the range readable and writable) over the
+/// lazy `MADV_FREE`, which only frees under memory pressure, as for any purge.
+///
+/// # Safety
+/// As [`commit`]; the range must be committed and its contents dead.
+pub unsafe fn discard(ptr: *mut u8, size: usize, purge_decommits: bool) -> Result<(), PrimError> {
+    #[cfg(all(test, feature = "std"))]
+    if test_hooks::take_purge_failure() {
+        return Err(test_hooks::INJECTED);
+    }
+    if purge_decommits && !cfg!(windows) {
+        // SAFETY: forwarded contract; a Unix decommit keeps the range
+        // accessible (`prim::unix::decommit` returns needs_recommit = false).
+        unsafe { prim::decommit(ptr, page_align_up(size)).map(|_| ()) }
+    } else {
+        // SAFETY: forwarded contract.
+        unsafe { prim::reset(ptr, page_align_up(size)) }
+    }
+}
+
 /// Toggle no-access protection on a page-aligned range (guard pages).
 ///
 /// # Safety

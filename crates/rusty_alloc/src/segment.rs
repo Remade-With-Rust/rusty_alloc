@@ -2120,3 +2120,142 @@ mod purge_delay_tests {
         crate::options::set(15, -1);
     }
 }
+
+#[cfg(all(test, feature = "std"))]
+mod free_slot_tests {
+    use super::*;
+    use crate::alloc::{collect, free, malloc, stats};
+    use crate::types::{MEDIUM_OBJ_SIZE_MAX, MEDIUM_PAGE_SLICES};
+
+    /// A medium page full of `bs`-byte blocks, every byte written, then all
+    /// freed but the first (the pin). `None` when this geometry has no such
+    /// page (the block would not be medium, or not span two OS pages).
+    fn pinned_page(bs: usize) -> Option<Vec<*mut u8>> {
+        let page_bytes = MEDIUM_PAGE_SLICES * SEGMENT_SLICE_SIZE;
+        if bs > MEDIUM_OBJ_SIZE_MAX || bs < 2 * os::page_size() {
+            return None;
+        }
+        let first = malloc(bs);
+        assert!(!first.is_null());
+        // As many as the page holds: `reserved`, not `page_bytes / bs`,
+        // because `blockmap` keeps its map after the blocks.
+        // SAFETY: a page lookup on a live block.
+        let k = unsafe { (*page_of(segment_of(first), first)).reserved as usize };
+        assert!(k <= page_bytes / bs);
+        let mut blocks = vec![first];
+        blocks.extend((1..k).map(|_| malloc(bs)));
+        let seg = segment_of(blocks[0]);
+        // SAFETY: live blocks of `bs` bytes; page lookups on live blocks.
+        unsafe {
+            let pg = page_of(seg, blocks[0]);
+            assert!(
+                blocks
+                    .iter()
+                    .all(|&b| !b.is_null() && page_of(segment_of(b), b) == pg),
+                "setup: the blocks did not share one page"
+            );
+            for &b in &blocks {
+                b.write_bytes(0xAB, bs);
+            }
+            for &b in &blocks[1..] {
+                free(b);
+            }
+        }
+        Some(blocks)
+    }
+
+    /// One live block pins a medium page; a forced collect gives back every
+    /// other slot's pages past the first, once, and the slots stay usable.
+    #[test]
+    fn a_pinned_medium_page_gives_back_its_free_slots() {
+        let _g = crate::arena::adopt_tests::lock();
+        crate::options::set(15, 0);
+        let bs = 32 * 1024;
+        let Some(blocks) = pinned_page(bs) else {
+            crate::options::set(15, -1);
+            return;
+        };
+        let before = stats().purges;
+        collect(true);
+        let purged = stats().purges - before;
+        assert!(
+            purged as usize >= blocks.len() - 1,
+            "{purged} of {} free slots purged",
+            blocks.len() - 1
+        );
+        // Linux and macOS give back zero pages; Windows' MEM_RESET leaves
+        // the contents undefined, so only the count is checked there.
+        #[cfg(unix)]
+        if crate::options::is_enabled(5) {
+            for &b in &blocks[1..] {
+                // SAFETY: the slot is free but still mapped and accessible:
+                // the purge keeps it so, which is what this reads.
+                let tail = unsafe { b.add(bs - 1).read_volatile() };
+                assert_eq!(tail, 0, "a purged slot kept its contents");
+            }
+        }
+        let before = stats().purges;
+        collect(true);
+        assert_eq!(stats().purges, before, "a purged slot was purged again");
+        // The slots are ordinary free blocks: allocate and fill them all.
+        let again: Vec<*mut u8> = (1..blocks.len()).map(|_| malloc(bs)).collect();
+        // SAFETY: live blocks, each written in full and freed once.
+        unsafe {
+            for &b in &again {
+                assert!(!b.is_null());
+                b.write_bytes(0xCD, bs);
+                assert_eq!(b.add(bs - 1).read(), 0xCD);
+            }
+            for &b in again.iter().chain(&blocks[..1]) {
+                free(b);
+            }
+        }
+        crate::options::set(15, -1);
+    }
+
+    /// Under a positive delay an unforced collect only stamps a free slot;
+    /// a later one past the delay purges it; a forced one never waits.
+    #[test]
+    fn a_free_slot_waits_out_the_delay() {
+        let _g = crate::arena::adopt_tests::lock();
+        let bs = 16 * 1024;
+        crate::options::set(15, 60_000);
+        let Some(blocks) = pinned_page(bs) else {
+            crate::options::set(15, -1);
+            return;
+        };
+        let before = stats().purges;
+        collect(false);
+        assert_eq!(
+            stats().purges,
+            before,
+            "an unforced collect purged inside the delay"
+        );
+        crate::options::set(15, 2);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        collect(false);
+        let purged = stats().purges - before;
+        assert!(
+            purged as usize >= blocks.len() - 1,
+            "only {purged} slots purged after the delay"
+        );
+        crate::options::set(15, -1);
+        // SAFETY: the pin is live, freed once.
+        unsafe { free(blocks[0]) };
+    }
+
+    /// Purging off: the free slots are left alone.
+    #[test]
+    fn no_slot_is_purged_with_purging_off() {
+        let _g = crate::arena::adopt_tests::lock();
+        crate::options::set(15, -1);
+        let Some(blocks) = pinned_page(32 * 1024) else {
+            return;
+        };
+        let before = stats().purges;
+        collect(true);
+        assert_eq!(stats().purges, before);
+        // SAFETY: the pin is live, freed once.
+        unsafe { free(blocks[0]) };
+    }
+}

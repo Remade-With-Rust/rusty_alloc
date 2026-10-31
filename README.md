@@ -397,9 +397,9 @@ So memory a thread frees and then leaves idle is purged only when that
 thread allocates enough again, exits, or calls `collect(true)`. A daemon
 that frees during setup and then parks in an event loop keeps it for good:
 call `collect(true)` before entering the loop, or set `purge_delay` to `0`.
-Neither reaches the free slots of a page that still holds a live block: a
-512 KiB medium page (8-64 KiB requests) pinned by one long-lived object
-keeps every slot it ever used resident whatever the purge settings
+The same collect also gives back the free slots of a page that still holds
+a live block: a 512 KiB medium page (8-64 KiB requests) pinned by one
+long-lived object returns each free slot's pages past its first
 (`docs/plans/free-slot-purge.md`).
 Set
 `RUSTY_ALLOC_PURGE_DELAY` (or `MIMALLOC_PURGE_DELAY`) to `0` to purge as soon

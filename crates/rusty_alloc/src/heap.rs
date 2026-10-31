@@ -1625,6 +1625,16 @@ impl Heap {
             // inlining around the generic path's periodic collect and every
             // opscan op got worse — `big`/`large` +4.00, `mixed` +2.89 — with
             // perl +45,287 and python +79,035 whole-program.
+            // The free-slot purge (`page_purge_free_slots`) takes pages whose
+            // blocks span two OS pages or more, whenever purging is on.
+            // `usize::MAX` turns it off with the one compare it costs per page.
+            let purge_on = crate::options::get(15) >= 0;
+            let slot_min = if purge_on {
+                2 * crate::os::page_size()
+            } else {
+                usize::MAX
+            };
+            let mut slot_now: Option<Option<u32>> = None;
             let qbase: *mut PageQueue = (&raw mut self.pages).cast::<PageQueue>();
             let mut q: *mut PageQueue = qbase.add(1);
             while bin <= MAX_NORMAL_BIN {
@@ -1658,6 +1668,16 @@ impl Heap {
                         // and a released segment has no queued pages (release
                         // requires used_pages == 0).
                         let _ = self.retire_span(seg, p); // nosemgrep: discarded-lifecycle-result -- terminal, see comment above
+                    } else if (*p).block_size >= slot_min {
+                        let now = *slot_now.get_or_insert_with(|| {
+                            (!force).then(|| (crate::prim::clock_now() / 1_000_000) as u32)
+                        });
+                        self.stats.purges += crate::page::page_purge_free_slots(
+                            p,
+                            now,
+                            crate::options::get(15).clamp(0, i64::from(u32::MAX / 2)) as u32,
+                            crate::options::is_enabled(5),
+                        ) as u64;
                     }
                     p = next;
                 }

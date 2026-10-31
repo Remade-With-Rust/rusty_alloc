@@ -1,9 +1,10 @@
 # Free-slot purge — return the touched free slots of a page that stays live
 
-Status: MEASURED, not built; next in the owner's order (2026-10-31). The
-purge-default flip it was ordered against has landed (`purge_delay` is a real
-delay, default 10 ms; see the last section for why it could not be `0`).
-Neither the flip nor `collect(true)` reaches the slots of a pinned page.
+Status: BUILT (2026-10-31), `page::page_purge_free_slots`, run from every
+collect while purging is on. WSL2 probe, one block pinned, after
+`collect(true)`: 64 KiB +452 -> +32 KiB, 32 KiB +484 -> +64, 16 KiB +500 ->
++128 (glibc +132); the residue is each free block's first OS page, which
+keeps the free-list link. Awaiting rusty_WRT's `netlink_no_lend` gate below.
 
 ## The gap
 

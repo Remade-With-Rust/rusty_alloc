@@ -1293,6 +1293,100 @@ pub unsafe fn page_extend(page: *mut Page, area: *mut u8) {
     }
 }
 
+/// A free block's second word, when the free-slot purge has looked at it:
+/// `SLOT_SEEN ^ addr` (free since the time in its third word) or
+/// `SLOT_PURGED ^ addr` (its pages past the first went back to the OS).
+/// Anything else is whatever the block's last tenant left, so a match by
+/// accident only makes the purge skip or delay one block.
+const SLOT_SEEN: usize = 0x5EE7_51A7_5EE7_51A7_u64 as usize;
+const SLOT_PURGED: usize = 0x9A26_ED51_9A26_ED51_u64 as usize;
+
+/// Give back the free slots of a page that still holds live blocks: each free
+/// block's whole OS pages past its first, which keeps the free-list link and
+/// the two words above. The span purge cannot reach these: it purges free
+/// spans, and a page with one live block is never free. Measured before this,
+/// one long-lived 64 KiB block kept +452 KiB of a 512 KiB medium page resident
+/// through `purge_delay = 0` and a forced collect
+/// (`docs/plans/free-slot-purge.md`).
+///
+/// `now_ms` is `None` for a forced collect, which purges every free block at
+/// once. Otherwise a block is purged once it has been seen free for
+/// `delay_ms` (at once for 0): the first pass that finds it free stamps it, a
+/// later one purges it. A purged block is not purged again while it stays
+/// free. Returns how many blocks were purged.
+///
+/// While the page's `free` list is still known zero (`free_is_zero`) that list
+/// is left alone: its blocks were never written, so nothing of theirs is
+/// resident, and the stamp would break the zero promise `calloc` relies on.
+/// `local_free` is recycled memory either way (a collect that moves it onto
+/// `free` clears the flag), and it is where a program's freed blocks wait.
+///
+/// # Safety
+/// `page` is a live page owned by the calling thread, collected, with
+/// `block_size` at least two OS pages.
+#[cold]
+#[inline(never)]
+pub unsafe fn page_purge_free_slots(
+    page: *mut Page,
+    now_ms: Option<u32>,
+    delay_ms: u32,
+    decommits: bool,
+) -> usize {
+    // SAFETY: owner thread; every block walked is a free block of `page`
+    // (its `free` and `local_free` lists are owner-only), at least two OS
+    // pages long, so the three words written lie in its first OS page, which
+    // is never given back, and the purged range lies inside the block.
+    unsafe {
+        let fresh = if (*page).free_is_zero {
+            ptr::null_mut()
+        } else {
+            (*page).free
+        };
+        let bsize = (*page).block_size;
+        let ps = crate::os::page_size();
+        let mut n = 0;
+        for head in [fresh, (*page).local_free] {
+            let mut b = head;
+            while !b.is_null() {
+                let next = block_next(page, b);
+                let addr = b.addr();
+                let w = b.cast::<usize>();
+                let state = *w.add(1);
+                if state != SLOT_PURGED ^ addr {
+                    let due = match now_ms {
+                        None => true,
+                        Some(_) if delay_ms == 0 => true,
+                        Some(t) => {
+                            state == SLOT_SEEN ^ addr
+                                && t.wrapping_sub(*w.add(2) as u32) >= delay_ms
+                        }
+                    };
+                    if due {
+                        let start = (addr + 3 * core::mem::size_of::<usize>()).next_multiple_of(ps);
+                        let end = (addr + bsize) & !(ps - 1);
+                        if end > start
+                            && crate::os::discard(
+                                crate::ptr_with_addr(b.cast::<u8>(), start),
+                                end - start,
+                                decommits,
+                            )
+                            .is_ok()
+                        {
+                            *w.add(1) = SLOT_PURGED ^ addr;
+                            n += 1;
+                        }
+                    } else if state != SLOT_SEEN ^ addr {
+                        *w.add(1) = SLOT_SEEN ^ addr;
+                        *w.add(2) = now_ms.unwrap_or(0) as usize;
+                    }
+                }
+                b = next;
+            }
+        }
+        n
+    }
+}
+
 /// Whether every block of the page is free (as seen by the owner; remote
 /// frees count only after a collect).
 ///
