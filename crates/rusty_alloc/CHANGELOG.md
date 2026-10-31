@@ -21,6 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `overcommit_memory = 2` charges `Committed_AS` the same way. A refused
   commit is a failed span, as a refused re-commit already was. Off on targets
   whose commit is a no-op (fixed region, wasm) and in the small profile.
+- **A guarded object freed with purging on no longer leaks its chunk on
+  Windows.** Since 2.2.4 a freed huge block is purged before its chunks
+  return to the arena, and for a guarded object that decommits the guard
+  page too; the restore then lifted the guard before re-committing, and
+  `VirtualProtect` refuses decommitted pages. Every such free retired its
+  chunk for the life of the process and counted a refused commit in
+  `stats::commit_failures`. The restore now commits first. Only with guarded
+  sampling enabled (`guarded_max` or `guarded_set_sample_rate`), which is off
+  by default.
 
 ## [2.3.1](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.3.0...rusty_alloc-v2.3.1) - 2026-10-31
 

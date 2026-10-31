@@ -4,7 +4,8 @@
 (`e6475c1`; `mata-master` pins `=2.2.3`). Mechanism B **found, reproduced as
 `STATUS_ACCESS_VIOLATION` and fixed** on branch `fix/purged-merge-flag`, not
 yet released (section 9). Which one caused the field crash is still unknown;
-the `secure` guard-page route is the one path not traced ·
+the `secure` guard-page route is **traced and ruled out (2026-10-31, section
+10)**, and tracing it found a chunk leak, fixed ·
 **Date:** 2026-10-04 · **Seen on:** 1.1.6 (`secure` on, `purge_delay = 0`) ·
 **Code checked against:** HEAD `86980ec` (2.2.2) · **Platform:** Windows 11,
 x86-64 · **From:** the MATA desktop session (`mata-master`, branch
@@ -271,4 +272,29 @@ on another test thread can take a chunk from an arena that test just adopted).
 With it, 30 consecutive runs (15 default, 15 `secure`) were clean.
 
 **Still open:** the guard-page route (`secure`, a guard left no-access), not
-traced.
+traced. *(Traced 2026-10-31: section 10.)*
+
+## 10. The guard-page route, traced (2026-10-31)
+
+**Not the field crash.** Guard pages exist only in the dedicated huge segment
+of a guarded object (`heap::guarded_alloc`); Normal segments never carry one.
+In 1.1.6, the version that crashed, freeing one ran `let _ = os::protect(..,
+false); let _ = os::commit(..)` over the segment, and nothing purged a huge
+segment before that (the huge purge arrived in 2.2.4). The range was committed
+throughout, so the protect lifted the guard and the next tenant received
+accessible, backed memory. The route cannot produce an unbacked write.
+
+**But it had its own defect, from 2.2.4 to 2.3.1.** With purging on, `huge_free`
+purges the whole segment, guard page included, before `restore_for_reuse`. The
+restore lifted the guard first, and on Windows `VirtualProtect` fails on pages
+the purge just decommitted. The restore then reported failure (checked since
+2.2.3), so the chunk was retired in place for the life of the process and a
+refused commit was counted. Not a crash, a leak, and a false reading on
+`commit_failures`, the counter section 6 relies on to tell mechanism A apart.
+
+Reproduced by `segment::recommit_tests::a_freed_guarded_object_recycles_its_chunk_with_purging_on`
+(guarded sampling at rate 1, `purge_delay = 0`, both `purge_decommits`
+values): `commit_failures` rose by 1 on Windows. Fixed by committing before
+the protect; with the old order the test fails again at `purge_decommits = 1`.
+Guarded sampling is off by default (`guarded_max = 0`), so only processes that
+enable it were affected.

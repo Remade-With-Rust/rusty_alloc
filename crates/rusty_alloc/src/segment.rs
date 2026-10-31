@@ -535,7 +535,13 @@ unsafe fn restore_for_reuse(seg: *mut Segment) -> bool {
         }
         let base = seg.cast::<u8>().add(HEADER_SLICES * SEGMENT_SLICE_SIZE);
         let bytes = (*seg).total_size - HEADER_SLICES * SEGMENT_SLICE_SIZE;
-        if os::protect(base, bytes, false).is_err() || os::commit(base, bytes).is_err() {
+        // Commit BEFORE lifting the guard. A purged guarded segment (purging
+        // on, `huge_free`) has its guard page decommitted with the rest, and
+        // Windows' `VirtualProtect` refuses decommitted pages, so the old
+        // order failed on every such free and retired the chunk in place
+        // (`recommit_tests::a_freed_guarded_object_recycles_its_chunk_with_purging_on`).
+        // Once all of it is committed the protect succeeds either way.
+        if os::commit(base, bytes).is_err() || os::protect(base, bytes, false).is_err() {
             crate::stats::commit_failed();
             return false;
         }
@@ -1527,6 +1533,69 @@ mod recommit_tests {
         merged_span_is_backed(a, ia, span);
         // SAFETY: live, freed once.
         unsafe { free(pin) };
+    }
+
+    /// The `secure` guard-page route (`docs/plans/recommit-failure-ignored.md`,
+    /// "still open"): a guarded object, freed with purging on, must give its
+    /// chunk back to the arena usable, not retire it.
+    ///
+    /// A guarded object lives in a dedicated huge segment whose page after
+    /// the object is no-access. `huge_free` purges the whole segment, guard
+    /// page included, then `restore_for_reuse` lifts the guard and
+    /// re-commits. With the protect FIRST, Windows refuses it:
+    /// `VirtualProtect` fails on pages the purge just decommitted. The
+    /// restore then reports failure, the chunk is retired in place for the
+    /// life of the process, and the failure is counted as a refused commit,
+    /// which is the counter that tells mechanism A apart.
+    #[test]
+    #[cfg(not(miri))] // guard pages need real OS protection
+    fn a_freed_guarded_object_recycles_its_chunk_with_purging_on() {
+        let _g = crate::arena::adopt_tests::lock();
+        let h = crate::init::create_heap(0, true, -1);
+        // SAFETY: heap ours on this thread; each block is ours, freed once.
+        unsafe {
+            (*(*h).heap.get()).guarded_set_size_bound(1, 64 * 1024);
+            (*(*h).heap.get()).guarded_set_sample_rate(1, 0x1234);
+        }
+        // Both purge forms: decommit (the default) and reset, which keeps
+        // the range committed and so has to cope with the no-access page.
+        for decommits in [1, 0] {
+            crate::options::set(5, decommits); // purge_decommits
+            crate::options::set(15, 0);
+            // SAFETY: as above.
+            unsafe { free_one_guarded(h, decommits) };
+            crate::options::set(15, -1);
+        }
+        crate::options::set(5, 1);
+        // SAFETY: heap ours, no live blocks.
+        unsafe { crate::init::heap_destroy(h) };
+    }
+
+    /// One guarded 4 KiB object from `h`, written and freed; the free must not
+    /// count a refused commit.
+    ///
+    /// # Safety
+    /// `h` is a live heap of this thread with guarded sampling on.
+    unsafe fn free_one_guarded(h: *mut crate::init::HeapBox, decommits: i64) {
+        // SAFETY: caller contract; the block is ours, freed once.
+        unsafe {
+            let p = crate::alloc::heap_malloc(h, 4096);
+            assert!(!p.is_null());
+            let seg = segment_of(p);
+            assert!((*seg).guarded, "setup: the object was not guarded");
+            assert!(
+                crate::arena::owns(seg.cast()),
+                "setup: the guarded segment is not arena memory"
+            );
+            p.write_bytes(0xA7, 4096);
+            let failures = crate::stats::commit_failures();
+            free(p);
+            assert_eq!(
+                crate::stats::commit_failures(),
+                failures,
+                "purge_decommits = {decommits}: the guarded chunk could not be restored, so it was retired"
+            );
+        }
     }
 }
 
