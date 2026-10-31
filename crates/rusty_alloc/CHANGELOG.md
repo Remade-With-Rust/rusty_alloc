@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The default arena no longer commits its whole reservation.** Every
+  process reserved its 1 GiB arena (`arena_reserve`) committed. On Windows
+  that charged 1 GiB of commit per process, whatever it used (measured:
+  1027 MiB of commit with a 4 MiB working set; now 33 MiB). On Linux the
+  read-write mapping counted against the overcommit heuristic, so a machine
+  with about 1 GiB of RAM (rusty_WRT's 512 MB routers, a 1 GB VM) refused it,
+  logged `__vm_enough_memory` at every process start and fell back to one OS
+  mapping per segment. The arena is now reserved without committing
+  (`PROT_NONE` + `MAP_NORESERVE` on Linux, `MEM_RESERVE` on Windows), and
+  each 32 MiB chunk is committed the first time a segment claims it. If the
+  OS refuses that commit, the claim is released and the allocation falls back
+  as before, without reserving further arenas. Cost: one `mprotect` or
+  `VirtualAlloc` per chunk over the life of the process (perl +13 Ir on
+  772 M, sqlite +10 on 316 M).
+- `arena::reserve_os_memory_ex` honours `commit = false`, which it ignored
+  before.
+
 ## [2.3.0](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.2.7...rusty_alloc-v2.3.0) - 2026-10-30
 
 ### Fixed

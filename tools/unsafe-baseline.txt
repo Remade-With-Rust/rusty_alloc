@@ -1,5 +1,5 @@
    123  crates/rusty_alloc/src/alloc.rs
-    15  crates/rusty_alloc/src/arena.rs
+    20  crates/rusty_alloc/src/arena.rs
     80  crates/rusty_alloc/src/heap.rs
     43  crates/rusty_alloc/src/init.rs
      2  crates/rusty_alloc/src/lib.rs

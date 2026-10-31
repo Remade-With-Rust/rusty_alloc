@@ -290,11 +290,12 @@ fn arena_bitmap_reaches_past_its_first_word() {
     // One chunk per huge block, and enough of them to cross a 32-bit word.
     const CHUNKS: usize = 33;
     let want = CHUNKS * SEGMENT_SIZE;
-    // At the shipped 32 MiB geometry that is ~1.06 GiB, eagerly committed
-    // (`reserve_os_memory_ex` ignores `commit=false` in v1, a recorded
-    // divergence). Skip rather than fail where the box will not give it —
-    // under the small profile the same test costs 2.1 MiB and always runs.
-    let Ok(arena_id) = arena::reserve_os_memory_ex(want, true, false, true) else {
+    // At the shipped 32 MiB geometry that is ~1.06 GiB of address space,
+    // reserved without committing (each chunk commits as it is claimed, so
+    // the test commits 33 chunks one by one). Skip rather than fail where the
+    // box will not give it; under the small profile the same test costs
+    // 2.1 MiB and always runs.
+    let Ok(arena_id) = arena::reserve_os_memory_ex(want, false, false, true) else {
         eprintln!("skipped: could not reserve {want} bytes for a {CHUNKS}-chunk arena");
         return;
     };
