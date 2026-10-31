@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.1](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.3.0...rusty_alloc-v2.3.1) - 2026-10-31
+
 ### Fixed
 
 - **The default arena no longer commits its whole reservation.** Every
@@ -22,7 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   OS refuses that commit, the claim is released and the allocation falls back
   as before, without reserving further arenas. Cost: one `mprotect` or
   `VirtualAlloc` per chunk over the life of the process (perl +13 Ir on
-  772 M, sqlite +10 on 316 M).
+  772 M, sqlite +10 on 316 M). Verified in rusty_WRT on a KVM guest
+  (overcommit mode 0) at 1024 and 512 MiB, 1600 process starts per arm:
+  `__vm_enough_memory` lines went from 10–11 per block of 200 starts (the
+  printk rate limit; every start failed) to 0, the long-lived daemon now
+  holds the reservation (`---p`, Rss 0) plus one 32 MiB chunk, and RSS and
+  start time are unchanged.
 - `arena::reserve_os_memory_ex` honours `commit = false`, which it ignored
   before.
 

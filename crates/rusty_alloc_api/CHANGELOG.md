@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.1](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-api-v2.3.0...rusty_alloc-api-v2.3.1) - 2026-10-31
+
+### Fixed
+
+- Picks up `rusty_alloc` 2.3.1: the default arena is reserved uncommitted
+  and committed a 32 MiB chunk at a time, so a process no longer charges
+  1 GiB of commit on Windows or fails the overcommit check on a ~1 GiB Linux
+  machine. This crate's code is unchanged.
+
 ## [2.3.0](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-api-v2.2.7...rusty_alloc-api-v2.3.0) - 2026-10-30
 
 ### Performance
