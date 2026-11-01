@@ -18,7 +18,7 @@ rusty_alloc = { path = "../rusty_alloc" }
 
 [dev-dependencies]
 rusty_alloc-api = { path = "../rusty_alloc_api" }
-libloading = "0.8"
+libloading = "0.9"
 
 [lints]
 workspace = true
