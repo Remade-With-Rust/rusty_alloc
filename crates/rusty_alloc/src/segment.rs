@@ -572,7 +572,7 @@ pub unsafe fn segment_free(seg: *mut Segment) -> Result<(), PrimError> {
     // pending, so the arena purges it once it has stayed free for the delay
     // and a segment claimed again inside the window refaults nothing. Under
     // `0` its spans were purged as they were freed; under `< 0` nothing is.
-    let pending = crate::options::get(15) > 0;
+    let pending = crate::OS_PAGES && crate::options::get(15) > 0;
     if LAZY_COMMIT {
         // Nothing to restore: guard pages live only in Huge segments, and
         // purged or never-committed slices are recorded on the chunk instead
@@ -867,7 +867,10 @@ pub unsafe fn span_alloc(seg: *mut Segment, slices: usize) -> (*mut Page, bool) 
         }
         // Commit ahead of the cursor before anything is carved. A refusal is
         // a failed span, exactly as a refused re-commit above.
-        if idx + slices > (*seg).commit_end as usize && !commit_frontier(seg, idx + slices) {
+        if LAZY_COMMIT
+            && idx + slices > (*seg).commit_end as usize
+            && !commit_frontier(seg, idx + slices)
+        {
             return (ptr::null_mut(), false);
         }
         // First carve of these slots in this tenancy: on a recycled chunk
@@ -1009,7 +1012,7 @@ pub unsafe fn span_free(seg: *mut Segment, page: *mut Page) -> usize {
         if merged_purged {
             (*seg).pages[idx].purged = true;
         }
-        if delay > 0 {
+        if crate::OS_PAGES && delay > 0 {
             return schedule_purge(seg, idx, delay as u64);
         }
         0
@@ -1459,7 +1462,7 @@ pub unsafe fn huge_free(seg: *mut Segment) -> Result<(), PrimError> {
                 seg.cast(),
                 (*seg).total_size / SEGMENT_SIZE,
                 None,
-                delay > 0,
+                crate::OS_PAGES && delay > 0,
             ) {
                 return Ok(());
             }
@@ -1977,6 +1980,7 @@ mod purge_delay_tests {
     /// clears the deadline; before it, an unforced pass does nothing and a
     /// forced one purges at once.
     #[test]
+    #[cfg_attr(miri, ignore)] // real time: the mock prim's clock counts calls
     fn an_expired_deadline_purges_and_a_forced_pass_does_not_wait() {
         let _g = crate::arena::adopt_tests::lock();
         // SAFETY: as documented on the helpers.
@@ -2010,6 +2014,7 @@ mod purge_delay_tests {
     /// is freed in the same segment: A is purged, B is not, and the deadline
     /// is re-armed for B.
     #[test]
+    #[cfg_attr(miri, ignore)] // real time: the mock prim's clock counts calls
     fn an_expired_deadline_spares_a_span_freed_just_now() {
         let _g = crate::arena::adopt_tests::lock();
         let n = MEDIUM_PAGE_SLICES + 1;
@@ -2052,6 +2057,7 @@ mod purge_delay_tests {
     /// `purge_delay = 0` every free purged and every reuse refaulted), and a
     /// forced collect afterwards still gives the span back.
     #[test]
+    #[cfg_attr(miri, ignore)] // megabytes of writes per round: too slow under miri
     fn a_large_buffer_loop_under_a_delay_never_purges_until_collected() {
         use crate::alloc::{collect, free, malloc, stats};
         let _g = crate::arena::adopt_tests::lock();
@@ -2087,6 +2093,7 @@ mod purge_delay_tests {
     /// resident, so 20 rounds purge nothing; a forced collect then purges
     /// them through the arena pass.
     #[test]
+    #[cfg_attr(miri, ignore)] // megabytes of writes per round: too slow under miri
     fn a_huge_buffer_loop_under_a_delay_never_purges_until_collected() {
         use crate::alloc::{collect, free, malloc, stats};
         let _g = crate::arena::adopt_tests::lock();
@@ -2185,7 +2192,8 @@ mod free_slot_tests {
         );
         // Linux and macOS give back zero pages; Windows' MEM_RESET leaves
         // the contents undefined, so only the count is checked there.
-        #[cfg(unix)]
+        // (miri's mock prim keeps contents too.)
+        #[cfg(all(unix, not(miri)))]
         if crate::options::is_enabled(5) {
             for &b in &blocks[1..] {
                 // SAFETY: the slot is free but still mapped and accessible:
@@ -2216,6 +2224,7 @@ mod free_slot_tests {
     /// Under a positive delay an unforced collect only stamps a free slot;
     /// a later one past the delay purges it; a forced one never waits.
     #[test]
+    #[cfg_attr(miri, ignore)] // real time: the mock prim's clock counts calls
     fn a_free_slot_waits_out_the_delay() {
         let _g = crate::arena::adopt_tests::lock();
         let bs = 16 * 1024;

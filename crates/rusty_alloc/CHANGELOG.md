@@ -58,6 +58,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The wasm module is back under its size gate.** 2.3.1's commit-on-claim
+  bookkeeping, and since then commit on demand, the purge delays and the
+  free-slot purge, compiled into wasm, where committing and purging are
+  no-ops: 653 bytes gzipped over the gate at 2.3.1, 2,768 with this
+  release's work. All of it now folds away on a constant where commit and
+  purge are no-ops (wasm, fixed region): 21,291 bytes gzipped, 90 over 2.3.0
+  on the same toolchain.
 - **A thread no longer costs 32 MiB of commit.** Every segment committed its
   whole 32 MiB when it was claimed, and each thread's first allocation claims
   one, so on Windows the commit charge grew by 32 MiB per live thread however

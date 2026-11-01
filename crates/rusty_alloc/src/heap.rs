@@ -1628,7 +1628,7 @@ impl Heap {
             // The free-slot purge (`page_purge_free_slots`) takes pages whose
             // blocks span two OS pages or more, whenever purging is on.
             // `usize::MAX` turns it off with the one compare it costs per page.
-            let purge_on = crate::options::get(15) >= 0;
+            let purge_on = crate::OS_PAGES && crate::options::get(15) >= 0;
             let slot_min = if purge_on {
                 2 * crate::os::page_size()
             } else {
@@ -1668,7 +1668,7 @@ impl Heap {
                         // and a released segment has no queued pages (release
                         // requires used_pages == 0).
                         let _ = self.retire_span(seg, p); // nosemgrep: discarded-lifecycle-result -- terminal, see comment above
-                    } else if (*p).block_size >= slot_min {
+                    } else if purge_on && (*p).block_size >= slot_min {
                         let now = *slot_now.get_or_insert_with(|| {
                             (!force).then(|| (crate::prim::clock_now() / 1_000_000) as u32)
                         });
@@ -1689,7 +1689,7 @@ impl Heap {
             // `mi_collect(true)` asks for. After the sweep, so spans it just
             // retired are included. The clock is read only if some segment
             // has a deadline running.
-            if crate::options::get(15) > 0 {
+            if crate::OS_PAGES && crate::options::get(15) > 0 {
                 let mut now = None;
                 let mut s = self.segments;
                 while !s.is_null() {

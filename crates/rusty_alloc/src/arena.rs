@@ -136,6 +136,9 @@ fn set_bits(map: &[AtomicBitWord], from: usize, to: usize) {
 /// `a` is a live descriptor and `start..start + n` lies inside its live
 /// chunks.
 unsafe fn commit_claimed(a: *mut Arena, start: usize, n: usize) -> bool {
+    if !crate::OS_PAGES {
+        return true; // memory there is committed whatever the bits say
+    }
     // SAFETY: live descriptor (caller contract).
     let all = unsafe {
         (start..start + n).all(|j| {
@@ -194,7 +197,7 @@ fn arena_register(
         (*a).exclusive = exclusive;
         (*a).owned = owned;
         (*a).numa_node = numa_node;
-        if committed {
+        if crate::OS_PAGES && committed {
             set_bits(&(*a).committed, 0, chunks);
         }
     }
@@ -752,7 +755,7 @@ pub fn chunk_release(p: *mut u8, n: usize, committed: Option<bool>, pending: boo
     // `committed` bits or stamps until the `used` release below publishes
     // them.
     unsafe {
-        if let Some(full) = committed {
+        if let (true, Some(full)) = (crate::OS_PAGES, committed) {
             for j in start..end {
                 let w = &(*a).committed[j / WORD_BITS];
                 if full {
@@ -762,7 +765,7 @@ pub fn chunk_release(p: *mut u8, n: usize, committed: Option<bool>, pending: boo
                 }
             }
         }
-        if pending {
+        if crate::OS_PAGES && pending {
             let now = now_ms();
             for j in start..end {
                 (*a).freed_ms[j].store(now, Ordering::Relaxed);
@@ -789,7 +792,7 @@ pub fn chunk_release(p: *mut u8, n: usize, committed: Option<bool>, pending: boo
 /// address space only, and only in that window.
 #[allow(clippy::needless_range_loop)] // indexed scan over a fixed atomic table
 pub fn purge_due(force: bool) -> usize {
-    if crate::FIXED_REGION {
+    if !crate::OS_PAGES {
         return 0;
     }
     let count = ARENA_COUNT.load(Ordering::Acquire).min(MAX_ARENAS);
@@ -966,7 +969,10 @@ pub(crate) fn adopt_os_block(ptr: *mut u8, size: usize) -> Option<i32> {
                 // An OS block arrives committed.
                 for j in chunks..chunks + n {
                     (*a).dirty[j / WORD_BITS].fetch_or(1 << (j % WORD_BITS), Ordering::AcqRel);
-                    (*a).committed[j / WORD_BITS].fetch_or(1 << (j % WORD_BITS), Ordering::AcqRel);
+                    if crate::OS_PAGES {
+                        (*a).committed[j / WORD_BITS]
+                            .fetch_or(1 << (j % WORD_BITS), Ordering::AcqRel);
+                    }
                     (*a).used[j / WORD_BITS].fetch_and(!(1 << (j % WORD_BITS)), Ordering::AcqRel);
                 }
                 (*a).chunks_live.store(chunks + n, Ordering::Release);
@@ -1302,6 +1308,7 @@ mod commit_tests {
     /// been free for `purge_delay`; a forced pass purges it at once, and a
     /// decommit leaves it marked uncommitted for its next tenant.
     #[test]
+    #[cfg_attr(miri, ignore)] // real time: the mock prim's clock counts calls
     fn a_pending_chunk_is_purged_after_the_delay_or_when_forced() {
         // The tests that set the process-wide `purge_delay` share this lock.
         let _g = adopt_tests::lock();

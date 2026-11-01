@@ -218,6 +218,16 @@ pub(crate) const SHARED_LIGHT: bool = !ONE_THREAD;
 /// instead (`docs/plans/finished/firmware-code-size.md`, lever 3).
 pub(crate) const GUARD_PAGES: bool = cfg!(any(unix, windows, miri));
 
+/// `true` where committing, purging and protecting memory are real OS calls
+/// (`prim::unix`, `prim::windows`, and miri's mock, which tests the same
+/// paths). On wasm and a fixed region they are no-ops, so everything that
+/// exists only to drive them folds away on this constant: commit-on-claim,
+/// commit on demand, both purge delays and the free-slot purge. The runtime
+/// gates (`purge_delay`, a chunk's `committed` bit) cannot remove that code,
+/// for the reason `GUARD_PAGES` gives. Measured on the wasm size gate: they
+/// had added 2,768 bytes gzipped to a 20,873-byte module.
+pub(crate) const OS_PAGES: bool = cfg!(any(unix, windows, miri));
+
 /// Whether anything draws from a heap's CSPRNG: `secure` free-list keys, or
 /// guarded sampling. A build with neither never seeds it.
 pub(crate) const RNG_USED: bool = GUARD_PAGES || cfg!(feature = "secure");
