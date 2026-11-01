@@ -400,6 +400,12 @@ call `collect(true)` before entering the loop, or set `purge_delay` to `0`.
 `collect` reaches only the calling thread's memory (its own heap, or the
 shared light heap on a light thread), so call it on the thread that freed
 the memory, at that thread's idle point: after a burst, not before it.
+Give that idle point a deadline of its own, such as once after 2 s with no
+I/O. A loop whose wait timeout comes from its own task deadlines always
+wakes with a task due, so "collect when there is nothing to do" never runs
+there. On rusty_WRT's odhcpd, in a test build that allocates a fresh
+netlink buffer per read, that debounce took anonymous PSS from 432 to 260
+KiB at boot.
 The same collect also gives back the free slots of a page that still holds
 a live block: a 512 KiB medium page (8-64 KiB requests) pinned by one
 long-lived object returns each free slot's pages past its first
