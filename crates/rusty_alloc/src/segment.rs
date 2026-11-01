@@ -2207,6 +2207,22 @@ mod free_slot_tests {
         assert_eq!(stats().purges, before, "a purged slot was purged again");
         // The slots are ordinary free blocks: allocate and fill them all.
         let again: Vec<*mut u8> = (1..blocks.len()).map(|_| malloc(bs)).collect();
+        // Every one comes back from the pinned page, i.e. the free list
+        // survived the purge whole. A purge that reached a block's first OS
+        // page would zero its link on Linux and end the list there: the
+        // slots past it would leak and these would come from a new page.
+        let mut sorted = again.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), again.len(), "a slot was handed out twice");
+        // SAFETY: page lookups on live blocks.
+        unsafe {
+            let pg = page_of(segment_of(blocks[0]), blocks[0]);
+            assert!(
+                again.iter().all(|&b| page_of(segment_of(b), b) == pg),
+                "a purged slot was lost from the free list"
+            );
+        }
         // SAFETY: live blocks, each written in full and freed once.
         unsafe {
             for &b in &again {
