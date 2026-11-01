@@ -4,7 +4,22 @@ Status: BUILT (2026-10-31), `page::page_purge_free_slots`, run from every
 collect while purging is on. WSL2 probe, one block pinned, after
 `collect(true)`: 64 KiB +452 -> +32 KiB, 32 KiB +484 -> +64, 16 KiB +500 ->
 +128 (glibc +132); the residue is each free block's first OS page, which
-keeps the free-list link. Awaiting rusty_WRT's `netlink_no_lend` gate below.
+keeps the free-list link. On rusty_WRT (musl, static, light heap), a probe
+that pins pages the same way: retained growth comes down to about the live
+data, 90-100 % of the slack against 11-36 % before.
+
+**The odhcpd case below was misdiagnosed, and its gate is withdrawn
+(2026-10-31).** With a collect that provably fires (once after 2 s with no
+I/O, in odhcpd's own loop), three boots per arm, `netlink_no_lend`, odhcpd
+anonymous PSS: no collect 432 KiB; collect on this commit 260; collect
+before it (`6642e2f`) 264. The collect is the whole 172 KiB; the free-slot
+purge adds nothing within the 4 KiB spread. odhcpd's freed buffers sit in
+pages that empty completely, and a plain collect retires those. Nothing had
+ever called collect: there is no purge thread, and a parked daemon never
+reaches a periodic one. The census below read `pages_retired = 0` for that
+reason, not because a live block pinned the page. A real-world gate for
+this feature needs long-lived blocks interleaved with churned ones in one
+size class.
 
 ## The gap
 
@@ -30,7 +45,7 @@ One thread, 50 rounds of N transient buffers written in full and freed, then
 The first row also shows a separate effect: purging defaults to OFF
 (`purge_delay = -1`, `options.rs`), so a default build returns nothing at all.
 
-## Real case: rusty_WRT odhcpd (purge_delay = 0 throughout)
+## Real case: rusty_WRT odhcpd (purge_delay = 0 throughout) — misread, see the status
 
 A single-threaded daemon allocating ~10 transient zeroed 32/64 KiB netlink
 receive buffers across startup. Two whole-system boots per arm, anonymous PSS
