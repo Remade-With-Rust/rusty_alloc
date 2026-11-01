@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.0](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-api-v2.3.1...rusty_alloc-api-v2.4.0) - 2026-11-01
+
+### Changed
+
+- Picks up `rusty_alloc` 2.4.0: purging is on by default (`purge_delay`
+  10 ms, now a real delay), a page pinned by one live block gives back its
+  free slots on collect, and a thread no longer costs 32 MiB of Windows
+  commit charge. The core's changelog has the numbers. This crate's code is
+  unchanged.
+
 ## [2.3.1](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-api-v2.3.0...rusty_alloc-api-v2.3.1) - 2026-10-31
 
 ### Fixed
