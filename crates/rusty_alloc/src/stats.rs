@@ -233,16 +233,34 @@ fn unix_process_info() -> (usize, usize, usize, usize, usize, usize, usize, usiz
         };
         #[cfg(not(target_vendor = "apple"))]
         let (current_rss, peak_rss) = {
-            // Linux: ru_maxrss is KiB; current RSS is field 2 of statm, in pages.
+            // Linux: ru_maxrss is KiB. Current RSS from `smaps_rollup`, which
+            // the kernel sums by walking the page tables, so it is exact.
+            // `statm` reads the mm's RSS counters, which since Linux 6.2 are
+            // per-CPU and read approximately: on a 24-CPU WSL2 6.6 kernel it
+            // did not move at all across a 180 KiB MADV_DONTNEED that
+            // `smaps_rollup` reported to the KiB, which is how
+            // `tests/huge_purge.rs` failed on that machine and not on CI's
+            // smaller runners. `statm` (field 2, in pages) stays the fallback
+            // where `smaps_rollup` is missing (before 4.14) or unreadable.
             let peak = (ru.ru_maxrss as usize) * 1024;
-            let current = std::fs::read_to_string("/proc/self/statm")
+            let rollup = std::fs::read_to_string("/proc/self/smaps_rollup")
                 .ok()
                 .and_then(|s| {
-                    s.split_whitespace()
-                        .nth(1)
-                        .and_then(|v| v.parse::<usize>().ok())
+                    s.lines()
+                        .find_map(|l| l.strip_prefix("Rss:"))
+                        .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<usize>().ok())
                 })
-                .map_or(0, |pages| pages * crate::os::page_size());
+                .map(|kib| kib * 1024);
+            let current = rollup.unwrap_or_else(|| {
+                std::fs::read_to_string("/proc/self/statm")
+                    .ok()
+                    .and_then(|s| {
+                        s.split_whitespace()
+                            .nth(1)
+                            .and_then(|v| v.parse::<usize>().ok())
+                    })
+                    .map_or(0, |pages| pages * crate::os::page_size())
+            });
             (current, peak)
         };
 

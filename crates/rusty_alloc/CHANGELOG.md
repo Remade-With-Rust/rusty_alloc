@@ -58,6 +58,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`stats::process_info` reports current RSS exactly on Linux.** It read
+  `/proc/self/statm`, whose counters Linux 6.2+ keeps per CPU and reads
+  approximately: on a 24-CPU 6.6 kernel it did not move at all across a
+  180 KiB `MADV_DONTNEED` that `/proc/self/smaps_rollup` reported to the KiB.
+  Current RSS now comes from `smaps_rollup` (Linux 4.14+), with `statm` as
+  the fallback. This was the small-profile `huge_purge` failure seen on many
+  -core machines since 2.3.0: the purge worked and the reading did not move.
 - **The wasm module is back under its size gate.** 2.3.1's commit-on-claim
   bookkeeping, and since then commit on demand, the purge delays and the
   free-slot purge, compiled into wasm, where committing and purging are
