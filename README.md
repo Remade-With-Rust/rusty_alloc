@@ -6,7 +6,7 @@
 
 ### In The Wild with 82,661 Active Installs (6 hour Issue response, 72 hour Issue closure)
 > [MATA Network](https://mata.network) uses `rusty_alloc` as their distributed cloud unified allocator
-> deploying across Windows, PC, MAC, Linux, Android, iPhone, WASM, and ESP-32 for Home devices.
+> deploying across Windows, MAC, Linux, Android, iPhone, WASM, and ESP-32 for Home devices.
 > This diverse ecosystem is battle testing our code base in every environment for performance,
 > and security.
 
