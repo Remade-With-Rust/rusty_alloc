@@ -1930,11 +1930,17 @@ unsafe fn realloc_live_body(p: ptr::NonNull<u8>, newsize: usize) -> *mut u8 {
     // branches each move arm decides in one compare, and each knows its copy
     // length outright (`usable` for a growth, `newsize` for a shrink), so the
     // `min` goes too.
-    if newsize > usable {
-        // SAFETY: forwarded contract; a growth copies the whole old block.
-        return unsafe { realloc_move_at(p, newsize, usable, seg, pg) };
-    }
-    if newsize >= usable / 2 {
+    //
+    // ONE move tail, reached by both arms with their copy length (census 4,
+    // vein 5). As two inlined copies of the tail, the shrink arm's length —
+    // `newsize`, which arrives in the register `memcpy` wants the source in —
+    // was parked in a callee-saved register for the whole function, and the
+    // growth arm paid that register's push and pop and the alignment pair
+    // that came with it.
+    let copy = if newsize > usable {
+        // A growth copies the whole old block.
+        usable
+    } else if newsize >= usable / 2 {
         // Keep in place. NOTE: this counter costs a TLS heap lookup (a call
         // into ld.so's __tls_get_addr in a cdylib) on the most common realloc
         // outcome, so removing it was tried as a brick -- and measured FLAT on
@@ -1943,16 +1949,18 @@ unsafe fn realloc_live_body(p: ptr::NonNull<u8>, newsize: usize) -> *mut u8 {
         // unmeasurable gain does not justify losing a work-parity counter.
         stat_realloc(true);
         return p;
-    }
+    } else {
+        // A shrink below half: the copy is the new, smaller size.
+        newsize
+    };
     // NOTE (2026-08-21): moving everything below into an `#[inline(never)]`
     // `realloc_move(p, newsize, usable)` — so `realloc`'s prologue would not
     // carry the register needs of an inlined malloc, memcpy and free — cost
     // **+12.00 Ir/op** and was reverted. The argument setup plus the call and
     // return are paid on every MOVING realloc, and the scan is all moves; the
     // frame it saved was smaller than the call it added.
-    // A shrink below half: the copy is the new, smaller size.
-    // SAFETY: forwarded contract.
-    unsafe { realloc_move_at(p, newsize, newsize, seg, pg) }
+    // SAFETY: forwarded contract; `copy <= usable` and `copy <= newsize`.
+    unsafe { realloc_move_at(p, newsize, copy, seg, pg) }
 }
 
 /// Allocate, copy `copy` bytes and free `p`, for a caller that has resolved
