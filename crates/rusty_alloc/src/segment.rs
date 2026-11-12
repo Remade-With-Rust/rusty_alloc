@@ -928,6 +928,7 @@ pub unsafe fn span_free(seg: *mut Segment, page: *mut Page) -> usize {
             (*page).payload = ptr::null_mut();
         }
         (*page).flags.store(0, Ordering::Relaxed);
+        crate::page::page_owner_clear(page);
         (*page).free_is_zero = false;
 
         // Merge right: the slot at idx+len (if carved) is a span START.
@@ -1386,6 +1387,7 @@ pub fn huge_alloc(
             crate::page::pflags::HUGE_SEGMENT | crate::page::pflags::SINGLE_BLOCK,
             Ordering::Relaxed,
         );
+        crate::page::page_owner_clear(page);
         (*page).free_is_zero = b.is_zero;
         // Every slice of a huge segment resolves to slot 1, so the owner table
         // is one value repeated across the run, and it is the ONLY record of

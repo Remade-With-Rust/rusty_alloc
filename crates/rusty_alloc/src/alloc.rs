@@ -1152,7 +1152,7 @@ unsafe fn free_inline_impl<const OWNER_FIRST: bool>(p: *mut u8) {
 /// As [`free`], `seg == segment_of(p)`, and with `KNOWN_PAGE`,
 /// `known_pg == page_of(seg, p)`.
 #[inline(always)]
-unsafe fn free_body<const OWNER_FIRST: bool, const KNOWN_PAGE: bool>(
+unsafe fn free_body_classic<const OWNER_FIRST: bool, const KNOWN_PAGE: bool>(
     p: *mut u8,
     seg: *mut Segment,
     known_pg: *mut Page,
@@ -1277,178 +1277,264 @@ unsafe fn free_body<const OWNER_FIRST: bool, const KNOWN_PAGE: bool>(
                     return;
                 }
             }
-            {
-                // Routing the whole free on ONE byte is only safe while that
-                // byte agrees with the fields it summarises. These two check
-                // exactly that, against INDEPENDENT representations: the
-                // segment's own kind tag, and the page's bin. A desync (a page
-                // built without its flag, a flag cleared by a stray write)
-                // would otherwise send a huge or unqueued span down the binned
-                // path and corrupt silently — so assert it where the decision
-                // is actually made, not in a helper that may go uncalled.
-                debug_assert_eq!(
-                    (*seg).kind,
-                    SegmentKind::Normal,
-                    "free fast path: HUGE_SEGMENT clear but segment is Huge"
-                );
-                debug_assert_ne!(
-                    (*pg).bin as usize,
-                    BIN_HUGE,
-                    "free fast path: SINGLE_BLOCK clear but bin is BIN_HUGE"
-                );
-                // Upstream's `mi_free_block_local` touches NO heap: the PAGE
-                // owns `local_free`. The only parts of a fast-path free that
-                // need the owning heap are the stats counter — which, like
-                // upstream's `MI_STAT`, exists only in debug builds — and
-                // retiring a page that just emptied, which is rare. So the
-                // shipped fast path is push + decrement + ONE branch: both
-                // cold outcomes of the decrement — 0 (page emptied, retire)
-                // and negative (double free, abort) — share a single `<= 0`
-                // test on its flags, and the shared handler is reached by a
-                // tail jump. With no `call` left in the function, the fast
-                // path needs no stack adjustment at all (the M16 lesson,
-                // applied to the alignment push this time).
-                // THE DECREMENT, AND WHY IT IS ASM.
-                //
-                // `used -= 1` followed by a test of the result is five
-                // instructions from safe Rust — load, dec, store, test, branch
-                // — because LLVM will not emit a memory-destination RMW when
-                // the decremented value is also needed to drive a branch. It
-                // even re-tests a value `dec` has already set the flags for.
-                // mimalloc emits `subw $1, used; je`: TWO. That gap is 3 Ir on
-                // every local free, `docs/opps.md` #6 measured it on four
-                // workloads (sh6bench +366M, sh8bench +852M, alloc-test +200M,
-                // cfrac +183M), and it was refuted TWICE from safe Rust — the
-                // second time by deleting the return value entirely, which
-                // produced byte-identical code because the caller then had to
-                // re-read the field.
-                //
-                // It is not reachable from safe Rust by any arrangement of
-                // this code. So it is written directly, as the one instruction
-                // pair it is. `used` is a plain owner-only `u32` — no atomic,
-                // no other thread may touch it — so a non-atomic RMW is
-                // exactly right, and the flags `sub` leaves are precisely the
-                // `<= 0` the two cold outcomes share: 0 means the page just
-                // emptied, negative means the count wrapped and this is a
-                // DOUBLE FREE.
-                crate::page::page_link_local(pg, p.cast::<Block>());
-                #[cfg(debug_assertions)]
-                {
-                    (*owner_heap(pg)).stats.frees += 1;
-                }
-                // NOT on an MSVC target that unwinds. This function inlines
-                // into `GlobalAlloc::dealloc`, so into every Rust drop,
-                // including the drops a panic runs; on MSVC those are EH
-                // cleanup FUNCLETS, and LLVM cannot place an `asm!` goto
-                // (`callbr`) in a funclet: its successors lose the funclet
-                // colouring and the verifier rejects the module ("Bogus
-                // funclet pad use"). 2.2.1-2.2.4 failed to build in an
-                // unwinding MSVC consumer with LTO that way (rusty_sloth;
-                // docs/plans/msvc-funclet-asm-goto.md). Those builds take the
-                // plain-Rust decrement below (+3 Ir per local free, opps #6),
-                // which reaches every caller, not just `dealloc`. An MSVC
-                // build with `panic = "abort"` has no funclets and keeps the
-                // asm. Regression gate: the corpus's rusty_sloth row, built
-                // `--release` (no small consumer reproduces it).
-                #[cfg(all(
-                    target_arch = "x86_64",
-                    not(miri),
-                    not(all(target_env = "msvc", panic = "unwind"))
-                ))]
-                {
-                    // SAFETY: `pg` is a live page of this thread; `USED_OFFSET`
-                    // is `offset_of!(Page, used)`, checked against the real
-                    // layout by a unit test. The asm reads and writes only that
-                    // one `u32` and uses no stack.
-                    core::arch::asm!(
-                        // The offset is a `const` operand, not an address
-                        // computed into a register: passing `pg + USED_OFFSET`
-                        // as `in(reg)` costs a `lea` that mimalloc does not
-                        // pay, because x86 addressing carries the displacement
-                        // for free.
-                        "sub dword ptr [{pg} + {off}], 1",
-                        "jle {cold}",
-                        pg = in(reg) pg,
-                        off = const crate::page::USED_OFFSET,
-                        cold = label {
-                            // Page emptied, or the count wrapped. The common
-                            // outcome is "sole page in its queue, keep it warm",
-                            // which needs only the page's own links.
-                            //
-                            // A `label` block does not inherit the enclosing
-                            // `unsafe`; it is a separate item.
-                            // SAFETY: `pg` is the live page this free resolved,
-                            // owned by this thread.
-                            //
-                            // ONE test, not three: `used`, `next` and `prev`
-                            // OR-ed are zero exactly when the page emptied
-                            // (not a wrapped double free) and is its queue's
-                            // only member. Three compare-and-branch pairs
-                            // were 6 Ir on every free that empties a page —
-                            // every free of an alloc/free loop cycling one
-                            // block. `retire_or_abort` re-tests each case.
-                            unsafe {
-                                if ((*pg).used as usize | (*pg).next.addr() | (*pg).prev.addr())
-                                    == 0
-                                {
-                                    return;
-                                }
-                                return retire_or_abort(pg);
-                            }
-                        },
-                        options(nostack),
-                    );
-                }
-                // MSVC with `panic = "unwind"`: no goto (see the arm above),
-                // but an `asm!` with an OUTPUT operand is allowed there, and
-                // `sub` + `setle` is four instructions with the test, where
-                // the plain decrement below is five (load, dec, store, test,
-                // branch: LLVM will not emit a memory-destination RMW whose
-                // result drives a branch). Measured with this arm forced on
-                // Linux: see the note below the cfg.
-                #[cfg(all(
-                    target_arch = "x86_64",
-                    not(miri),
-                    target_env = "msvc",
-                    panic = "unwind"
-                ))]
-                {
-                    let le: u8;
-                    // SAFETY: as the goto arm: `pg` is a live page of this
-                    // thread, `USED_OFFSET` is `offset_of!(Page, used)`, and
-                    // the asm touches only that `u32` and uses no stack.
-                    core::arch::asm!(
-                        "sub dword ptr [{pg} + {off}], 1",
-                        "setle {le}",
-                        pg = in(reg) pg,
-                        off = const crate::page::USED_OFFSET,
-                        le = out(reg_byte) le,
-                        options(nostack),
-                    );
-                    if le != 0 {
-                        // One test, as in the goto arm.
-                        if ((*pg).used as usize | (*pg).next.addr() | (*pg).prev.addr()) == 0 {
-                            return;
-                        }
-                        return retire_or_abort(pg);
-                    }
-                }
-                #[cfg(not(all(target_arch = "x86_64", not(miri))))]
-                {
-                    let u = (*pg).used.wrapping_sub(1);
-                    (*pg).used = u;
-                    if (u as i32) <= 0 {
-                        // One test, as in the x86-64 arm above.
-                        if (u as usize | (*pg).next.addr() | (*pg).prev.addr()) == 0 {
-                            return;
-                        }
-                        return retire_or_abort(pg);
-                    }
-                }
-            }
+            free_local_plain(seg, pg, p);
             return;
         }
         free_general(p, seg, pg, owner_tid);
+    }
+}
+
+/// Free `p`, a block of ours: the ONE-compare fast path, then the body above.
+///
+/// A local free into a plain page is decided by one word of the page
+/// ([`Page::owner_plain`]): it equals this thread's id only for a plain page
+/// of a segment this thread owns. Everything else — a cross-thread free, a
+/// full or aligned or single-block page, an abandoned segment — reads as a
+/// mismatch and takes [`free_slow`], which asks the two original questions.
+/// `OWNER_FIRST` no longer shapes the inlined code (the cold arm is out of
+/// line and tests the owner first), so both entries share this.
+///
+/// # Safety
+/// As [`free_body_classic`].
+#[inline(always)]
+unsafe fn free_body<const OWNER_FIRST: bool, const KNOWN_PAGE: bool>(
+    p: *mut u8,
+    seg: *mut Segment,
+    known_pg: *mut Page,
+) {
+    if crate::page::FAST_OWNER {
+        // SAFETY: `p` is ours per the contract, so `seg` is its live segment
+        // and the resolved slot its page; the word is read, never written.
+        unsafe {
+            let pg = if KNOWN_PAGE {
+                known_pg
+            } else {
+                page_of(seg, p)
+            };
+            let owner = (*pg).owner_plain.load(Ordering::Relaxed);
+            // `thread_id()` IS the fs base here, so the compare takes `fs:0`
+            // as its memory operand (see `free_body_classic`).
+            #[cfg(all(target_arch = "x86_64", target_os = "linux", not(miri)))]
+            core::arch::asm!(
+                "cmp {owner}, fs:0",
+                "jne {slow}",
+                owner = in(reg) owner,
+                slow = label {
+                    // SAFETY: forwarded contract; `pg` is `p`'s page.
+                    unsafe { free_slow(p, seg, pg) };
+                    return;
+                },
+                options(nostack, readonly),
+            );
+            #[cfg(not(all(target_arch = "x86_64", target_os = "linux", not(miri))))]
+            if owner != init::thread_id() {
+                return free_slow(p, seg, pg);
+            }
+            debug_assert_eq!(
+                (*pg).flags.load(Ordering::Relaxed) & pflags::SLOW_FREE,
+                0,
+                "free fast path: the owner word matched a flagged page"
+            );
+            debug_assert_eq!(
+                (*seg).thread_id.load(Ordering::Relaxed),
+                owner,
+                "free fast path: the owner word outlived its segment's owner"
+            );
+            return free_local_plain(seg, pg, p);
+        }
+    }
+    // SAFETY: forwarded contract.
+    unsafe { free_body_classic::<OWNER_FIRST, KNOWN_PAGE>(p, seg, known_pg) }
+}
+
+/// The cold arm of [`free_body`]: not a local free into a plain page.
+///
+/// # Safety
+/// As [`free_body_classic`], with `pg == page_of(seg, p)`.
+#[cold]
+#[inline(never)]
+unsafe fn free_slow(p: *mut u8, seg: *mut Segment, pg: *mut Page) {
+    // SAFETY: forwarded contract.
+    unsafe { free_body_classic::<true, true>(p, seg, pg) }
+}
+
+/// The tail of a local free into a plain page: push, decrement, and the one
+/// branch both cold outcomes of the decrement share.
+///
+/// # Safety
+/// `p` is a block of `pg`, a plain page of `seg`, owned by the calling
+/// thread.
+#[inline(always)]
+unsafe fn free_local_plain(seg: *mut Segment, pg: *mut Page, p: *mut u8) {
+    // SAFETY: per contract.
+    unsafe {
+        // Routing the whole free on ONE byte is only safe while that
+        // byte agrees with the fields it summarises. These two check
+        // exactly that, against INDEPENDENT representations: the
+        // segment's own kind tag, and the page's bin. A desync (a page
+        // built without its flag, a flag cleared by a stray write)
+        // would otherwise send a huge or unqueued span down the binned
+        // path and corrupt silently — so assert it where the decision
+        // is actually made, not in a helper that may go uncalled.
+        debug_assert_eq!(
+            (*seg).kind,
+            SegmentKind::Normal,
+            "free fast path: HUGE_SEGMENT clear but segment is Huge"
+        );
+        debug_assert_ne!(
+            (*pg).bin as usize,
+            BIN_HUGE,
+            "free fast path: SINGLE_BLOCK clear but bin is BIN_HUGE"
+        );
+        // Upstream's `mi_free_block_local` touches NO heap: the PAGE
+        // owns `local_free`. The only parts of a fast-path free that
+        // need the owning heap are the stats counter — which, like
+        // upstream's `MI_STAT`, exists only in debug builds — and
+        // retiring a page that just emptied, which is rare. So the
+        // shipped fast path is push + decrement + ONE branch: both
+        // cold outcomes of the decrement — 0 (page emptied, retire)
+        // and negative (double free, abort) — share a single `<= 0`
+        // test on its flags, and the shared handler is reached by a
+        // tail jump. With no `call` left in the function, the fast
+        // path needs no stack adjustment at all (the M16 lesson,
+        // applied to the alignment push this time).
+        // THE DECREMENT, AND WHY IT IS ASM.
+        //
+        // `used -= 1` followed by a test of the result is five
+        // instructions from safe Rust — load, dec, store, test, branch
+        // — because LLVM will not emit a memory-destination RMW when
+        // the decremented value is also needed to drive a branch. It
+        // even re-tests a value `dec` has already set the flags for.
+        // mimalloc emits `subw $1, used; je`: TWO. That gap is 3 Ir on
+        // every local free, `docs/opps.md` #6 measured it on four
+        // workloads (sh6bench +366M, sh8bench +852M, alloc-test +200M,
+        // cfrac +183M), and it was refuted TWICE from safe Rust — the
+        // second time by deleting the return value entirely, which
+        // produced byte-identical code because the caller then had to
+        // re-read the field.
+        //
+        // It is not reachable from safe Rust by any arrangement of
+        // this code. So it is written directly, as the one instruction
+        // pair it is. `used` is a plain owner-only `u32` — no atomic,
+        // no other thread may touch it — so a non-atomic RMW is
+        // exactly right, and the flags `sub` leaves are precisely the
+        // `<= 0` the two cold outcomes share: 0 means the page just
+        // emptied, negative means the count wrapped and this is a
+        // DOUBLE FREE.
+        crate::page::page_link_local(pg, p.cast::<Block>());
+        #[cfg(debug_assertions)]
+        {
+            (*owner_heap(pg)).stats.frees += 1;
+        }
+        // NOT on an MSVC target that unwinds. This function inlines
+        // into `GlobalAlloc::dealloc`, so into every Rust drop,
+        // including the drops a panic runs; on MSVC those are EH
+        // cleanup FUNCLETS, and LLVM cannot place an `asm!` goto
+        // (`callbr`) in a funclet: its successors lose the funclet
+        // colouring and the verifier rejects the module ("Bogus
+        // funclet pad use"). 2.2.1-2.2.4 failed to build in an
+        // unwinding MSVC consumer with LTO that way (rusty_sloth;
+        // docs/plans/msvc-funclet-asm-goto.md). Those builds take the
+        // plain-Rust decrement below (+3 Ir per local free, opps #6),
+        // which reaches every caller, not just `dealloc`. An MSVC
+        // build with `panic = "abort"` has no funclets and keeps the
+        // asm. Regression gate: the corpus's rusty_sloth row, built
+        // `--release` (no small consumer reproduces it).
+        #[cfg(all(
+            target_arch = "x86_64",
+            not(miri),
+            not(all(target_env = "msvc", panic = "unwind"))
+        ))]
+        {
+            // SAFETY: `pg` is a live page of this thread; `USED_OFFSET`
+            // is `offset_of!(Page, used)`, checked against the real
+            // layout by a unit test. The asm reads and writes only that
+            // one `u32` and uses no stack.
+            core::arch::asm!(
+                // The offset is a `const` operand, not an address
+                // computed into a register: passing `pg + USED_OFFSET`
+                // as `in(reg)` costs a `lea` that mimalloc does not
+                // pay, because x86 addressing carries the displacement
+                // for free.
+                "sub dword ptr [{pg} + {off}], 1",
+                "jle {cold}",
+                pg = in(reg) pg,
+                off = const crate::page::USED_OFFSET,
+                cold = label {
+                    // Page emptied, or the count wrapped. The common
+                    // outcome is "sole page in its queue, keep it warm",
+                    // which needs only the page's own links.
+                    //
+                    // A `label` block does not inherit the enclosing
+                    // `unsafe`; it is a separate item.
+                    // SAFETY: `pg` is the live page this free resolved,
+                    // owned by this thread.
+                    //
+                    // ONE test, not three: `used`, `next` and `prev`
+                    // OR-ed are zero exactly when the page emptied
+                    // (not a wrapped double free) and is its queue's
+                    // only member. Three compare-and-branch pairs
+                    // were 6 Ir on every free that empties a page —
+                    // every free of an alloc/free loop cycling one
+                    // block. `retire_or_abort` re-tests each case.
+                    unsafe {
+                        if ((*pg).used as usize | (*pg).next.addr() | (*pg).prev.addr())
+                            == 0
+                        {
+                            return;
+                        }
+                        return retire_or_abort(pg);
+                    }
+                },
+                options(nostack),
+            );
+        }
+        // MSVC with `panic = "unwind"`: no goto (see the arm above),
+        // but an `asm!` with an OUTPUT operand is allowed there, and
+        // `sub` + `setle` is four instructions with the test, where
+        // the plain decrement below is five (load, dec, store, test,
+        // branch: LLVM will not emit a memory-destination RMW whose
+        // result drives a branch). Measured with this arm forced on
+        // Linux: see the note below the cfg.
+        #[cfg(all(
+            target_arch = "x86_64",
+            not(miri),
+            target_env = "msvc",
+            panic = "unwind"
+        ))]
+        {
+            let le: u8;
+            // SAFETY: as the goto arm: `pg` is a live page of this
+            // thread, `USED_OFFSET` is `offset_of!(Page, used)`, and
+            // the asm touches only that `u32` and uses no stack.
+            core::arch::asm!(
+                "sub dword ptr [{pg} + {off}], 1",
+                "setle {le}",
+                pg = in(reg) pg,
+                off = const crate::page::USED_OFFSET,
+                le = out(reg_byte) le,
+                options(nostack),
+            );
+            if le != 0 {
+                // One test, as in the goto arm.
+                if ((*pg).used as usize | (*pg).next.addr() | (*pg).prev.addr()) == 0 {
+                    return;
+                }
+                return retire_or_abort(pg);
+            }
+        }
+        #[cfg(not(all(target_arch = "x86_64", not(miri))))]
+        {
+            let u = (*pg).used.wrapping_sub(1);
+            (*pg).used = u;
+            if (u as i32) <= 0 {
+                // One test, as in the x86-64 arm above.
+                if (u as usize | (*pg).next.addr() | (*pg).prev.addr()) == 0 {
+                    return;
+                }
+                return retire_or_abort(pg);
+            }
+        }
     }
 }
 

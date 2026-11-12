@@ -449,6 +449,23 @@ pub struct Page {
     /// synthetic microbenchmark. Upstream mimalloc reads these flags
     /// non-atomically and does not pay the instruction — and has the race.
     pub flags: AtomicU8,
+    /// The fast-path owner word: the owning thread's id (the segment's
+    /// `thread_id`) while this is a PLAIN page — live, binned, no
+    /// [`pflags::SLOW_FREE`] bit — and 0 otherwise (flagged, free, or in an
+    /// abandoned segment).
+    ///
+    /// `free` asked two questions with two loads and two branches: is the
+    /// segment mine (`Segment::thread_id`), and is the page plain (`flags`).
+    /// This word answers both with one load and one compare, because a
+    /// thread's own id can match only a plain page of a segment it owns. A
+    /// mismatch says nothing by itself — the cold arm asks the two original
+    /// questions — so a stale 0 costs speed and never correctness. A stale
+    /// NON-zero would be a defect: every writer of `flags` and of
+    /// `Segment::thread_id` keeps this in step ([`page_owner_sync`],
+    /// [`page_owner_clear`]), and the local free asserts it in debug builds.
+    /// Written only by the owning thread; read by any thread, hence atomic.
+    /// Measured: 6 -> 3 instructions on every local free (census 4, vein 1).
+    pub owner_plain: AtomicUsize,
     /// The un-extended tail AND current free list are known zero.
     pub free_is_zero: bool,
     /// This span's memory was PURGED (decommitted/reset) while free. It must
@@ -560,6 +577,7 @@ impl Page {
             slice_offset: 0,
             bin: 0,
             flags: AtomicU8::new(0),
+            owner_plain: AtomicUsize::new(0),
             free_is_zero: false,
             purged: false,
             heap_tag: 0,
@@ -1384,6 +1402,45 @@ pub unsafe fn page_purge_free_slots(
             }
         }
         n
+    }
+}
+
+/// Whether pages carry a live [`Page::owner_plain`]. Not on a one-context
+/// build, where the owner test folds away, nor on wasm, which has one thread
+/// and a size budget.
+pub(crate) const FAST_OWNER: bool =
+    !crate::ONE_THREAD && cfg!(not(all(target_arch = "wasm32", not(miri))));
+
+/// Set `page`'s owner word from its flags and its segment's owner: call after
+/// initialising a page, after CLEARING a slow flag, and when a segment
+/// changes hands.
+///
+/// # Safety
+/// `page` is a live page slot of `seg`, owned by the calling thread.
+#[inline(always)]
+pub unsafe fn page_owner_sync(page: *mut Page, seg: *mut crate::segment::Segment) {
+    if FAST_OWNER {
+        // SAFETY: per contract.
+        unsafe {
+            let plain = (*page).flags.load(Ordering::Relaxed) & pflags::SLOW_FREE == 0;
+            let tid = (*seg).thread_id.load(Ordering::Relaxed);
+            (*page)
+                .owner_plain
+                .store(if plain { tid } else { 0 }, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Clear `page`'s owner word: call after SETTING a slow flag, when the page
+/// dies, and when its segment is abandoned.
+///
+/// # Safety
+/// `page` is a page slot the calling thread owns.
+#[inline(always)]
+pub unsafe fn page_owner_clear(page: *mut Page) {
+    if FAST_OWNER {
+        // SAFETY: per contract.
+        unsafe { (*page).owner_plain.store(0, Ordering::Relaxed) };
     }
 }
 

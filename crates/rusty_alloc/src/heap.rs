@@ -897,6 +897,7 @@ impl Heap {
                 // of the enclosing frame, not of this code.
                 queue_remove(q, p);
                 (*p).flags.fetch_or(pflags::IN_FULL, Ordering::Relaxed);
+                crate::page::page_owner_clear(p);
                 page_set_flag(p, XFLAG_DELAYED);
                 queue_push_front(&raw mut self.pages[BIN_FULL], p);
                 p = next;
@@ -997,6 +998,7 @@ impl Heap {
             (*p).local_free = ptr::null_mut();
             (*p).bin = bin as u8;
             (*p).flags.store(0, Ordering::Relaxed);
+            crate::page::page_owner_sync(p, segment_of(p.cast::<u8>()));
             // Bump-fresh spans of an eager-committed zero mapping are zero;
             // RECLAIMED spans are recycled memory and are not.
             (*p).free_is_zero = fresh;
@@ -1134,6 +1136,7 @@ impl Heap {
                 (*p).payload = ptr::null_mut();
             }
             (*p).flags.store(pflags::SINGLE_BLOCK, Ordering::Relaxed); // unqueued single-block span
+            crate::page::page_owner_clear(p);
             (*p).free_is_zero = fresh;
             // Unqueued → never scanned → remote frees must go via the
             // delayed list (same rule as parked-full pages).
@@ -1182,6 +1185,7 @@ impl Heap {
             let seg = segment_of(block);
             let pg: *mut Page = &raw mut (*seg).pages[1];
             (*pg).flags.fetch_or(pflags::HAS_ALIGNED, Ordering::Relaxed);
+            crate::page::page_owner_clear(pg);
             (p, true)
         }
     }
@@ -1208,6 +1212,7 @@ impl Heap {
                         pflags::HUGE_SEGMENT | pflags::SINGLE_BLOCK,
                         Ordering::Relaxed,
                     );
+                    crate::page::page_owner_clear(pg);
                     page_set_flag(pg, XFLAG_DELAYED);
                     (*seg).next = self.huge_segments;
                     self.huge_segments = seg;
@@ -1439,6 +1444,7 @@ impl Heap {
                 let seg = segment_of(block);
                 let pg = segment::page_of(seg, block);
                 (*pg).flags.fetch_or(pflags::HAS_ALIGNED, Ordering::Relaxed);
+                crate::page::page_owner_clear(pg);
             }
         }
         // A fresh-zero block is zero at every interior position too.
@@ -1790,6 +1796,8 @@ impl Heap {
                         // docs/opps.md #9. It IS a latency win (no lock prefix
                         // on the common path); this project's metric is Ir.
                         (*slot).flags.fetch_and(!pflags::IN_FULL, Ordering::Relaxed);
+                        // The segment is ours now: its plain pages say so.
+                        crate::page::page_owner_sync(slot, seg);
                         // `next`/`prev` are NOT cleared here: `queue_push_front`
                         // below writes both unconditionally (`prev = null`,
                         // `next = q.first`), and nothing between here and there
@@ -2048,6 +2056,7 @@ impl Heap {
                     }
                     if (*pg).flags.load(Ordering::Relaxed) & pflags::IN_FULL != 0 {
                         (*pg).flags.fetch_and(!pflags::IN_FULL, Ordering::Relaxed);
+                        crate::page::page_owner_sync(pg, seg);
                         queue_remove(&raw mut self.pages[BIN_FULL], pg);
                         page_set_flag(pg, XFLAG_NORMAL);
                         let bin = (*pg).bin as usize;

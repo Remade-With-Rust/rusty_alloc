@@ -925,6 +925,9 @@ unsafe fn thread_done_one(hb: *mut HeapBox) {
                     // live page of every segment a dying thread owns.
                     page_collect_and_set_flag(slot, XFLAG_NEVER);
                     (*slot).xheap.store(0, Ordering::Release);
+                    // No owner from here: a thread that later reuses this
+                    // thread's id must not match the page.
+                    crate::page::page_owner_clear(slot);
                 }
                 idx += len;
                 // `wrapping_add`, not `add`: the pointer is only ever
