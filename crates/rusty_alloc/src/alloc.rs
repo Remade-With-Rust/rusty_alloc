@@ -686,6 +686,7 @@ fn malloc_first(size: usize) -> *mut u8 {
 }
 
 /// Allocate `size` zeroed bytes.
+#[inline]
 pub fn zalloc(size: usize) -> *mut u8 {
     // Same TLS shape as `malloc` and `malloc_aligned_at`: `heap_box_fast` and
     // one compare against the shared sentinel, not `my_heap` — which goes
@@ -813,6 +814,13 @@ unsafe fn zero_block(p: *mut u8, is_zero: bool) {
 }
 
 /// `calloc`: overflow-checked `count * size`, zeroed.
+// `#[inline]`, and `zalloc` with it, so the C export (`rusty_alloc_override`'s
+// `calloc`) IS the body. Without them the export was one instruction, a jump
+// through the GOT to this function, on every `calloc` of an interposed
+// program (census 4, vein 3). BOTH or neither: with only this one inline the
+// export became the multiply and a jump to `zalloc` with the size moved
+// into place, opscan calloc 84.01 -> 85.88.
+#[inline]
 pub fn calloc(count: usize, size: usize) -> *mut u8 {
     match count.checked_mul(size) {
         Some(total) => zalloc(total),
