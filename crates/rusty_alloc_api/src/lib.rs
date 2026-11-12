@@ -214,17 +214,27 @@ unsafe impl GlobalAlloc for RustyAlloc {
             // stays keeps its address, and a move lands in a class of at
             // least two words. Before this, every realloc aligned above one
             // word (a growing `Vec<u128>`, say) was an allocate-copy-free.
-            let new_size = if layout.align() <= WORD {
-                new_size
-            } else {
-                new_size.max(NATURAL_ALIGN)
-            };
+            //
+            // `realloc_rust` takes the four values in the registers
+            // `__rust_realloc` holds them in, so a word-aligned layout — all
+            // but a handful of real ones — is one compare and a jump; the
+            // rare two-word layout pays its `max` on its own branch. As
+            // `realloc(ptr, select(new_size, max(new_size, 16)))` every
+            // realloc paid the select and the register move.
             // SAFETY: GlobalAlloc contract — ptr live and non-null,
             // invalidated on move; our realloc preserves min(old, new) bytes.
-            // The hint lets `realloc`'s null arm fold away.
             unsafe {
-                core::hint::assert_unchecked(!ptr.is_null());
-                rusty_alloc::alloc::realloc(ptr, new_size)
+                let p = core::ptr::NonNull::new_unchecked(ptr);
+                if layout.align() <= WORD {
+                    rusty_alloc::alloc::realloc_rust(p, layout.size(), layout.align(), new_size)
+                } else {
+                    rusty_alloc::alloc::realloc_rust(
+                        p,
+                        layout.size(),
+                        layout.align(),
+                        new_size.max(NATURAL_ALIGN),
+                    )
+                }
             }
         } else {
             // Above `NATURAL_ALIGN`. The block already satisfies

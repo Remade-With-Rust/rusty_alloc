@@ -1828,6 +1828,43 @@ pub unsafe fn realloc(p: *mut u8, newsize: usize) -> *mut u8 {
 /// `p` must be a live pointer from this allocator; invalidated on move.
 #[inline(never)]
 unsafe fn realloc_live(p: ptr::NonNull<u8>, newsize: usize) -> *mut u8 {
+    // SAFETY: forwarded contract.
+    unsafe { realloc_live_body(p, newsize) }
+}
+
+/// [`realloc`] for Rust's `GlobalAlloc`, whose `__rust_realloc` receives
+/// `(ptr, old_size, align, new_size)`: the same body as [`realloc_live`]
+/// behind a symbol that takes its arguments in THOSE registers.
+///
+/// Through `realloc(ptr, new_size)` the entry had to move `new_size` from the
+/// fourth register to the second before it could jump, and it did so with a
+/// branch-free select between `new_size` and `max(new_size, 16)`: eight
+/// instructions in front of every Rust realloc. Here a word-aligned layout
+/// is one compare and the jump (census 4, vein 5).
+///
+/// `old_size` and `align` are the layout's; this body does not read them.
+///
+/// # Safety
+/// `p` must be a live pointer from this allocator, allocated with a layout
+/// of at most [`crate::types::NATURAL_ALIGN`]; invalidated on move.
+#[inline(never)]
+pub unsafe fn realloc_rust(
+    p: ptr::NonNull<u8>,
+    _old_size: usize,
+    _align: usize,
+    newsize: usize,
+) -> *mut u8 {
+    // SAFETY: forwarded contract.
+    unsafe { realloc_live_body(p, newsize) }
+}
+
+/// The body of [`realloc_live`] and [`realloc_rust`]: one body, two symbols,
+/// because the two callers hold `newsize` in different registers.
+///
+/// # Safety
+/// As [`realloc_live`].
+#[inline(always)]
+unsafe fn realloc_live_body(p: ptr::NonNull<u8>, newsize: usize) -> *mut u8 {
     let p = p.as_ptr();
     // The segment and page are resolved ONCE, here, and handed to the free
     // of a moved block: through `usable_size` and then `free_inline` they
