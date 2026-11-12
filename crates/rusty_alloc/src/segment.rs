@@ -505,6 +505,25 @@ unsafe fn scrub_recycled(seg: *mut Segment, slots: usize, owner_table: bool) {
 /// heap's `arena_id` restriction), else fresh OS memory — and register it in
 /// the segment map. Under [`LAZY_COMMIT`] only the header is committed here.
 pub fn segment_alloc(arena_id: i32) -> Result<*mut Segment, PrimError> {
+    segment_alloc_for(arena_id, 0)
+}
+
+/// [`segment_alloc`] for a caller about to carve `first` slices from the new
+/// segment: the header and those slices are committed in ONE call.
+///
+/// A segment is only ever created because a span is wanted from it, so the
+/// header's commit was always followed, a few instructions later, by a
+/// second commit of the very next slices (`commit_frontier` from
+/// `span_alloc`): two system calls on adjacent ranges at every segment's
+/// birth, which is every process's start and every thread's first
+/// allocation (census 4, vein 10; the pair is visible in a syscall trace as
+/// `mprotect(seg, 64K)` then `mprotect(seg + 64K, 64K)`). Nothing more is
+/// committed than those two calls committed between them.
+///
+/// If the OS refuses the larger range the header alone is tried, and the
+/// span's own commit then fails or succeeds as it did before.
+pub fn segment_alloc_for(arena_id: i32, first: usize) -> Result<*mut Segment, PrimError> {
+    let mut init = (HEADER_SLICES + first).min(SLICES_PER_SEGMENT);
     let claim = if LAZY_COMMIT {
         crate::arena::chunk_claim(arena_id)
     } else {
@@ -524,8 +543,15 @@ pub fn segment_alloc(arena_id: i32) -> Result<*mut Segment, PrimError> {
         // The header is written next, so it is committed first. On refusal
         // the memory goes back untouched: its chunk keeps a clear
         // `committed` bit, a fresh reservation is released whole.
-        // SAFETY: the header slice lies inside the reservation just obtained.
-        if unsafe { os::commit(ptr_, HEADER_SLICES * SEGMENT_SLICE_SIZE) }.is_err() {
+        // SAFETY: `ptr_` is the base of a reservation of `SEGMENT_SIZE`
+        // bytes this call owns; both ranges lie inside it.
+        let mut ok = unsafe { os::commit(ptr_, init * SEGMENT_SLICE_SIZE) }.is_ok();
+        if !ok && init > HEADER_SLICES {
+            init = HEADER_SLICES;
+            // SAFETY: as above.
+            ok = unsafe { os::commit(ptr_, init * SEGMENT_SLICE_SIZE) }.is_ok();
+        }
+        if !ok {
             crate::stats::commit_failed();
             if !crate::arena::chunk_free_marked(ptr_, false) {
                 let block = os::OsBlock {
@@ -555,11 +581,7 @@ pub fn segment_alloc(arena_id: i32) -> Result<*mut Segment, PrimError> {
         (*seg).kind = SegmentKind::Normal;
         (*seg).total_size = size;
         (*seg).next_free_slice = HEADER_SLICES as u32;
-        (*seg).commit_end = if committed {
-            SLICES_PER_SEGMENT
-        } else {
-            HEADER_SLICES
-        } as u32;
+        (*seg).commit_end = if committed { SLICES_PER_SEGMENT } else { init } as u32;
         (*seg).used_pages = 0;
         (*seg).thread_id = AtomicUsize::new(crate::init::thread_id());
         (*seg).mem_is_zero = mem_zero;

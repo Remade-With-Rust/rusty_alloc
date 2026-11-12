@@ -1104,7 +1104,7 @@ impl Heap {
                     return Some((p, fresh));
                 }
             }
-            let seg = segment::segment_alloc(self.arena_id).ok()?;
+            let seg = segment::segment_alloc_for(self.arena_id, slices).ok()?;
             #[cfg(ra_shared_light_heap)]
             crate::shared_light::stamp_if_shared(self, seg);
             self.stats.segments += 1;
