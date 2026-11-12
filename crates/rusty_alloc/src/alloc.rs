@@ -1475,7 +1475,43 @@ unsafe fn free_body_classic<const OWNER_FIRST: bool, const KNOWN_PAGE: bool>(
             free_local_plain(seg, pg, p);
             return;
         }
+        if OWNER_FIRST {
+            // The owner compare above already said "local", and `flags` is
+            // in a register: `free_general` would load the flags again and
+            // compare the owner again.
+            return free_flagged_local(p, seg, pg, flags);
+        }
         free_general(p, seg, pg, owner_tid);
+    }
+}
+
+/// A LOCAL free into a flagged page (full, aligned, single-block, huge), for
+/// the caller that has already established both facts.
+///
+/// Since the owner word, every free that is not a local free into a plain
+/// page reaches [`free_body_classic`] through [`free_slow`], which compares
+/// the segment's owner with this thread and tests the page's flags. It then
+/// handed `free_general` the owner id to compare AGAIN, and `free_general`
+/// loaded the flags AGAIN. This is `free_general`'s local half with neither:
+/// 13 -> 9 instructions on every free of a large block and every free that
+/// un-parks a full page (census 4, vein 1; a 2 MiB alloc/free pair 147 ->
+/// 143, which is the three instructions the owner word had cost that path,
+/// and one more).
+///
+/// # Safety
+/// As [`free_general`], with the calling thread the owner of `seg` and
+/// `flags` the page's flags as just loaded.
+#[cold]
+#[inline(never)]
+unsafe fn free_flagged_local(p: *mut u8, seg: *mut Segment, pg: *mut Page, flags: u8) {
+    // SAFETY: per contract; the two arms are `free_general`'s own.
+    unsafe {
+        let block = if flags & pflags::HAS_ALIGNED != 0 && flags & pflags::HUGE_SEGMENT == 0 {
+            unalign(pg, p)
+        } else {
+            p
+        };
+        free_local_owned(seg, pg, block);
     }
 }
 

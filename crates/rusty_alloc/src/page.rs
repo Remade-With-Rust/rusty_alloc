@@ -1746,6 +1746,34 @@ pub unsafe fn page_owner_sync(page: *mut Page, seg: *mut crate::segment::Segment
     }
 }
 
+/// Debug-assert that `page`'s owner word is already zero: for a slot that
+/// has just been taken from the span allocator or a new segment.
+///
+/// **A slot that is not a live page has a zero owner word**, always: the
+/// word is cleared when a page dies (`span_free`) and when its segment is
+/// abandoned, a never-used slot is zero memory, and a recycled segment's
+/// slots are scrubbed. So a single-block page, which is born flagged and is
+/// never plain, needs no clear of its own. It had one at each of its three
+/// births (the large span, the huge page, the huge segment's adoption by a
+/// heap): one store per large allocation that wrote the value already
+/// there, which is one of the three instructions the owner word cost a
+/// 2 MiB alloc/free pair (census 4, vein 1).
+///
+/// # Safety
+/// `page` is a page slot the calling thread owns.
+#[inline(always)]
+pub unsafe fn page_owner_assert_clear(page: *mut Page) {
+    if FAST_OWNER {
+        // SAFETY: per contract.
+        debug_assert_eq!(
+            unsafe { (*page).owner_plain.load(Ordering::Relaxed) },
+            0,
+            "a slot that was not a live page carried an owner word"
+        );
+    }
+    let _ = page;
+}
+
 /// Clear `page`'s owner word: call after SETTING a slow flag, when the page
 /// dies, and when its segment is abandoned.
 ///

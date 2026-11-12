@@ -1172,7 +1172,7 @@ impl Heap {
                 (*p).payload = ptr::null_mut();
             }
             (*p).flags.store(pflags::SINGLE_BLOCK, Ordering::Relaxed); // unqueued single-block span
-            crate::page::page_owner_clear(p);
+            crate::page::page_owner_assert_clear(p);
             (*p).free_is_zero = fresh;
             // Unqueued → never scanned → remote frees must go via the
             // delayed list (same rule as parked-full pages).
@@ -1248,7 +1248,7 @@ impl Heap {
                         pflags::HUGE_SEGMENT | pflags::SINGLE_BLOCK,
                         Ordering::Relaxed,
                     );
-                    crate::page::page_owner_clear(pg);
+                    crate::page::page_owner_assert_clear(pg);
                     page_set_flag(pg, XFLAG_DELAYED);
                     (*seg).next = self.huge_segments;
                     self.huge_segments = seg;
