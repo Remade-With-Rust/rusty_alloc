@@ -476,6 +476,31 @@ pub fn malloc_or_with<H: OnOom>(size: usize) -> *mut u8 {
                 }
                 return b;
             }
+            // A dry list, as distinct from a non-small size: see
+            // `malloc_dry`.
+            return malloc_or_dry_with::<H>(size, hb, p);
+        }
+        malloc_or_slow_with::<H>(size, hb)
+    }
+}
+
+/// [`malloc_or_with`]'s small miss: the direct page's `free` list is dry.
+/// The swap trip of [`malloc_dry`]; a swapped block is never null, so the
+/// out-of-memory arm stays where it was, behind the plain miss.
+///
+/// # Safety
+/// As [`malloc_dry`].
+#[cold]
+#[inline(never)]
+unsafe fn malloc_or_dry_with<H: OnOom>(
+    size: usize,
+    hb: *mut init::HeapBox,
+    pg: *mut Page,
+) -> *mut u8 {
+    // SAFETY: forwarded contract.
+    unsafe {
+        if let Some(b) = swap_trip(hb, pg) {
+            return b;
         }
         malloc_or_slow_with::<H>(size, hb)
     }
