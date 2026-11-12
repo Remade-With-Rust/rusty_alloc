@@ -2161,11 +2161,66 @@ unsafe fn realloc_move_at(
     // block of at least `newsize >= copy` bytes. `p` is freed once, through
     // the page resolved by the caller.
     unsafe {
-        core::ptr::copy_nonoverlapping(p, np, copy);
+        copy_block(p, np, copy);
         free_body::<true, true>(p, seg, pg);
         stat_realloc(false);
     }
     np
+}
+
+/// Copy the `n` live bytes of a block that is moving, without a call when
+/// `n` is small.
+///
+/// The 2026-08-21 note above tried a 32-byte chunk LOOP against `memcpy` for
+/// 64- and 128-byte moves and lost by 31 instructions: an increment, a
+/// compare and a branch per chunk. This is the mechanism that note asked
+/// for, and it has no loop: a range is copied as its first and its last
+/// 16 bytes, which overlap wherever `n` is not exactly 32 — two loads and two
+/// stores for every length from 16 to 32. The same with 8 bytes serves 8 to
+/// 15, and with 32 bytes 33 to 64.
+///
+/// What it replaces is not `memcpy`'s copy, which is the same two loads and
+/// two stores, but everything around it: the call, the size dispatch, the
+/// return. Measured in the real-program gate: lua makes 300,003 reallocs
+/// from a 16-byte block to a 32-byte one (a table's array part getting its
+/// second element), and `memcpy` cost 21.7 instructions for each of them
+/// (callgrind, inclusive per call; census 4, vein 4).
+///
+/// # Safety
+/// `src` is valid for `n` bytes of reads, `dst` for `n` bytes of writes, and
+/// the two do not overlap.
+#[inline(always)]
+unsafe fn copy_block(src: *const u8, dst: *mut u8, n: usize) {
+    // SAFETY: per contract; every access below lies inside `[0, n)` of its
+    // block, and unaligned reads and writes need no more than that.
+    unsafe {
+        // Each rung is two copies of a CONSTANT size, which is one load and
+        // one store apiece (two for 32). Written as `[u8; 16]` values read
+        // first and stored after, the second went through a stack slot: a
+        // frame adjustment on every realloc and six moves instead of four
+        // (`realloc_live` 46.0 -> 54.0 Ir per call on every path).
+        //
+        // The large copy leaves FIRST, in one compare: it is the path that
+        // gains nothing here, so it pays the least for the question.
+        if n <= 64 {
+            if n > 32 {
+                core::ptr::copy_nonoverlapping(src, dst, 32);
+                core::ptr::copy_nonoverlapping(src.add(n - 32), dst.add(n - 32), 32);
+                return;
+            }
+            if n >= 16 {
+                core::ptr::copy_nonoverlapping(src, dst, 16);
+                core::ptr::copy_nonoverlapping(src.add(n - 16), dst.add(n - 16), 16);
+                return;
+            }
+            if n >= 8 {
+                core::ptr::copy_nonoverlapping(src, dst, 8);
+                core::ptr::copy_nonoverlapping(src.add(n - 8), dst.add(n - 8), 8);
+                return;
+            }
+        }
+        core::ptr::copy_nonoverlapping(src, dst, n);
+    }
 }
 
 /// `mi_reallocn`: overflow-checked `count * size` realloc.

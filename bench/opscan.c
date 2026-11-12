@@ -122,6 +122,22 @@ static void op_realloc_grow(long iters) {
     }
 }
 
+/* The first four steps of a growing buffer: 8 -> 16 -> 32 -> 64 -> 128.
+ * Each realloc moves, and copies 8, 16, 32 and 64 bytes: the sizes a small
+ * vector or string passes through, and (16 -> 32) the one a Lua table's
+ * array part takes when it gets its second element. */
+static void op_realloc_small(long iters) {
+    for (long i = 0; i < iters; i++) {
+        void *p = malloc(8);
+        p = realloc(p, 16);
+        p = realloc(p, 32);
+        p = realloc(p, 64);
+        p = realloc(p, 128);
+        sink = p;
+        free(p);
+    }
+}
+
 static void op_aligned(size_t align, size_t n, long iters) {
     for (long i = 0; i < iters; i++) {
         void *p = NULL;
@@ -347,6 +363,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(op, "calloc_batch")) op_calloc_batch(64, n);
     else if (!strcmp(op, "new_batch"))   op_new_batch(64, n);
     else if (!strcmp(op, "realloc"))     op_realloc_grow(n);
+    else if (!strcmp(op, "realloc_small")) op_realloc_small(n);
     else if (!strcmp(op, "aligned"))     op_aligned(64, 256, n);
     else if (!strcmp(op, "usable"))      op_usable(256, n);
     else if (!strcmp(op, "mixed"))       op_mixed(n);
