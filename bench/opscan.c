@@ -10,6 +10,8 @@
  *
  * usage: opscan <op> <iters>
  */
+#define _GNU_SOURCE
+#include <dlfcn.h>
 #include <malloc.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -71,6 +73,42 @@ static void op_batch(size_t n, long iters, int lifo) {
         } else {
             for (int j = 0; j < BATCH; j++) free(v[j]);
         }
+    }
+}
+
+/* The same batch through calloc: the swap trip (a dry page whose blocks all
+ * came back on its local list) as a zeroing allocation meets it. */
+static void op_calloc_batch(size_t n, long iters) {
+    void *v[BATCH];
+    long rounds = iters / BATCH;
+    for (long i = 0; i < rounds; i++) {
+        for (int j = 0; j < BATCH; j++) {
+            v[j] = calloc(1, n);
+            sink = v[j];
+        }
+        for (int j = BATCH - 1; j >= 0; j--) free(v[j]);
+    }
+}
+
+/* And through C++ `operator new` / `operator delete`, looked up by their
+ * Itanium names so this stays one C binary. Under an allocator that does not
+ * export them the op falls back to malloc/free and says so on stderr. */
+static void op_new_batch(size_t n, long iters) {
+    void *(*op_new)(size_t) = (void *(*)(size_t))dlsym(RTLD_DEFAULT, "_Znwm");
+    void (*op_del)(void *) = (void (*)(void *))dlsym(RTLD_DEFAULT, "_ZdlPv");
+    if (!op_new || !op_del) {
+        fprintf(stderr, "new_batch: no operator new exported, using malloc\n");
+        op_new = malloc;
+        op_del = free;
+    }
+    void *v[BATCH];
+    long rounds = iters / BATCH;
+    for (long i = 0; i < rounds; i++) {
+        for (int j = 0; j < BATCH; j++) {
+            v[j] = op_new(n);
+            sink = v[j];
+        }
+        for (int j = BATCH - 1; j >= 0; j--) op_del(v[j]);
     }
 }
 
@@ -306,6 +344,8 @@ int main(int argc, char **argv) {
     else if (!strcmp(op, "calloc"))      op_calloc(256, n);
     else if (!strcmp(op, "batch_lifo"))  op_batch(64, n, 1);
     else if (!strcmp(op, "batch_fifo"))  op_batch(64, n, 0);
+    else if (!strcmp(op, "calloc_batch")) op_calloc_batch(64, n);
+    else if (!strcmp(op, "new_batch"))   op_new_batch(64, n);
     else if (!strcmp(op, "realloc"))     op_realloc_grow(n);
     else if (!strcmp(op, "aligned"))     op_aligned(64, 256, n);
     else if (!strcmp(op, "usable"))      op_usable(256, n);

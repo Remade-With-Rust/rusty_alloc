@@ -699,6 +699,35 @@ pub fn zalloc(size: usize) -> *mut u8 {
                 }
                 return b;
             }
+            // A dry list, as distinct from a non-small size: see
+            // `malloc_dry`.
+            return zalloc_dry(hb, size, p);
+        }
+        zalloc_slow(hb, size)
+    }
+}
+
+/// [`zalloc`]'s small miss: the direct page's `free` list is dry. The swap
+/// trip of [`malloc_dry`], and then the zeroing with the page still in hand.
+///
+/// calloc's swap trip was dearer than malloc's: `zalloc_slow`, then
+/// `Heap::zalloc` trying the same dry list again, then the generic path, and
+/// then `usable_size` resolving the page from the block to learn how much to
+/// zero. Here the page is the one the fast path just read.
+///
+/// # Safety
+/// As [`malloc_dry`], `hb` first as [`zalloc_slow`] has it.
+#[cold]
+#[inline(never)]
+unsafe fn zalloc_dry(hb: *mut init::HeapBox, size: usize, pg: *mut Page) -> *mut u8 {
+    // SAFETY: forwarded contract; a swapped block is a whole block of `pg`,
+    // whose `block_size` is its usable extent (the direct table never serves
+    // an interior pointer).
+    unsafe {
+        if let Some(b) = swap_trip(hb, pg) {
+            // Recycled blocks are not zero: `swap_trip` cleared the flag.
+            ptr::write_bytes(b, 0, (*pg).block_size);
+            return b;
         }
         zalloc_slow(hb, size)
     }
