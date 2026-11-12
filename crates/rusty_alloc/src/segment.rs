@@ -536,7 +536,30 @@ unsafe fn scrub_recycled(seg: *mut Segment, slots: usize, owner_table: bool) {
     // SAFETY: per contract, both ranges lie inside the header.
     unsafe {
         let tab = (&raw mut (*seg).page_off).cast::<OwnerEntry>();
-        core::ptr::write_bytes(tab, 0, if owner_table { SLICES_PER_SEGMENT } else { 1 });
+        // Through `fill_owner`, not `write_bytes` (census 4, vein 2). At the
+        // default geometry the table is 4 KiB, which `memset` clears with
+        // `rep stosb`: 4,115 instructions per recycled segment (callgrind
+        // counts each repetition), and a short-lived thread's first
+        // allocation claims one. On the short-lived-threads workload that
+        // was 819,000 of 3.75M instructions; it had been half that until the
+        // entries became pointers. The paired fill clears the same bytes in
+        // about 450.
+        //
+        // The whole table still, deliberately: entries past what the last
+        // tenant carved are zero already, but nothing here can prove what
+        // the last tenant was (a huge block's payload, a caller's own
+        // memory), and a stale entry is what turns a dangling `free` from a
+        // fault into a write through a live page.
+        //
+        // `black_box` on the value is what keeps it a fill. Given a constant
+        // zero, LLVM recognises the loop and calls `memset` again: measured,
+        // 4,115 Ir before and after.
+        let zero: OwnerEntry = core::mem::zeroed();
+        if owner_table {
+            fill_owner(tab, SLICES_PER_SEGMENT, core::hint::black_box(zero));
+        } else {
+            *tab = zero;
+        }
         core::ptr::write_bytes((&raw mut (*seg).pages).cast::<Page>(), 0, slots);
     }
 }
