@@ -343,40 +343,33 @@ pub unsafe fn page_of(seg: *mut Segment, p: *mut u8) -> *mut Page {
         // `slice_offset` follow-back all disappear — see `Segment::page_off`.
         let tab: *const OwnerEntry = (&raw const (*seg).page_off).cast();
         let pg = entry_page(seg, *tab.add(idx));
-        // The two representations must agree. This is the check that makes the
-        // duplicated state safe to keep, and it is free in release.
-        // (A Huge segment keeps `page_off` alone: its interior slots' offsets
-        // are not written, see `huge_alloc`.)
+        // The table is the only record of this (see `span_mark`), so the
+        // check that is left is on its own shape: an entry names a span
+        // START, a slot whose own slice names it too. Free in release.
         debug_assert!(
-            (*seg).kind == SegmentKind::Huge || {
+            {
                 let base: *mut Page = (&raw mut (*seg).pages).cast();
-                let slot = base.add(idx);
-                let back = (*slot).slice_offset as usize * slot_stride();
-                back <= idx * core::mem::size_of::<Page>()
-                    && slot.cast::<u8>().sub(back).cast::<Page>() == pg
+                let head = (pg.addr().wrapping_sub(base.addr())) / core::mem::size_of::<Page>();
+                head <= idx && entry_page(seg, *tab.add(head)) == pg
             },
-            "page_of: page_off table disagrees with slice_offset"
+            "page_of: the owner table names a slot that is not a span start"
         );
         pg
     }
 }
 
-/// Byte distance between adjacent slice slots. No longer the unit of
-/// [`Page::slice_offset`], which counts slices; this scales it where a byte
-/// distance is actually wanted.
-#[inline]
-pub const fn slot_stride() -> usize {
-    core::mem::size_of::<Page>()
+/// The page slot that owns slice `idx`: its span's first slot.
+///
+/// # Safety
+/// `seg` is a live segment and `idx` a carved slice of it.
+#[inline(always)]
+pub unsafe fn slice_owner(seg: *mut Segment, idx: usize) -> *mut Page {
+    // SAFETY: per contract, the entry lies inside the header.
+    unsafe {
+        let tab: *const OwnerEntry = (&raw const (*seg).page_off).cast();
+        entry_page(seg, *tab.add(idx))
+    }
 }
-
-// A span can start at most SLICES_PER_SEGMENT-1 slots before an interior slot,
-// so the slice distance must fit the u16 it is stored in. This had far less
-// headroom when the field held bytes: 511 * 88 = 44,968, inside u16 but only
-// just — a larger `Page` or segment would have overflowed it silently.
-const _: () = assert!(
-    SLICES_PER_SEGMENT - 1 <= u16::MAX as usize,
-    "slice_offset (slices) must fit in u16"
-);
 
 /// Payload start of the page whose slot index is `idx`.
 ///
@@ -681,8 +674,26 @@ pub unsafe fn segment_free(seg: *mut Segment) -> Result<(), PrimError> {
     }
 }
 
-/// Write the span markers for a span at `idx` of `len` slices: first slot
-/// offset 0, interior+last offsets pointing back.
+/// Write the span markers for a span at `idx` of `len` slices: its length
+/// and payload in the first slot, and every slice's owner-table entry
+/// pointing at that slot.
+///
+/// **One record, not two** (census 4, vein 9). Until 2.4.1 each interior
+/// slot also carried `slice_offset`, the distance back to the first slot:
+/// the same fact, 96 bytes apart, written beside every table entry. Its
+/// release readers were two, both cold (the coalesce-left in `span_free`,
+/// one resume in `adopt_segment`), and both read the table now. The loop
+/// below was a table store and a strided `u16` store with its own counter,
+/// 4.7 instructions a slice, and it is the bulk of `span_free` wherever free
+/// spans grow long: lua, 241,627 of that function's 311,993 Ir. As a plain
+/// fill LLVM writes two entries a store.
+///
+/// What is NOT dropped is the marking of every slice of a FREE span, which
+/// was assessed and declined in 2026-08 for the validator's sake and stays
+/// declined for a second reason: it is what makes a dangling `free` into
+/// freed memory resolve to a dead slot and abort. Marked only at its ends,
+/// a free span's interior entries would keep naming whichever slot owned
+/// them last, and that slot can be a LIVE page again.
 ///
 /// Interior slices below `from` are NOT rewritten: the caller knows they
 /// already point back to `idx` in both representations. That holds for every
@@ -702,7 +713,6 @@ unsafe fn span_mark(seg: *mut Segment, idx: usize, len: usize, from: usize) {
     debug_assert!(from >= 1, "span_mark: slot 0 is the head, not an interior");
     // SAFETY: caller contract keeps every index in bounds.
     unsafe {
-        (*seg).pages[idx].slice_offset = 0;
         (*seg).pages[idx].slice_count = len as u16;
         // Cache the payload start now, while `idx` is an integer — a shift, no
         // division. The refill path then reads `(*p).area` instead of
@@ -727,15 +737,10 @@ unsafe fn span_mark(seg: *mut Segment, idx: usize, len: usize, from: usize) {
         // unroll setup and scalar remainder. Opscan `huge` +28.00, perl +340,
         // lua -8,327, sqlite -862 allocator Ir — a sign flip by span length,
         // not a win. Same verdict as the fill `huge_alloc` measured flat.
-        let base: *mut Page = (&raw mut (*seg).pages).cast();
-        let mut slot = base.wrapping_add(idx + from);
         let mut ent = tab.wrapping_add(idx + from);
         let mut j = from;
         while j < len {
-            // SLICES back to the span start, not bytes — see Page::slice_offset.
-            (*slot).slice_offset = j as u16;
             *ent = owner;
-            slot = slot.wrapping_add(1);
             ent = ent.wrapping_add(1);
             j += 1;
         }
@@ -817,8 +822,8 @@ pub unsafe fn debug_validate_segment(seg: *mut Segment, where_: &str) {
             while idx < end {
                 let slot: *mut Page = &raw mut (*seg).pages[idx];
                 assert_eq!(
-                    (*slot).slice_offset,
-                    0,
+                    slice_owner(seg, idx),
+                    slot,
                     "{where_}: slice {idx} is not a span start (layout not tiled)"
                 );
                 let len = (*slot).slice_count as usize;
@@ -829,8 +834,8 @@ pub unsafe fn debug_validate_segment(seg: *mut Segment, where_: &str) {
                 // Interior slices must point back to this start.
                 for j in 1..len {
                     assert_eq!(
-                        (*seg).pages[idx + j].slice_offset as usize,
-                        j,
+                        slice_owner(seg, idx + j),
+                        slot,
                         "{where_}: slice {} lost its back-pointer",
                         idx + j
                     );
@@ -852,7 +857,11 @@ pub unsafe fn debug_validate_segment(seg: *mut Segment, where_: &str) {
                     i >= HEADER_SLICES && i < end,
                     "{where_}: free span {i} out of region"
                 );
-                assert_eq!((*s).slice_offset, 0, "{where_}: free span {i} not a start");
+                assert_eq!(
+                    slice_owner(seg, i),
+                    s,
+                    "{where_}: free span {i} not a start"
+                );
                 assert_eq!((*s).block_size, 0, "{where_}: free span {i} marked live");
                 n += 1;
                 assert!(
@@ -999,7 +1008,11 @@ pub unsafe fn span_free(seg: *mut Segment, page: *mut Page) -> usize {
         let right = idx + len;
         if right < (*seg).next_free_slice as usize {
             let rslot: *mut Page = &raw mut (*seg).pages[right];
-            debug_assert_eq!((*rslot).slice_offset, 0, "right neighbor not a span start");
+            debug_assert_eq!(
+                slice_owner(seg, right),
+                rslot,
+                "right neighbor not a span start"
+            );
             if (*rslot).block_size == 0 {
                 span_list_remove(seg, rslot);
                 len += (*rslot).slice_count as usize;
@@ -1009,11 +1022,10 @@ pub unsafe fn span_free(seg: *mut Segment, page: *mut Page) -> usize {
         // Merge left: follow the left slot back to its span start.
         if idx > HEADER_SLICES {
             let lslot_idx = idx - 1;
-            // slice_offset counts SLICES, so the span start is a subtract.
-            // This was `bytes / slot_stride()` — a `movabs; mul; shr` magic
-            // multiply by 88, `docs/opps.md` #1, now gone.
-            let lstart_idx = lslot_idx - (*seg).pages[lslot_idx].slice_offset as usize;
-            let lstart: *mut Page = &raw mut (*seg).pages[lstart_idx];
+            // The left neighbour's last slice names its first slot, and a
+            // span start's index is a shift of its `area` (`page_index`).
+            let lstart = slice_owner(seg, lslot_idx);
+            let lstart_idx = page_index(seg, lstart);
             if (*lstart).block_size == 0 {
                 span_list_remove(seg, lstart);
                 len += idx - lstart_idx;
@@ -1425,7 +1437,6 @@ pub fn huge_alloc(
         (*page).capacity = 1;
         (*page).reserved = 1;
         (*page).slice_count = (SLICES_PER_SEGMENT - 1) as u16;
-        (*page).slice_offset = 0;
         // `header == SEGMENT_SLICE_SIZE`, so this is exactly `page_area(seg, 1)`.
         // Huge segments build their one slot by hand instead of through
         // `span_mark`, which is the only other writer of this field — so this

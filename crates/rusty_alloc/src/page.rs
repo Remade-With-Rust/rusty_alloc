@@ -402,22 +402,9 @@ pub struct Page {
     pub area: *mut u8,
     /// Slices this page spans.
     pub slice_count: u16,
-    /// For interior slices: distance BACK to the span-start slot, **in
-    /// slices** (not in bytes).
-    ///
-    /// This held BYTES until 2026-08-22, pre-scaled by `size_of::<Page>()`,
-    /// because `page_of` followed it back on every free and a slice count
-    /// would have to be scaled there. **That justification expired** when the
-    /// `Segment::page_off` table took over `page_of`: in a release build the
-    /// only remaining reader is `span_free`'s coalesce-left, and the only
-    /// byte-scaled reader is a `debug_assert`.
-    ///
-    /// Bytes therefore bought nothing and cost a division. `size_of::<Page>()`
-    /// is 88 — `8 * 11`, not a power of two — so recovering the slice count
-    /// from bytes is a real `movabs; mul; shr` magic-multiply sequence, which
-    /// is what `docs/opps.md` #1 named. In slices the same read is a bare
-    /// subtract, and the two loops that WRITE the field drop a multiply each.
-    pub slice_offset: u16,
+    // (No back-pointer here. Until 2.4.1 every slot carried `slice_offset`,
+    // the distance back to its span's first slot, beside the same fact in
+    // `Segment::page_off`; see `segment::span_mark` for why it went.)
     /// Bin index this page is queued under (BIN_HUGE marks unqueued larges).
     pub bin: u8,
     /// Fast-path flag byte (see [`pflags`]): any bit set ⇒ the free fast path
@@ -514,7 +501,19 @@ pub unsafe fn debug_validate_page(page: *const Page, where_: &str) {
         // reading its metadata is exactly as valid as that use.
         unsafe {
             assert!(!page.is_null(), "{where_}: null page");
-            assert_eq!((*page).slice_offset, 0, "{where_}: not a span start");
+            // The shared empty page is in no segment (and the old form of
+            // this check, a field of the page itself, passed it by accident).
+            if !core::ptr::eq(page, empty_page_ptr()) {
+                // A span start is a slot whose own slice names it as owner.
+                let seg = crate::segment::segment_of(page.cast_mut().cast::<u8>());
+                let base: *const Page = (&raw const (*seg).pages).cast();
+                let idx = (page.addr() - base.addr()) / core::mem::size_of::<Page>();
+                assert_eq!(
+                    crate::segment::slice_owner(seg, idx).cast_const(),
+                    page,
+                    "{where_}: not a span start"
+                );
+            }
             assert!((*page).block_size > 0, "{where_}: dead page (block_size 0)");
             assert!(
                 (*page).block_size.is_multiple_of(8),
@@ -574,7 +573,6 @@ impl Page {
             block_size: 8,
             area: ptr::null_mut(),
             slice_count: 1,
-            slice_offset: 0,
             bin: 0,
             flags: AtomicU8::new(0),
             owner_plain: OwnerWord::new(0),

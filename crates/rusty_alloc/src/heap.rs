@@ -1888,7 +1888,7 @@ impl Heap {
                 let slot: *mut Page = &raw mut (*seg).pages[idx];
                 let len = ((*slot).slice_count as usize).max(1);
                 if (*slot).block_size > 0
-                    && (*slot).slice_offset == 0
+                    && segment::slice_owner(seg, idx) == slot
                     && (*slot).bin as usize == BIN_HUGE
                     && (*slot).used == 0
                 {
@@ -1909,7 +1909,7 @@ impl Heap {
                     // Ir per op), so this bounds the worst case and is not a
                     // win. The +2.1 % that adoption costs over 2.2.3 there is
                     // retiring the other 63 dead spans, which 2.2.3 stranded.
-                    idx -= (*slot).slice_offset as usize;
+                    idx = segment::page_index(seg, segment::slice_owner(seg, idx));
                     continue;
                 }
                 idx += len;
