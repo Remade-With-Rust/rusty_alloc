@@ -764,6 +764,24 @@ impl Heap {
         unsafe { self.malloc_generic_walk(bin) }
     }
 
+    /// Park a full page: out of its bin's queue and onto the full queue, with
+    /// its slow-free flag set so the next free of one of its blocks brings it
+    /// back. Inline at both of the walk's uses (see the note at the second).
+    ///
+    /// # Safety
+    /// `p` is a live page of this heap, a member of `q`, with no free block.
+    #[inline(always)]
+    unsafe fn park_full(&mut self, q: *mut PageQueue, p: *mut Page) {
+        // SAFETY: per contract; owner thread.
+        unsafe {
+            queue_remove(q, p);
+            (*p).flags.fetch_or(pflags::IN_FULL, Ordering::Relaxed);
+            crate::page::page_owner_clear(p);
+            page_set_flag(p, XFLAG_DELAYED);
+            queue_push_front(&raw mut self.pages[BIN_FULL], p);
+        }
+    }
+
     /// The queue front has no block but has not been fully carved yet:
     /// extend it and serve from the new run.
     ///
@@ -824,9 +842,14 @@ impl Heap {
     /// instructions of push and nine of pop on EVERY generic allocation, 20%
     /// of the function, for machinery most calls never reach.
     ///
-    /// The first queue page is re-collected here rather than threaded in: the
-    /// collect is idempotent, and re-doing it keeps the two frames
+    /// Nothing is threaded in from the caller: that keeps the two frames
     /// independent of each other's register needs, which is the whole point.
+    /// The first queue page used to be RE-COLLECTED here for the same reason
+    /// ("the collect is idempotent"), and that was the walk asking a question
+    /// its caller answered one instruction earlier: both callers arrive
+    /// having just collected the front page and found it dry and fully
+    /// carved. Two loads say so again, where the collect, the extend test
+    /// and the serve test said it in fifteen instructions (census 4, vein 8).
     ///
     /// # Safety
     /// `bin` indexes `self.pages`.
@@ -838,6 +861,16 @@ impl Heap {
         unsafe {
             let q: *mut PageQueue = &raw mut self.pages[bin];
             let mut p = (*q).first;
+            // The front page, as the caller left it: dry and fully carved
+            // means full, so it is parked without another look. The test is
+            // real, not an assertion: a page that fails it (a caller that
+            // did not collect, a block that came back since) simply takes
+            // the loop like any other.
+            if !p.is_null() && (*p).free.is_null() && (*p).capacity >= (*p).reserved {
+                let next = (*p).next;
+                self.park_full(q, p);
+                p = next;
+            }
             while !p.is_null() {
                 if (*p).free.is_null() {
                     // A steal ANYWHERE in this heap's queue means this heap
@@ -895,11 +928,7 @@ impl Heap {
                 // an outlining decision whenever the function around it is
                 // restructured; the frequency that justified it is a property
                 // of the enclosing frame, not of this code.
-                queue_remove(q, p);
-                (*p).flags.fetch_or(pflags::IN_FULL, Ordering::Relaxed);
-                crate::page::page_owner_clear(p);
-                page_set_flag(p, XFLAG_DELAYED);
-                queue_push_front(&raw mut self.pages[BIN_FULL], p);
+                self.park_full(q, p);
                 p = next;
             }
             // No usable page — carve a fresh one.
