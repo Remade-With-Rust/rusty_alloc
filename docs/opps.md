@@ -598,6 +598,137 @@ real-world programs byte-identical across ra/mi/sys, alloc-eval checks on all
 One unexplained failure in the first of 27 Windows test runs (log lost), not
 reproduced in the 26 after it.
 
+## Vein census 4, 2026-11-11 (ten veins, three wins each)
+
+Method as before: callgrind Ir, paired runs of the previous commit against
+the change (`prev` vs `new`), the allocator object's self Ir as the exact
+instrument, every program's output as the work-parity anchor. New
+instruments: an interposer histogram of live `realloc` sizes, a per-line
+census inside one function, and a system-call trace
+(`valgrind --tool=none --trace-syscalls=yes`) for vein 10. opscan gained
+`calloc_batch`, `new_batch` and `realloc_small`.
+
+Totals against 2.4.0 (`9831347`), outputs identical:
+
+| instrument | 2.4.0 | census 4 | delta |
+|---|---:|---:|---:|
+| perl, allocator Ir | 24,269,838 | 20,636,756 | **-15.0 %** |
+| sqlite | 4,590,776 | 3,894,676 | **-15.2 %** |
+| lua | 53,950,490 | 47,126,221 | **-12.6 %** |
+| python | 184,468 | 153,891 | **-16.6 %** |
+| rust-trees, whole program | 18,751,028 | 17,790,160 | -5.1 % |
+| rust-overaligned | 1,590,361 | 1,509,903 | -5.1 % |
+| rust-threads (200 short-lived threads) | 3,082,838 | 2,873,802 | -6.8 % |
+| rust-maps | 26,759,510 | 26,573,762 | -0.7 % |
+
+| opscan op, Ir/op | 2.4.0 | census 4 |
+|---|---:|---:|
+| small / med / big | 52.25 / 56.01 / 94.00 | 47.07 / 48.07 / 89.00 |
+| calloc / calloc_batch | 93.01 / 74.69 | 83.01 / 68.44 |
+| batch_lifo / mixed / new_batch | 53.22 / 93.56 / 49.30 | 47.48 / 85.80 / 43.45 |
+| realloc / realloc_small | 227.97 / 364.28 | 203.45 / 292.29 |
+| aligned (posix_memalign) / aligned_alloc | 83.01 / 74.44 | 79.13 / 65.94 |
+| xthread | 74.81 | 65.83 |
+| huge (2 MiB pair) | 144.00 | 144.00 (the owner word's +3 repaid) |
+
+### The ledger: three independent wins per vein, each in instructions
+
+Every row is ONE commit, measured against the commit before it, on a
+deterministic instruction count: an entry point's instructions from the
+disassembly, Ir per call from the function census, Ir per operation from
+opscan's two-point estimator, or Ir on a real program (the allocator
+object's own, or whole-program for the Rust workloads). No vein counts one
+commit twice.
+
+| vein | commit | win | measured |
+|---|---|---|---|
+| 1. the owner question in `free` | `dbb0b7b` | one owner word decides the local free | `free` 21 -> 18 instructions, `__rust_dealloc` 19 -> 16 |
+| | `23ff3c2` | a cross-thread free in the common state is a straight line | cross-thread arm 24.0 -> 16.0 Ir/call; xthread 73.83 -> 65.84 |
+| | `d573b24` | a local free into a flagged page is asked who owns it once | huge 147 -> 145; lua -1,321 |
+| 2. block-to-page resolution | `55cf589` | the owner table holds page pointers | `free` 18 -> 17 instructions; perl -602,795 |
+| | `d73a710` | a span's table entry is its head slot's pointer | `span_free` 196.1 -> 193.1 Ir/call (lua); lua -1,921 |
+| | `4a426ab` | a recycled segment's table is cleared by the paired fill | segment creation 4,213 -> 416 Ir; rust-threads -20.1 % |
+| 3. entries that move before they work | `94058fd` | the miss takes its arguments where they arrive | `malloc` 15 -> 14, `__rust_alloc` 18 -> 16 instructions |
+| | `228771c` | the `calloc` export is the body | calloc 84.01 -> 83.01 |
+| | `6f15106` | `aligned_alloc` / `memalign` take (align, size) as C passes them | aligned_alloc 68.76 -> 65.94; export 4 -> 1 instruction |
+| 4. the copy in a moving realloc | `223c66c` | straight-line copy up to 64 bytes | realloc_small 327.19 -> 315.19 |
+| | `d51ef9a` | the small move is a leaf | lua 50,017,235 -> 48,246,145 |
+| | `609a60b` | an over-aligned realloc that stays pushes nothing | rust-overaligned 1,535,412 -> 1,513,859 |
+| 5. the realloc entry and body | `832c3ed` | Rust's realloc lands on a four-register body | `__rust_realloc` 8.0 -> 5.0 Ir/call |
+| | `e9f8e3a` | the moving free's cold arm recomputes the segment | `realloc_rust` 52.1 -> 48.1 Ir/call |
+| | `d764c80` | one move tail for growth and shrink | `realloc_live` 50.0 -> 46.0 Ir/call; lua -1,200,494 |
+| 6. swap trips | `1f3d34a` | `malloc` | sqlite 3,989,736 -> 3,903,848; med 51.07 -> 48.07 |
+| | `85f74e3` | `calloc` | calloc 89.01 -> 84.01 |
+| | `ad82133` | `operator new` | new_batch 44.31 -> 43.45 |
+| 7. finding the thread's heap | `2752680` | local-exec TLS (opt-in cfg) | `__rust_alloc` 16.0 -> 15.0 Ir/call; rust-trees -220,144 |
+| | `09531b1` | the sentinel is found through the flag the miss already reads | `malloc_slow` 8 -> 7 instructions; perl -8,959, big 90 -> 89 |
+| | `a129204` | `calloc`'s miss takes the same one test | `zalloc_slow` 14.0 -> 6.0 Ir/call |
+| 8. carving and the generic walk | `bec6ebe` | two links per SSE2 store | perl -569,957; `grow_front` 855.8 -> 597.1 Ir/call |
+| | `b058cec` | the walk does not ask the front page twice | walk 303.5 -> 297.1 Ir/call; perl -4,637 |
+| | `8d39963` | sixteen blocks a pass on long runs | perl -54,105; lua -83,764 |
+| 9. span re-marking | `e4d6d2b` | one record of a slice's owner (`slice_offset` gone) | `span_free` 521.7 -> 246.3 Ir/call (lua) |
+| | `2e9b579` | the table fill writes two entries a store | `span_free` 246.3 -> 200.0 |
+| | `abce1b6` | the span functions use the slot pointers they hold | `span_free` 200.0 -> 196.1; perl -2,092 |
+| 10. starting a segment, a thread, a process | `4ebd432` | a segment's first commit covers its first span | -62 Ir per segment; 1 system call |
+| | `afb35e2` | the arena's reservation is not trimmed | -66 Ir per process; 2 system calls |
+| | `b7a2ebc` | a new heap's first slow allocation does not collect | -520 Ir per process; ten-block program 3,584 -> 3,064; rust-threads -3.85 % |
+
+Not counted in the ledger: `e2efb01` (a heap's later segments start a
+whole commit step in). It saves system calls (lua 26 -> 21 commits) but
+costs a one-segment program two instructions, so it is not an
+instruction win. A follow-up that would have removed those two
+instructions by dropping the creation commit's bounds clamp was written
+and NOT applied: the clamp keeps a segment's first commit inside its own
+reservation.
+
+### Refuted in census 4 (each recorded where the code is)
+
+- **`calloc` inline without `zalloc`**: the export became the multiply and
+  a jump to `zalloc` with the size moved into place; calloc 84.01 -> 85.88.
+- **The cross-thread NORMAL push as an early `if` inside `remote_free`'s
+  loop**: LLVM folded it back into the same switch; 24.0 Ir/call before and
+  after. Out of line, the rare states are a call away and it moved.
+- **The recycled-table fill with a constant zero**: recognised and turned
+  back into `memset`, 4,115 Ir before and after. `black_box` on the value.
+- **`fill_owner` for a huge segment's 511 entries**: `giant` 1,115 Ir/op
+  before and after; that fixed-length loop was vectorised already.
+- **Routing a foreign non-zero owner word straight to `remote_free`**
+  (twice: as an argument, xthread +0.31; as an inline push in `free_slow`,
+  xthread -0.63 but a 2 MiB pair +3 and lua +1,680). The pages a consumer
+  frees into are mostly FULL, whose owner word is 0.
+- **Size-first miss for `calloc`**: +1.06 Ir per calloc (its size is a
+  product, not an incoming register).
+- **`free_slow` recomputing the segment for every caller**: xthread +3.00,
+  huge +8.00, perl +1,831. As a second symbol for the known-page site: flat.
+- **The dry arm inlined instead of a jump to the miss**: the generic call
+  stopped being a tail call; a non-swap dry trip 14 instructions against 12.
+- **The dry arm from the allocation inside a moving realloc**:
+  `realloc_live` 46 -> 50 Ir on every call (lua +1,165,302).
+- **The small copy as two `[u8; 16]` values read then stored**: a stack
+  slot; `realloc_live` 46 -> 54 on every path.
+- **Cold helpers that return their argument plainly**: LLVM proves it and
+  turns the tail jump back into a call (one push and pop per realloc).
+  `black_box` on the return.
+- **The 16-block carve loop for every run** (stage tests in front): sqlite
+  +2,168; and **the gate without splitting `page_extend`**: LLVM stopped
+  inlining it anywhere, sqlite +3,052.
+- **`slice::fill` for the owner-table fill**: the same scalar loop with more
+  setup; lua +2,072.
+- **Marking a free span only at its ends: DECLINED a second time**, and now
+  for safety, not only for the validator: the full marking is what makes a
+  dangling `free` into freed memory resolve to a dead slot and abort.
+
+### Left on the table
+
+- A copy above 64 bytes in a moving realloc pays ~4 Ir around its `memcpy`
+  (the price of the leaf). An inline 65..128 rung was not tried.
+- `malloc_generic_once`'s own 47 Ir per trip is now the largest slow-path
+  line after the carve on perl (424K): its frame, the bin computed twice.
+- `schedule_purge` reads the clock on every free of a span of 8 slices or
+  more (lua: 545 calls).
+- The commit step above 4 MiB is linear (seven calls from 4 to 32 MiB).
+  Making it proportional trades commit charge for calls; not taken.
+
 ## Banked
 
 ### 8. Collect-loop double `block_next` — LANDED 2026-08-20

@@ -7,6 +7,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.0](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.4.0...rusty_alloc-v2.5.0) - 2026-11-12
+
+### Changed
+
+- **Census 4: thirty measured instruction wins across ten veins, three
+  independent commits each** (`docs/opps.md`, "Vein census 4"). Against
+  2.4.0, same program output on every instrument: allocator instructions
+  perl **-15.0 %**, sqlite **-15.2 %**, lua **-12.6 %**, python
+  **-16.6 %**; Rust `GlobalAlloc` workloads boxed trees -5.1 %, aligned
+  buffers -5.1 %, short-lived threads -6.8 %, hash maps -0.7 %
+  whole-program. Per operation: small alloc/free pair 52.25 -> 47.07
+  instructions, 256-byte 56.01 -> 48.07, `calloc` 93.01 -> 83.01,
+  `realloc` growth 227.97 -> 203.45, small `realloc` growth
+  364.28 -> 292.29, `aligned_alloc` 74.44 -> 65.94, a cross-thread
+  alloc/free 74.81 -> 65.83. What changed, in one line each:
+  - `free` is one compare: a per-page owner word answers "my segment" and
+    "plain page" together (21 -> 17 instructions with the next item). A
+    cross-thread free in the common state is a straight line, and a local
+    free into a flagged page is asked who owns it once.
+  - The per-slice owner table holds page pointers, and is the only record
+    of which span owns a slice (`Page::slice_offset` is gone). A recycled
+    segment clears it in ~320 instructions instead of a 4,115-instruction
+    `rep stosb`, which every short-lived thread paid.
+  - A dry page with frees on it swaps its lists in 20 instructions instead
+    of a trip round the generic path, for `malloc`, `calloc` and
+    `operator new`.
+  - A moving `realloc` of up to 64 bytes is a leaf: no call, no frame, the
+    copy straight-line. Rust's `realloc` lands with its four arguments in
+    place; an over-aligned one that stays pushes nothing.
+  - The `calloc`, `aligned_alloc` and `memalign` exports no longer move or
+    jump before they work; the allocation miss recognises a thread with no
+    heap through the flag it already reads.
+  - Carving links two blocks per SSE2 store (`grow_front` 856 -> 570
+    instructions per call on perl); re-marking a span is a paired fill.
+  - Starting up is cheaper: a segment's first commit covers its first span,
+    the default arena's reservation is not trimmed, and a new heap does not
+    sweep its empty queues on its first slow allocation (520 instructions
+    and a clock read per thread and per process).
+- **Recorded trades.** A `realloc` that copies more than 64 bytes pays
+  about 4 more instructions around its `memcpy`. A dry small-size miss with
+  nothing to swap pays 4 (perl +0.02 %). A carve under 64 blocks pays one
+  compare (sqlite +0.02 %). A heap's later segments now start a whole
+  4 MiB commit step in (fewer commit calls: lua 26 -> 21), which costs a
+  one-segment program two instructions.
+
+### Added
+
+- **`--cfg ra_tls_local_exec`**: for an x86-64 Linux EXECUTABLE that links
+  the allocator statically, the thread's heap pointer is loaded in one
+  instruction instead of two (local-exec TLS). `__rust_alloc` 16 -> 15
+  instructions; boxed-trees workload -1.24 % whole-program. Not for a
+  `cdylib`: there it is a link error (`R_X86_64_TPOFF32 ... cannot be used
+  with -shared`), never a wrong program. See the README's Rust section.
+- `alloc::realloc_rust`, `alloc::usable_size_plain`,
+  `segment::segment_alloc_for`, `segment::slice_owner`,
+  `os::reserve_aligned_forever`, `alloc::malloc_aligned_c`,
+  `heap::Heap::sentinel`; opscan ops `calloc_batch`, `new_batch`,
+  `realloc_small`, `aligned_alloc`, `calloc_big`, `giant`.
+
+### Removed
+
+- `Page::slice_offset` and `segment::slot_stride` (the owner table is the
+  one record now). `Segment::page_off` holds `OwnerEntry` (a page pointer;
+  a `u32` offset only when `secure` and `blockmap` are both on) and
+  `segment::page_off_for` returns `usize`. These are internals that happen
+  to be `pub`; nothing in the documented API changes.
+
 ## [2.4.0](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.3.1...rusty_alloc-v2.4.0) - 2026-11-01
 
 ### Added

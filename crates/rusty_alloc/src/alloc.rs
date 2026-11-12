@@ -235,8 +235,24 @@ fn stat_realloc(in_place: bool) {
 /// gone from the hot path entirely, and no `&mut` is ever formed on a heap
 /// that might be the shared sentinel. The miss is a tail call, so the fast
 /// path also needs no callee-saved registers.
+///
+/// The miss takes `size` FIRST. It took the heap box first until 2.4.1, and
+/// since `size` arrives in the first argument register, every `malloc` opened
+/// with a register move to put it where the cold call wanted it: one
+/// instruction on the hot path for the benefit of the cold one (callgrind:
+/// 1.00 Ir per call on the entry line; perl 608,388 of them).
 #[inline]
 pub fn malloc(size: usize) -> *mut u8 {
+    malloc_impl::<true, true>(size)
+}
+
+/// [`malloc`], with the miss's argument order chosen by the caller:
+/// `SIZE_FIRST` where `size` arrives in the first argument register (`malloc`
+/// itself), heap-first where it arrives in the second (`realloc`'s null arm,
+/// whose slow trips each paid three register moves under the other order:
+/// lua +12,174 Ir over 4,151 trips).
+#[inline(always)]
+fn malloc_impl<const SIZE_FIRST: bool, const DRY: bool>(size: usize) -> *mut u8 {
     let hb = init::heap_box_fast();
     // SAFETY: raw reads only — `hb` may be the shared immortal sentinel (see
     // `heap_box_fast`), which must never see a `&mut` or a write. `direct`
@@ -258,8 +274,134 @@ pub fn malloc(size: usize) -> *mut u8 {
                 }
                 return b;
             }
+            // The miss knows WHY it missed, and says so: a dry list and a
+            // non-small size go to different cold symbols, at no cost here
+            // (each was a jump to a stub already). The dry one gets the page
+            // it just looked at.
+            //
+            // `DRY` is false at ONE site, the allocation inside a moving
+            // `realloc`, and that is measured: there the miss is a real call
+            // with the copy length live across it, in the register the page
+            // would have to travel in, and LLVM answered by giving the whole
+            // function a fourth callee-saved register again —
+            // `realloc_live` 46.0 -> 50.0 Ir on EVERY call (lua +1,165,302
+            // allocator Ir) to save 45 on 1,179 of them.
+            if DRY {
+                return if SIZE_FIRST {
+                    malloc_dry(size, hb, p)
+                } else {
+                    malloc_dry_hb_first(hb, size, p)
+                };
+            }
         }
-        malloc_slow(hb, size)
+        if SIZE_FIRST {
+            malloc_slow(size, hb)
+        } else {
+            malloc_slow_hb_first(hb, size)
+        }
+    }
+}
+
+/// `malloc`'s small miss: the direct page's `free` list is dry.
+///
+/// **The swap trip.** A page's blocks come back on `local_free`, and the next
+/// allocation that finds `free` dry moves that list over and carries on. That
+/// is the commonest reason a real program leaves the fast path at all —
+/// perl: 6,175 of its slow trips did nothing else; sqlite: 2,478 of 2,729 —
+/// and it went the whole way round: the generic path's entry, the heartbeat,
+/// the bin, the queue front, the collect, the direct-table check. 63 to 72
+/// instructions to move one pointer (callgrind, census 4, vein 6).
+///
+/// Here it is the move and the pop, when the heartbeat has nothing to do:
+///
+/// - no cross-thread free is waiting on the heap's delayed list (the
+///   heartbeat's first duty — the same peek it makes);
+/// - no deferred-free hook is registered (its second);
+/// - the periodic-collect countdown has not run out. It is DECREMENTED here,
+///   so the sweep comes round after exactly as many slow trips as before;
+/// - guarded sampling is off, since the generic path is where a sample is
+///   taken.
+///
+/// Otherwise, and whenever `local_free` is empty too, this is `malloc_slow`
+/// — by a JUMP to it, not a copy of it. Inlined here, the generic call stopped
+/// being a tail call (its pair return, narrowed to the pointer, no longer met
+/// a lone `ret`), and a dry trip with nothing to swap paid 14 instructions
+/// where `malloc_slow` pays 8; behind the jump it pays 4 more than before
+/// the split, which is the price of asking (perl: 1,226 such trips).
+/// The page's cross-thread list is not collected by the swap; it is the next
+/// time both lists are dry, which the generic path still handles. With no
+/// other thread freeing into the page the blocks come out in the same order
+/// as before, so a single-threaded program's addresses do not change.
+///
+/// # Safety
+/// As [`malloc_slow`], with `pg` the page `hb`'s direct table holds for
+/// `size`, its `free` list empty.
+#[cold]
+#[inline(never)]
+unsafe fn malloc_dry(size: usize, hb: *mut init::HeapBox, pg: *mut Page) -> *mut u8 {
+    // SAFETY: forwarded contract.
+    unsafe {
+        if let Some(b) = swap_trip(hb, pg) {
+            return b;
+        }
+        malloc_slow(size, hb)
+    }
+}
+
+/// [`malloc_dry`] for a caller holding `size` in the SECOND argument
+/// register (see [`malloc_slow_hb_first`]).
+///
+/// # Safety
+/// As [`malloc_dry`].
+#[cold]
+#[inline(never)]
+unsafe fn malloc_dry_hb_first(hb: *mut init::HeapBox, size: usize, pg: *mut Page) -> *mut u8 {
+    // SAFETY: forwarded contract.
+    unsafe {
+        if let Some(b) = swap_trip(hb, pg) {
+            return b;
+        }
+        malloc_slow_hb_first(hb, size)
+    }
+}
+
+/// The swap itself: `Some(block)` when `pg` had frees to hand back and the
+/// heartbeat had nothing to do, `None` for the generic path.
+///
+/// # Safety
+/// As [`malloc_dry`].
+#[inline(always)]
+unsafe fn swap_trip(hb: *mut init::HeapBox, pg: *mut Page) -> Option<*mut u8> {
+    // SAFETY: `pg` is a live page of this thread's heap or the immortal
+    // empty-page sentinel. The sentinel is never freed into, so a non-null
+    // `local_free` proves `pg` is a real page and `hb` this thread's real,
+    // initialised box; every write below is behind that test.
+    unsafe {
+        let lf = (*pg).local_free;
+        if lf.is_null() {
+            return None;
+        }
+        let h = (*hb).heap.get();
+        let quiet = (crate::ONE_THREAD || (*hb).delayed.head.load(Ordering::Acquire) == 0)
+            && !(crate::GUARD_PAGES && (*h).guarded_rate != 0)
+            && !crate::options::deferred_registered();
+        if !quiet {
+            return None;
+        }
+        // One decrement whose wrap means "it was zero" (as the generic
+        // path's own): a wrap puts the zero back and leaves the trip, and
+        // the sweep, to the generic path.
+        let left = (*h).generic_countdown.wrapping_sub(1);
+        (*h).generic_countdown = left;
+        if left == usize::MAX {
+            (*h).generic_countdown = 0;
+            return None;
+        }
+        #[cfg(debug_assertions)]
+        {
+            (*h).stats.allocs += 1;
+        }
+        Some(crate::page::page_swap_pop(pg, lf))
     }
 }
 
@@ -300,7 +442,7 @@ pub fn malloc_or(size: usize, on_oom: fn(usize) -> *mut u8) -> *mut u8 {
                 return b;
             }
         }
-        malloc_or_slow(hb, size, on_oom)
+        malloc_or_slow(size, hb, on_oom)
     }
 }
 
@@ -334,8 +476,33 @@ pub fn malloc_or_with<H: OnOom>(size: usize) -> *mut u8 {
                 }
                 return b;
             }
+            // A dry list, as distinct from a non-small size: see
+            // `malloc_dry`.
+            return malloc_or_dry_with::<H>(size, hb, p);
         }
-        malloc_or_slow_with::<H>(hb, size)
+        malloc_or_slow_with::<H>(size, hb)
+    }
+}
+
+/// [`malloc_or_with`]'s small miss: the direct page's `free` list is dry.
+/// The swap trip of [`malloc_dry`]; a swapped block is never null, so the
+/// out-of-memory arm stays where it was, behind the plain miss.
+///
+/// # Safety
+/// As [`malloc_dry`].
+#[cold]
+#[inline(never)]
+unsafe fn malloc_or_dry_with<H: OnOom>(
+    size: usize,
+    hb: *mut init::HeapBox,
+    pg: *mut Page,
+) -> *mut u8 {
+    // SAFETY: forwarded contract.
+    unsafe {
+        if let Some(b) = swap_trip(hb, pg) {
+            return b;
+        }
+        malloc_or_slow_with::<H>(size, hb)
     }
 }
 
@@ -345,9 +512,9 @@ pub fn malloc_or_with<H: OnOom>(size: usize) -> *mut u8 {
 /// As [`malloc_slow`].
 #[cold]
 #[inline(never)]
-unsafe fn malloc_or_slow_with<H: OnOom>(hb: *mut init::HeapBox, size: usize) -> *mut u8 {
+unsafe fn malloc_or_slow_with<H: OnOom>(size: usize, hb: *mut init::HeapBox) -> *mut u8 {
     // SAFETY: forwarded contract.
-    let p = unsafe { malloc_slow(hb, size) };
+    let p = unsafe { malloc_slow(size, hb) };
     if p.is_null() { H::on_oom(size) } else { p }
 }
 
@@ -359,8 +526,8 @@ unsafe fn malloc_or_slow_with<H: OnOom>(hb: *mut init::HeapBox, size: usize) -> 
 #[cold]
 #[inline(never)]
 unsafe fn malloc_or_slow(
-    hb: *mut init::HeapBox,
     size: usize,
+    hb: *mut init::HeapBox,
     on_oom: fn(usize) -> *mut u8,
 ) -> *mut u8 {
     // Duplicating `malloc_slow`'s body here to avoid nesting a second cold
@@ -368,7 +535,7 @@ unsafe fn malloc_or_slow(
     // because the call it would remove is already a tail-call `jmp`. Reverted;
     // the plain call is the clearer code for the same instruction count.
     // SAFETY: forwarded contract.
-    let p = unsafe { malloc_slow(hb, size) };
+    let p = unsafe { malloc_slow(size, hb) };
     if p.is_null() { on_oom(size) } else { p }
 }
 
@@ -383,7 +550,46 @@ unsafe fn malloc_or_slow(
 /// shared sentinel.
 #[cold]
 #[inline(never)]
-unsafe fn malloc_slow(hb: *mut init::HeapBox, size: usize) -> *mut u8 {
+unsafe fn malloc_slow(size: usize, hb: *mut init::HeapBox) -> *mut u8 {
+    // SAFETY: forwarded contract.
+    unsafe { malloc_slow_body(size, hb) }
+}
+
+/// [`malloc_slow`] for a caller holding `size` in the SECOND argument
+/// register. The same body under a second symbol, not a jump to the first.
+///
+/// # Safety
+/// As [`malloc_slow`].
+#[cold]
+#[inline(never)]
+unsafe fn malloc_slow_hb_first(hb: *mut init::HeapBox, size: usize) -> *mut u8 {
+    // SAFETY: forwarded contract.
+    unsafe { malloc_slow_body(size, hb) }
+}
+
+/// # Safety
+/// As [`malloc_slow`].
+#[inline(always)]
+unsafe fn malloc_slow_body(size: usize, hb: *mut init::HeapBox) -> *mut u8 {
+    if SENTINEL_BY_FLAG {
+        // ONE test for the two rare things a miss can find: a thread with
+        // no heap yet (the sentinel, whose flag is permanently set: see
+        // `Heap::sentinel`) and a deferred-free hook that is due. It was a
+        // compare against the sentinel's address and then this flag, two
+        // instructions more on every slow-path allocation, and a medium
+        // allocation takes this path every time (opscan big 90 -> 88).
+        //
+        // SAFETY: a raw one-byte read; `hb` is the TLS box, real or the
+        // immortal sentinel. `&mut Heap` is formed only when the flag is
+        // clear, which the sentinel's never is.
+        unsafe {
+            let h = (*hb).heap.get();
+            if (*h).deferred_due {
+                return malloc_slow_rare(size, hb);
+            }
+            return (*h).malloc_generic(size).0;
+        }
+    }
     if hb != init::empty_heap_box_ptr() {
         // SAFETY: a non-sentinel box is this thread's live, initialised box —
         // exclusive &mut scope on the calling thread's own heap. Straight to
@@ -421,6 +627,25 @@ unsafe fn malloc_slow(hb: *mut init::HeapBox, size: usize) -> *mut u8 {
         }
     }
     malloc_first(size)
+}
+
+/// Whether the allocation miss recognises the sentinel by its heap's
+/// `deferred_due` flag. Everywhere: the flag is part of the static.
+const SENTINEL_BY_FLAG: bool = true;
+
+/// The rare half of [`malloc_slow_body`]'s one test: no heap yet, or the
+/// deferred-free hook is due.
+///
+/// # Safety
+/// As [`malloc_slow`].
+#[cold]
+#[inline(never)]
+unsafe fn malloc_slow_rare(size: usize, hb: *mut init::HeapBox) -> *mut u8 {
+    if hb == init::empty_heap_box_ptr() {
+        return malloc_first(size);
+    }
+    // SAFETY: a non-sentinel box is this thread's live, initialised box.
+    unsafe { malloc_slow_deferred((*hb).heap.get(), size) }
 }
 
 /// [`malloc_slow`] when the heartbeat marked the deferred-free hook due: fire
@@ -499,6 +724,7 @@ fn malloc_first(size: usize) -> *mut u8 {
 }
 
 /// Allocate `size` zeroed bytes.
+#[inline]
 pub fn zalloc(size: usize) -> *mut u8 {
     // Same TLS shape as `malloc` and `malloc_aligned_at`: `heap_box_fast` and
     // one compare against the shared sentinel, not `my_heap` — which goes
@@ -537,6 +763,35 @@ pub fn zalloc(size: usize) -> *mut u8 {
                 }
                 return b;
             }
+            // A dry list, as distinct from a non-small size: see
+            // `malloc_dry`.
+            return zalloc_dry(hb, size, p);
+        }
+        zalloc_slow(hb, size)
+    }
+}
+
+/// [`zalloc`]'s small miss: the direct page's `free` list is dry. The swap
+/// trip of [`malloc_dry`], and then the zeroing with the page still in hand.
+///
+/// calloc's swap trip was dearer than malloc's: `zalloc_slow`, then
+/// `Heap::zalloc` trying the same dry list again, then the generic path, and
+/// then `usable_size` resolving the page from the block to learn how much to
+/// zero. Here the page is the one the fast path just read.
+///
+/// # Safety
+/// As [`malloc_dry`], `hb` first as [`zalloc_slow`] has it.
+#[cold]
+#[inline(never)]
+unsafe fn zalloc_dry(hb: *mut init::HeapBox, size: usize, pg: *mut Page) -> *mut u8 {
+    // SAFETY: forwarded contract; a swapped block is a whole block of `pg`,
+    // whose `block_size` is its usable extent (the direct table never serves
+    // an interior pointer).
+    unsafe {
+        if let Some(b) = swap_trip(hb, pg) {
+            // Recycled blocks are not zero: `swap_trip` cleared the flag.
+            ptr::write_bytes(b, 0, (*pg).block_size);
+            return b;
         }
         zalloc_slow(hb, size)
     }
@@ -548,7 +803,35 @@ pub fn zalloc(size: usize) -> *mut u8 {
 /// `hb` is `heap_box_fast()` of the calling thread.
 #[cold]
 #[inline(never)]
+// (`hb` first here, unlike `malloc_slow`: calloc's size is the product it
+// just computed, not an incoming register, and `size` first measured
+// +1.06 Ir per calloc.)
 unsafe fn zalloc_slow(hb: *mut init::HeapBox, size: usize) -> *mut u8 {
+    // The one test of `malloc_slow_body`: the sentinel's heap has the
+    // deferred-hook flag permanently set (`Heap::sentinel`), so "no heap
+    // yet" and "the hook is due" are one read, and both leave. With the
+    // hook's call gone from this body, nothing is live across a call and
+    // the common miss is a tail call into the heap (census 4, vein 7).
+    //
+    // SAFETY: a raw one-byte read of the TLS box's heap, real or sentinel;
+    // `&mut Heap` is formed only when the flag is clear.
+    unsafe {
+        let h = (*hb).heap.get();
+        if (*h).deferred_due {
+            return zalloc_slow_rare(hb, size);
+        }
+        (*h).zalloc(size)
+    }
+}
+
+/// The rare half of [`zalloc_slow`]: no heap yet, or the deferred-free hook
+/// is due.
+///
+/// # Safety
+/// As [`zalloc_slow`].
+#[cold]
+#[inline(never)]
+unsafe fn zalloc_slow_rare(hb: *mut init::HeapBox, size: usize) -> *mut u8 {
     if hb == init::empty_heap_box_ptr() {
         return zalloc_first(size);
     }
@@ -594,6 +877,13 @@ unsafe fn zero_block(p: *mut u8, is_zero: bool) {
 }
 
 /// `calloc`: overflow-checked `count * size`, zeroed.
+// `#[inline]`, and `zalloc` with it, so the C export (`rusty_alloc_override`'s
+// `calloc`) IS the body. Without them the export was one instruction, a jump
+// through the GOT to this function, on every `calloc` of an interposed
+// program (census 4, vein 3). BOTH or neither: with only this one inline the
+// export became the multiply and a jump to `zalloc` with the size moved
+// into place, opscan calloc 84.01 -> 85.88.
+#[inline]
 pub fn calloc(count: usize, size: usize) -> *mut u8 {
     match count.checked_mul(size) {
         Some(total) => zalloc(total),
@@ -624,6 +914,17 @@ pub fn zalloc_small(size: usize) -> *mut u8 {
 /// `mi_malloc_aligned(size, alignment)`.
 pub fn malloc_aligned(size: usize, align: usize) -> *mut u8 {
     malloc_aligned_at(size, align, 0)
+}
+
+/// [`malloc_aligned`] with its arguments in C's order, `(align, size)`: the
+/// entry for `aligned_alloc` and `memalign`.
+///
+/// Through `malloc_aligned(size, align)` those exports opened by swapping
+/// their two argument registers, three moves, and then jumped: the same
+/// defect as `malloc`'s miss (census 4, vein 3), on the other side of the
+/// call. Here the body is compiled for the registers the values arrive in.
+pub fn malloc_aligned_c(align: usize, size: usize) -> *mut u8 {
+    aligned_at_impl::<false>(size, align, 0)
 }
 
 /// `mi_malloc_aligned_at(size, alignment, offset)`: returns `p` with
@@ -694,7 +995,7 @@ fn aligned_at_impl<const POW2: bool>(size: usize, align: usize, offset: usize) -
                 }
             }
         }
-        malloc_aligned_slow(hb, size, align, offset)
+        malloc_aligned_slow(size, align, offset, hb)
     }
 }
 
@@ -706,11 +1007,14 @@ fn aligned_at_impl<const POW2: bool>(size: usize, align: usize, offset: usize) -
 /// shared sentinel.
 #[cold]
 #[inline(never)]
+// (`size`, `align`, `offset` first, in the registers they arrive in: with the
+// heap box first, `__rust_alloc` moved `size` out of its register at entry,
+// on every allocation, to make room. See `malloc`.)
 unsafe fn malloc_aligned_slow(
-    hb: *mut init::HeapBox,
     size: usize,
     align: usize,
     offset: usize,
+    hb: *mut init::HeapBox,
 ) -> *mut u8 {
     if hb != init::empty_heap_box_ptr() {
         // MEDIUM sizes get the peek here, in the COLD function, rather than
@@ -1106,7 +1410,7 @@ unsafe fn free_inline_impl<const OWNER_FIRST: bool>(p: *mut u8) {
 /// As [`free`], `seg == segment_of(p)`, and with `KNOWN_PAGE`,
 /// `known_pg == page_of(seg, p)`.
 #[inline(always)]
-unsafe fn free_body<const OWNER_FIRST: bool, const KNOWN_PAGE: bool>(
+unsafe fn free_body_classic<const OWNER_FIRST: bool, const KNOWN_PAGE: bool>(
     p: *mut u8,
     seg: *mut Segment,
     known_pg: *mut Page,
@@ -1231,178 +1535,334 @@ unsafe fn free_body<const OWNER_FIRST: bool, const KNOWN_PAGE: bool>(
                     return;
                 }
             }
-            {
-                // Routing the whole free on ONE byte is only safe while that
-                // byte agrees with the fields it summarises. These two check
-                // exactly that, against INDEPENDENT representations: the
-                // segment's own kind tag, and the page's bin. A desync (a page
-                // built without its flag, a flag cleared by a stray write)
-                // would otherwise send a huge or unqueued span down the binned
-                // path and corrupt silently — so assert it where the decision
-                // is actually made, not in a helper that may go uncalled.
-                debug_assert_eq!(
-                    (*seg).kind,
-                    SegmentKind::Normal,
-                    "free fast path: HUGE_SEGMENT clear but segment is Huge"
-                );
-                debug_assert_ne!(
-                    (*pg).bin as usize,
-                    BIN_HUGE,
-                    "free fast path: SINGLE_BLOCK clear but bin is BIN_HUGE"
-                );
-                // Upstream's `mi_free_block_local` touches NO heap: the PAGE
-                // owns `local_free`. The only parts of a fast-path free that
-                // need the owning heap are the stats counter — which, like
-                // upstream's `MI_STAT`, exists only in debug builds — and
-                // retiring a page that just emptied, which is rare. So the
-                // shipped fast path is push + decrement + ONE branch: both
-                // cold outcomes of the decrement — 0 (page emptied, retire)
-                // and negative (double free, abort) — share a single `<= 0`
-                // test on its flags, and the shared handler is reached by a
-                // tail jump. With no `call` left in the function, the fast
-                // path needs no stack adjustment at all (the M16 lesson,
-                // applied to the alignment push this time).
-                // THE DECREMENT, AND WHY IT IS ASM.
-                //
-                // `used -= 1` followed by a test of the result is five
-                // instructions from safe Rust — load, dec, store, test, branch
-                // — because LLVM will not emit a memory-destination RMW when
-                // the decremented value is also needed to drive a branch. It
-                // even re-tests a value `dec` has already set the flags for.
-                // mimalloc emits `subw $1, used; je`: TWO. That gap is 3 Ir on
-                // every local free, `docs/opps.md` #6 measured it on four
-                // workloads (sh6bench +366M, sh8bench +852M, alloc-test +200M,
-                // cfrac +183M), and it was refuted TWICE from safe Rust — the
-                // second time by deleting the return value entirely, which
-                // produced byte-identical code because the caller then had to
-                // re-read the field.
-                //
-                // It is not reachable from safe Rust by any arrangement of
-                // this code. So it is written directly, as the one instruction
-                // pair it is. `used` is a plain owner-only `u32` — no atomic,
-                // no other thread may touch it — so a non-atomic RMW is
-                // exactly right, and the flags `sub` leaves are precisely the
-                // `<= 0` the two cold outcomes share: 0 means the page just
-                // emptied, negative means the count wrapped and this is a
-                // DOUBLE FREE.
-                crate::page::page_link_local(pg, p.cast::<Block>());
-                #[cfg(debug_assertions)]
-                {
-                    (*owner_heap(pg)).stats.frees += 1;
-                }
-                // NOT on an MSVC target that unwinds. This function inlines
-                // into `GlobalAlloc::dealloc`, so into every Rust drop,
-                // including the drops a panic runs; on MSVC those are EH
-                // cleanup FUNCLETS, and LLVM cannot place an `asm!` goto
-                // (`callbr`) in a funclet: its successors lose the funclet
-                // colouring and the verifier rejects the module ("Bogus
-                // funclet pad use"). 2.2.1-2.2.4 failed to build in an
-                // unwinding MSVC consumer with LTO that way (rusty_sloth;
-                // docs/plans/msvc-funclet-asm-goto.md). Those builds take the
-                // plain-Rust decrement below (+3 Ir per local free, opps #6),
-                // which reaches every caller, not just `dealloc`. An MSVC
-                // build with `panic = "abort"` has no funclets and keeps the
-                // asm. Regression gate: the corpus's rusty_sloth row, built
-                // `--release` (no small consumer reproduces it).
-                #[cfg(all(
-                    target_arch = "x86_64",
-                    not(miri),
-                    not(all(target_env = "msvc", panic = "unwind"))
-                ))]
-                {
-                    // SAFETY: `pg` is a live page of this thread; `USED_OFFSET`
-                    // is `offset_of!(Page, used)`, checked against the real
-                    // layout by a unit test. The asm reads and writes only that
-                    // one `u32` and uses no stack.
-                    core::arch::asm!(
-                        // The offset is a `const` operand, not an address
-                        // computed into a register: passing `pg + USED_OFFSET`
-                        // as `in(reg)` costs a `lea` that mimalloc does not
-                        // pay, because x86 addressing carries the displacement
-                        // for free.
-                        "sub dword ptr [{pg} + {off}], 1",
-                        "jle {cold}",
-                        pg = in(reg) pg,
-                        off = const crate::page::USED_OFFSET,
-                        cold = label {
-                            // Page emptied, or the count wrapped. The common
-                            // outcome is "sole page in its queue, keep it warm",
-                            // which needs only the page's own links.
-                            //
-                            // A `label` block does not inherit the enclosing
-                            // `unsafe`; it is a separate item.
-                            // SAFETY: `pg` is the live page this free resolved,
-                            // owned by this thread.
-                            //
-                            // ONE test, not three: `used`, `next` and `prev`
-                            // OR-ed are zero exactly when the page emptied
-                            // (not a wrapped double free) and is its queue's
-                            // only member. Three compare-and-branch pairs
-                            // were 6 Ir on every free that empties a page —
-                            // every free of an alloc/free loop cycling one
-                            // block. `retire_or_abort` re-tests each case.
-                            unsafe {
-                                if ((*pg).used as usize | (*pg).next.addr() | (*pg).prev.addr())
-                                    == 0
-                                {
-                                    return;
-                                }
-                                return retire_or_abort(pg);
-                            }
-                        },
-                        options(nostack),
-                    );
-                }
-                // MSVC with `panic = "unwind"`: no goto (see the arm above),
-                // but an `asm!` with an OUTPUT operand is allowed there, and
-                // `sub` + `setle` is four instructions with the test, where
-                // the plain decrement below is five (load, dec, store, test,
-                // branch: LLVM will not emit a memory-destination RMW whose
-                // result drives a branch). Measured with this arm forced on
-                // Linux: see the note below the cfg.
-                #[cfg(all(
-                    target_arch = "x86_64",
-                    not(miri),
-                    target_env = "msvc",
-                    panic = "unwind"
-                ))]
-                {
-                    let le: u8;
-                    // SAFETY: as the goto arm: `pg` is a live page of this
-                    // thread, `USED_OFFSET` is `offset_of!(Page, used)`, and
-                    // the asm touches only that `u32` and uses no stack.
-                    core::arch::asm!(
-                        "sub dword ptr [{pg} + {off}], 1",
-                        "setle {le}",
-                        pg = in(reg) pg,
-                        off = const crate::page::USED_OFFSET,
-                        le = out(reg_byte) le,
-                        options(nostack),
-                    );
-                    if le != 0 {
-                        // One test, as in the goto arm.
-                        if ((*pg).used as usize | (*pg).next.addr() | (*pg).prev.addr()) == 0 {
-                            return;
-                        }
-                        return retire_or_abort(pg);
-                    }
-                }
-                #[cfg(not(all(target_arch = "x86_64", not(miri))))]
-                {
-                    let u = (*pg).used.wrapping_sub(1);
-                    (*pg).used = u;
-                    if (u as i32) <= 0 {
-                        // One test, as in the x86-64 arm above.
-                        if (u as usize | (*pg).next.addr() | (*pg).prev.addr()) == 0 {
-                            return;
-                        }
-                        return retire_or_abort(pg);
-                    }
-                }
-            }
+            free_local_plain(seg, pg, p);
             return;
         }
+        if OWNER_FIRST {
+            // The owner compare above already said "local", and `flags` is
+            // in a register: `free_general` would load the flags again and
+            // compare the owner again.
+            return free_flagged_local(p, seg, pg, flags);
+        }
         free_general(p, seg, pg, owner_tid);
+    }
+}
+
+/// A LOCAL free into a flagged page (full, aligned, single-block, huge), for
+/// the caller that has already established both facts.
+///
+/// Since the owner word, every free that is not a local free into a plain
+/// page reaches [`free_body_classic`] through [`free_slow`], which compares
+/// the segment's owner with this thread and tests the page's flags. It then
+/// handed `free_general` the owner id to compare AGAIN, and `free_general`
+/// loaded the flags AGAIN. This is `free_general`'s local half with neither:
+/// 13 -> 9 instructions on every free of a large block and every free that
+/// un-parks a full page (census 4, vein 1; a 2 MiB alloc/free pair 147 ->
+/// 143, which is the three instructions the owner word had cost that path,
+/// and one more).
+///
+/// # Safety
+/// As [`free_general`], with the calling thread the owner of `seg` and
+/// `flags` the page's flags as just loaded.
+#[cold]
+#[inline(never)]
+unsafe fn free_flagged_local(p: *mut u8, seg: *mut Segment, pg: *mut Page, flags: u8) {
+    // SAFETY: per contract; the two arms are `free_general`'s own.
+    unsafe {
+        let block = if flags & pflags::HAS_ALIGNED != 0 && flags & pflags::HUGE_SEGMENT == 0 {
+            unalign(pg, p)
+        } else {
+            p
+        };
+        free_local_owned(seg, pg, block);
+    }
+}
+
+/// Free `p`, a block of ours: the ONE-compare fast path, then the body above.
+///
+/// A local free into a plain page is decided by one word of the page
+/// ([`Page::owner_plain`]): it equals this thread's id only for a plain page
+/// of a segment this thread owns. Everything else — a cross-thread free, a
+/// full or aligned or single-block page, an abandoned segment — reads as a
+/// mismatch and takes [`free_slow`], which asks the two original questions.
+/// `OWNER_FIRST` no longer shapes the inlined code (the cold arm is out of
+/// line and tests the owner first), so both entries share this.
+///
+/// # Safety
+/// As [`free_body_classic`].
+#[inline(always)]
+unsafe fn free_body<const OWNER_FIRST: bool, const KNOWN_PAGE: bool>(
+    p: *mut u8,
+    seg: *mut Segment,
+    known_pg: *mut Page,
+) {
+    if crate::page::FAST_OWNER {
+        // SAFETY: `p` is ours per the contract, so `seg` is its live segment
+        // and the resolved slot its page; the word is read, never written.
+        unsafe {
+            let pg = if KNOWN_PAGE {
+                known_pg
+            } else {
+                page_of(seg, p)
+            };
+            let owner = (*pg).owner_plain.load(Ordering::Relaxed);
+            // `thread_id()` IS the fs base here, so the compare takes `fs:0`
+            // as its memory operand (see `free_body_classic`).
+            #[cfg(all(target_arch = "x86_64", target_os = "linux", not(miri)))]
+            core::arch::asm!(
+                "cmp {owner}, fs:0",
+                "jne {slow}",
+                owner = in(reg) owner,
+                slow = label {
+                    // SAFETY: forwarded contract; `pg` is `p`'s page.
+                    unsafe {
+                        if KNOWN_PAGE {
+                            free_slow_known(p, pg)
+                        } else {
+                            free_slow(p, seg, pg)
+                        }
+                    };
+                    return;
+                },
+                options(nostack, readonly),
+            );
+            #[cfg(not(all(target_arch = "x86_64", target_os = "linux", not(miri))))]
+            if owner != init::thread_id() {
+                return if KNOWN_PAGE {
+                    free_slow_known(p, pg)
+                } else {
+                    free_slow(p, seg, pg)
+                };
+            }
+            debug_assert_eq!(
+                (*pg).flags.load(Ordering::Relaxed) & pflags::SLOW_FREE,
+                0,
+                "free fast path: the owner word matched a flagged page"
+            );
+            debug_assert_eq!(
+                (*seg).thread_id.load(Ordering::Relaxed),
+                owner,
+                "free fast path: the owner word outlived its segment's owner"
+            );
+            return free_local_plain(seg, pg, p);
+        }
+    }
+    // SAFETY: forwarded contract.
+    unsafe { free_body_classic::<OWNER_FIRST, KNOWN_PAGE>(p, seg, known_pg) }
+}
+
+/// The cold arm of [`free_body`]: not a local free into a plain page.
+///
+/// # Safety
+/// As [`free_body_classic`], with `pg == page_of(seg, p)`.
+#[cold]
+#[inline(never)]
+unsafe fn free_slow(p: *mut u8, seg: *mut Segment, pg: *mut Page) {
+    // SAFETY: forwarded contract.
+    unsafe { free_body_classic::<true, true>(p, seg, pg) }
+}
+
+/// [`free_slow`] for the caller that resolved the page long ago (a moving
+/// `realloc`): it takes the block and its page and RECOMPUTES the segment.
+///
+/// Handed the segment, that caller had to keep it alive up to this call, and
+/// the local fast path no longer reads it: a callee-saved register held
+/// across the `memcpy` for the sake of this arm alone — a push, a pop, a
+/// copy, and on the Rust entry the stack-alignment pair an even count of
+/// pushes brings with it. 52.1 -> 48.1 Ir per Rust realloc (census 4,
+/// vein 5).
+///
+/// A second symbol, not a change to [`free_slow`], and that is measured:
+/// with ONE arm recomputing for everybody, `free`'s own cold arm — which
+/// has the segment in a register already — paid for it. Opscan xthread
+/// +3.00 Ir/op, huge +8.00, perl +1,831 allocator Ir.
+///
+/// # Safety
+/// As [`free_body_classic`], with `pg == page_of(segment_of(p), p)`.
+#[cold]
+#[inline(never)]
+unsafe fn free_slow_known(p: *mut u8, pg: *mut Page) {
+    // SAFETY: forwarded contract.
+    unsafe { free_slow(p, segment_of(p), pg) }
+}
+
+/// The tail of a local free into a plain page: push, decrement, and the one
+/// branch both cold outcomes of the decrement share.
+///
+/// # Safety
+/// `p` is a block of `pg`, a plain page of `seg`, owned by the calling
+/// thread.
+#[inline(always)]
+unsafe fn free_local_plain(seg: *mut Segment, pg: *mut Page, p: *mut u8) {
+    // SAFETY: per contract.
+    unsafe {
+        // Routing the whole free on ONE byte is only safe while that
+        // byte agrees with the fields it summarises. These two check
+        // exactly that, against INDEPENDENT representations: the
+        // segment's own kind tag, and the page's bin. A desync (a page
+        // built without its flag, a flag cleared by a stray write)
+        // would otherwise send a huge or unqueued span down the binned
+        // path and corrupt silently — so assert it where the decision
+        // is actually made, not in a helper that may go uncalled.
+        debug_assert_eq!(
+            (*seg).kind,
+            SegmentKind::Normal,
+            "free fast path: HUGE_SEGMENT clear but segment is Huge"
+        );
+        debug_assert_ne!(
+            (*pg).bin as usize,
+            BIN_HUGE,
+            "free fast path: SINGLE_BLOCK clear but bin is BIN_HUGE"
+        );
+        // Upstream's `mi_free_block_local` touches NO heap: the PAGE
+        // owns `local_free`. The only parts of a fast-path free that
+        // need the owning heap are the stats counter — which, like
+        // upstream's `MI_STAT`, exists only in debug builds — and
+        // retiring a page that just emptied, which is rare. So the
+        // shipped fast path is push + decrement + ONE branch: both
+        // cold outcomes of the decrement — 0 (page emptied, retire)
+        // and negative (double free, abort) — share a single `<= 0`
+        // test on its flags, and the shared handler is reached by a
+        // tail jump. With no `call` left in the function, the fast
+        // path needs no stack adjustment at all (the M16 lesson,
+        // applied to the alignment push this time).
+        // THE DECREMENT, AND WHY IT IS ASM.
+        //
+        // `used -= 1` followed by a test of the result is five
+        // instructions from safe Rust — load, dec, store, test, branch
+        // — because LLVM will not emit a memory-destination RMW when
+        // the decremented value is also needed to drive a branch. It
+        // even re-tests a value `dec` has already set the flags for.
+        // mimalloc emits `subw $1, used; je`: TWO. That gap is 3 Ir on
+        // every local free, `docs/opps.md` #6 measured it on four
+        // workloads (sh6bench +366M, sh8bench +852M, alloc-test +200M,
+        // cfrac +183M), and it was refuted TWICE from safe Rust — the
+        // second time by deleting the return value entirely, which
+        // produced byte-identical code because the caller then had to
+        // re-read the field.
+        //
+        // It is not reachable from safe Rust by any arrangement of
+        // this code. So it is written directly, as the one instruction
+        // pair it is. `used` is a plain owner-only `u32` — no atomic,
+        // no other thread may touch it — so a non-atomic RMW is
+        // exactly right, and the flags `sub` leaves are precisely the
+        // `<= 0` the two cold outcomes share: 0 means the page just
+        // emptied, negative means the count wrapped and this is a
+        // DOUBLE FREE.
+        crate::page::page_link_local(pg, p.cast::<Block>());
+        #[cfg(debug_assertions)]
+        {
+            (*owner_heap(pg)).stats.frees += 1;
+        }
+        // NOT on an MSVC target that unwinds. This function inlines
+        // into `GlobalAlloc::dealloc`, so into every Rust drop,
+        // including the drops a panic runs; on MSVC those are EH
+        // cleanup FUNCLETS, and LLVM cannot place an `asm!` goto
+        // (`callbr`) in a funclet: its successors lose the funclet
+        // colouring and the verifier rejects the module ("Bogus
+        // funclet pad use"). 2.2.1-2.2.4 failed to build in an
+        // unwinding MSVC consumer with LTO that way (rusty_sloth;
+        // docs/plans/msvc-funclet-asm-goto.md). Those builds take the
+        // plain-Rust decrement below (+3 Ir per local free, opps #6),
+        // which reaches every caller, not just `dealloc`. An MSVC
+        // build with `panic = "abort"` has no funclets and keeps the
+        // asm. Regression gate: the corpus's rusty_sloth row, built
+        // `--release` (no small consumer reproduces it).
+        #[cfg(all(
+            target_arch = "x86_64",
+            not(miri),
+            not(all(target_env = "msvc", panic = "unwind"))
+        ))]
+        {
+            // SAFETY: `pg` is a live page of this thread; `USED_OFFSET`
+            // is `offset_of!(Page, used)`, checked against the real
+            // layout by a unit test. The asm reads and writes only that
+            // one `u32` and uses no stack.
+            core::arch::asm!(
+                // The offset is a `const` operand, not an address
+                // computed into a register: passing `pg + USED_OFFSET`
+                // as `in(reg)` costs a `lea` that mimalloc does not
+                // pay, because x86 addressing carries the displacement
+                // for free.
+                "sub dword ptr [{pg} + {off}], 1",
+                "jle {cold}",
+                pg = in(reg) pg,
+                off = const crate::page::USED_OFFSET,
+                cold = label {
+                    // Page emptied, or the count wrapped. The common
+                    // outcome is "sole page in its queue, keep it warm",
+                    // which needs only the page's own links.
+                    //
+                    // A `label` block does not inherit the enclosing
+                    // `unsafe`; it is a separate item.
+                    // SAFETY: `pg` is the live page this free resolved,
+                    // owned by this thread.
+                    //
+                    // ONE test, not three: `used`, `next` and `prev`
+                    // OR-ed are zero exactly when the page emptied
+                    // (not a wrapped double free) and is its queue's
+                    // only member. Three compare-and-branch pairs
+                    // were 6 Ir on every free that empties a page —
+                    // every free of an alloc/free loop cycling one
+                    // block. `retire_or_abort` re-tests each case.
+                    unsafe {
+                        if ((*pg).used as usize | (*pg).next.addr() | (*pg).prev.addr())
+                            == 0
+                        {
+                            return;
+                        }
+                        return retire_or_abort(pg);
+                    }
+                },
+                options(nostack),
+            );
+        }
+        // MSVC with `panic = "unwind"`: no goto (see the arm above),
+        // but an `asm!` with an OUTPUT operand is allowed there, and
+        // `sub` + `setle` is four instructions with the test, where
+        // the plain decrement below is five (load, dec, store, test,
+        // branch: LLVM will not emit a memory-destination RMW whose
+        // result drives a branch). Measured with this arm forced on
+        // Linux: see the note below the cfg.
+        #[cfg(all(
+            target_arch = "x86_64",
+            not(miri),
+            target_env = "msvc",
+            panic = "unwind"
+        ))]
+        {
+            let le: u8;
+            // SAFETY: as the goto arm: `pg` is a live page of this
+            // thread, `USED_OFFSET` is `offset_of!(Page, used)`, and
+            // the asm touches only that `u32` and uses no stack.
+            core::arch::asm!(
+                "sub dword ptr [{pg} + {off}], 1",
+                "setle {le}",
+                pg = in(reg) pg,
+                off = const crate::page::USED_OFFSET,
+                le = out(reg_byte) le,
+                options(nostack),
+            );
+            if le != 0 {
+                // One test, as in the goto arm.
+                if ((*pg).used as usize | (*pg).next.addr() | (*pg).prev.addr()) == 0 {
+                    return;
+                }
+                retire_or_abort(pg);
+            }
+        }
+        #[cfg(not(all(target_arch = "x86_64", not(miri))))]
+        {
+            let u = (*pg).used.wrapping_sub(1);
+            (*pg).used = u;
+            if (u as i32) <= 0 {
+                // One test, as in the x86-64 arm above.
+                if (u as usize | (*pg).next.addr() | (*pg).prev.addr()) == 0 {
+                    return;
+                }
+                retire_or_abort(pg);
+            }
+        }
     }
 }
 
@@ -1590,6 +2050,34 @@ unsafe fn free_general(p: *mut u8, seg: *mut Segment, pg: *mut Page, owner_tid: 
     }
 }
 
+/// [`usable_size`] when it is one load: `Some` for a block on a plain page,
+/// `None` for one on a flagged page (an interior aligned block, a
+/// single-block span, a huge segment), which needs the general answer.
+///
+/// For a caller that wants the common answer WITHOUT a call in its body:
+/// `usable_size` reaches `usable_size_slow` on the flagged arm, and a call
+/// with anything live across it is a frame on every path.
+///
+/// # Safety
+/// `p` must be a live pointer from this allocator.
+#[inline]
+pub unsafe fn usable_size_plain(p: ptr::NonNull<u8>) -> Option<usize> {
+    let p = p.as_ptr();
+    let seg = segment_of(p);
+    // SAFETY: as `usable_size`: the page metadata of a live block is stable
+    // while it lives, and a page with none of the three flags holds whole
+    // blocks of `block_size` bytes.
+    unsafe {
+        let pg = page_of(seg, p);
+        let flags = (*pg).flags.load(Ordering::Relaxed);
+        if flags & (pflags::HAS_ALIGNED | pflags::SINGLE_BLOCK | pflags::HUGE_SEGMENT) == 0 {
+            Some((*pg).block_size)
+        } else {
+            None
+        }
+    }
+}
+
 /// Usable size of a live block (≥ requested); 0 for null. Any thread.
 ///
 /// # Safety
@@ -1678,7 +2166,7 @@ unsafe fn usable_size_slow(pg: *mut Page, p: *const u8, flags: u8) -> usize {
 #[inline]
 pub unsafe fn realloc(p: *mut u8, newsize: usize) -> *mut u8 {
     if p.is_null() {
-        return malloc(newsize);
+        return malloc_impl::<false, true>(newsize);
     }
     // SAFETY: forwarded contract; `p` is non-null here.
     unsafe { realloc_live(ptr::NonNull::new_unchecked(p), newsize) }
@@ -1696,6 +2184,262 @@ pub unsafe fn realloc(p: *mut u8, newsize: usize) -> *mut u8 {
 /// `p` must be a live pointer from this allocator; invalidated on move.
 #[inline(never)]
 unsafe fn realloc_live(p: ptr::NonNull<u8>, newsize: usize) -> *mut u8 {
+    // SAFETY: forwarded contract.
+    unsafe { realloc_live_body(p, newsize) }
+}
+
+/// [`realloc`] for Rust's `GlobalAlloc`, whose `__rust_realloc` receives
+/// `(ptr, old_size, align, new_size)`: the same body as [`realloc_live`]
+/// behind a symbol that takes its arguments in THOSE registers.
+///
+/// Through `realloc(ptr, new_size)` the entry had to move `new_size` from the
+/// fourth register to the second before it could jump, and it did so with a
+/// branch-free select between `new_size` and `max(new_size, 16)`: eight
+/// instructions in front of every Rust realloc. Here a word-aligned layout
+/// is one compare and the jump (census 4, vein 5).
+///
+/// `old_size` and `align` are the layout's; this body does not read them.
+///
+/// # Safety
+/// `p` must be a live pointer from this allocator, allocated with a layout
+/// of at most [`crate::types::NATURAL_ALIGN`]; invalidated on move.
+#[inline(never)]
+pub unsafe fn realloc_rust(
+    p: ptr::NonNull<u8>,
+    _old_size: usize,
+    _align: usize,
+    newsize: usize,
+) -> *mut u8 {
+    // SAFETY: forwarded contract.
+    unsafe { realloc_live_body(p, newsize) }
+}
+
+/// Whether [`realloc_live_body`] has its leaf: the targets where the local
+/// free is the one-compare form ([`free_body`]) and both of its cold exits
+/// can be `asm!` gotos, so nothing is live across a call.
+const LEAF_MOVE: bool =
+    crate::page::FAST_OWNER && cfg!(all(target_arch = "x86_64", target_os = "linux", not(miri)));
+
+/// The body of [`realloc_live`] and [`realloc_rust`]: one body, two symbols,
+/// because the two callers hold `newsize` in different registers.
+///
+/// **A LEAF for the small move, and that is the point of its shape** (census
+/// 4, vein 4). A move of at most 64 bytes into a block the direct table can
+/// hand over needs no call at all: the pop, the straight-line copy
+/// ([`copy_small`]), the local free. Everything else it might have to do is
+/// a call with the old block, its page and the new block live across it,
+/// which is three callee-saved registers pushed and popped by EVERY realloc,
+/// the in-place return and the 16-byte move included. So each of those is a
+/// tail call to a function with a frame of its own:
+///
+/// - a flagged page (aligned, single-block, huge): [`realloc_flagged`];
+/// - a copy above 64 bytes: [`realloc_move_out`] with `BIG`, which calls
+///   `memcpy`;
+/// - a new size above the direct table, or its page dry:
+///   [`realloc_move_out`] without it;
+/// - the free's two cold outcomes: [`free_moved`]'s own tail calls.
+///
+/// # Safety
+/// As [`realloc_live`].
+#[inline(always)]
+unsafe fn realloc_live_body(p: ptr::NonNull<u8>, newsize: usize) -> *mut u8 {
+    if !LEAF_MOVE {
+        // SAFETY: forwarded contract.
+        return unsafe { realloc_live_classic(p, newsize) };
+    }
+    let p = p.as_ptr();
+    let seg = segment_of(p);
+    // SAFETY: `p` is a live block of ours (contract), so `seg` is its live
+    // segment and `pg` its page. A plain page's `block_size` is the block's
+    // usable size. `direct` entries are live pages of this thread's heap or
+    // the immortal empty page, as in `malloc`; a non-null pop is a fresh
+    // block of at least `newsize >= copy` bytes, distinct from `p`.
+    unsafe {
+        let pg = page_of(seg, p);
+        let flags = (*pg).flags.load(Ordering::Relaxed);
+        if flags & (pflags::HAS_ALIGNED | pflags::SINGLE_BLOCK | pflags::HUGE_SEGMENT) != 0 {
+            return realloc_flagged(p, newsize);
+        }
+        let usable = (*pg).block_size;
+        // The same two branches and the same copy lengths as the classic
+        // body; see its notes.
+        let copy = if newsize > usable {
+            usable
+        } else if newsize >= usable / 2 {
+            stat_realloc(true);
+            return p;
+        } else {
+            newsize
+        };
+        if copy > 64 {
+            return realloc_move_out::<true>(p, newsize, copy, pg);
+        }
+        if newsize <= SMALL_SIZE_MAX {
+            let hb = init::heap_box_fast();
+            let h = (*hb).heap.get();
+            let np = crate::page::page_pop((*h).direct[crate::types::wsize_from_size(newsize)]);
+            if !np.is_null() {
+                #[cfg(debug_assertions)]
+                {
+                    (*h).stats.allocs += 1;
+                }
+                copy_small(p, np, copy);
+                stat_realloc(false);
+                return free_moved(p, pg, np);
+            }
+        }
+        realloc_move_out::<false>(p, newsize, copy, pg)
+    }
+}
+
+/// [`realloc_live_body`] for a block on a flagged page, whose usable size is
+/// not its page's block size. Out of line: it is the classic body, frame and
+/// all.
+///
+/// # Safety
+/// As [`realloc_live`].
+#[cold]
+#[inline(never)]
+unsafe fn realloc_flagged(p: *mut u8, newsize: usize) -> *mut u8 {
+    // SAFETY: forwarded contract; `p` is live, so non-null.
+    unsafe { realloc_live_classic(ptr::NonNull::new_unchecked(p), newsize) }
+}
+
+/// The move [`realloc_live_body`] could not make as a leaf: allocate through
+/// the whole of `malloc`, copy, free. `BIG` says the copy is above 64 bytes,
+/// so it is `memcpy` without the ladder's question.
+///
+/// # Safety
+/// As [`realloc_move_at`], with `pg == page_of(segment_of(p), p)`.
+#[inline(never)]
+unsafe fn realloc_move_out<const BIG: bool>(
+    p: *mut u8,
+    newsize: usize,
+    copy: usize,
+    pg: *mut Page,
+) -> *mut u8 {
+    let np = malloc_impl::<false, false>(newsize);
+    if np.is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: as `realloc_move_at`.
+    unsafe {
+        if BIG {
+            core::ptr::copy_nonoverlapping(p, np, copy);
+        } else {
+            copy_block(p, np, copy);
+        }
+        free_body::<true, true>(p, segment_of(p), pg);
+        stat_realloc(false);
+    }
+    np
+}
+
+/// Free `p`, the block a realloc just moved out of, and return `np`: the
+/// local free of [`free_body`] and [`free_local_plain`] with both cold
+/// outcomes as TAIL calls that carry `np` through, so the caller keeps
+/// nothing alive across them.
+///
+/// # Safety
+/// `p` is a live block of ours, `pg == page_of(segment_of(p), p)` is a plain
+/// page (no slow-free flag need be assumed: a flagged page's owner word is
+/// 0 and takes the cold arm), and `np` is the value to return.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", not(miri)))]
+#[inline(always)]
+unsafe fn free_moved(p: *mut u8, pg: *mut Page, np: *mut u8) -> *mut u8 {
+    // SAFETY: per contract; the two `asm!` blocks are those of `free_body`
+    // and `free_local_plain`, which document them.
+    unsafe {
+        let owner = (*pg).owner_plain.load(Ordering::Relaxed);
+        core::arch::asm!(
+            "cmp {owner}, fs:0",
+            "jne {slow}",
+            owner = in(reg) owner,
+            slow = label {
+                // SAFETY: forwarded contract.
+                return unsafe { free_slow_ret(p, pg, np) };
+            },
+            options(nostack, readonly),
+        );
+        crate::page::page_link_local(pg, p.cast::<Block>());
+        #[cfg(debug_assertions)]
+        {
+            (*owner_heap(pg)).stats.frees += 1;
+        }
+        core::arch::asm!(
+            "sub dword ptr [{pg} + {off}], 1",
+            "jle {cold}",
+            pg = in(reg) pg,
+            off = const crate::page::USED_OFFSET,
+            cold = label {
+                // SAFETY: `pg` is the live page this free resolved, owned by
+                // this thread (the owner word matched).
+                unsafe {
+                    if ((*pg).used as usize | (*pg).next.addr() | (*pg).prev.addr()) == 0 {
+                        return np;
+                    }
+                    return retire_ret(pg, np);
+                }
+            },
+            options(nostack),
+        );
+        np
+    }
+}
+
+/// [`free_moved`] where the leaf does not exist; never called
+/// ([`LEAF_MOVE`] is false), present so the one body compiles everywhere.
+///
+/// # Safety
+/// As the other definition.
+#[cfg(not(all(target_arch = "x86_64", target_os = "linux", not(miri))))]
+#[inline(always)]
+unsafe fn free_moved(p: *mut u8, pg: *mut Page, np: *mut u8) -> *mut u8 {
+    // SAFETY: forwarded contract.
+    unsafe { free_body::<true, true>(p, segment_of(p), pg) };
+    np
+}
+
+/// [`free_moved`]'s cold arm: not a local free into a plain page.
+///
+/// # Safety
+/// As [`free_slow_known`].
+#[cfg(all(target_arch = "x86_64", target_os = "linux", not(miri)))]
+#[cold]
+#[inline(never)]
+unsafe fn free_slow_ret(p: *mut u8, pg: *mut Page, np: *mut u8) -> *mut u8 {
+    // SAFETY: forwarded contract.
+    unsafe { free_slow_known(p, pg) };
+    // `black_box`, and it is the reason this is a tail call at all. Returned
+    // plainly, LLVM proves the result IS the third argument, rewrites the
+    // caller to use its own copy, and the jump becomes a call with `np`
+    // parked in a callee-saved register: a push and a pop on every realloc,
+    // for the sake of this arm (`realloc_live` 44.9 -> 46.9 Ir per call).
+    core::hint::black_box(np)
+}
+
+/// [`free_moved`]'s other cold arm: the page emptied and has neighbours, or
+/// its count wrapped.
+///
+/// # Safety
+/// As [`retire_or_abort`].
+#[cfg(all(target_arch = "x86_64", target_os = "linux", not(miri)))]
+#[cold]
+#[inline(never)]
+unsafe fn retire_ret(pg: *mut Page, np: *mut u8) -> *mut u8 {
+    // SAFETY: forwarded contract.
+    unsafe { retire_or_abort(pg) };
+    // As `free_slow_ret`: opaque, so the caller's jump stays a jump.
+    core::hint::black_box(np)
+}
+
+/// [`realloc_live_body`] in one framed piece: the only body where the leaf
+/// does not exist ([`LEAF_MOVE`]), and the flagged-page arm where it does.
+///
+/// # Safety
+/// As [`realloc_live`].
+#[inline(always)]
+unsafe fn realloc_live_classic(p: ptr::NonNull<u8>, newsize: usize) -> *mut u8 {
     let p = p.as_ptr();
     // The segment and page are resolved ONCE, here, and handed to the free
     // of a moved block: through `usable_size` and then `free_inline` they
@@ -1727,11 +2471,17 @@ unsafe fn realloc_live(p: ptr::NonNull<u8>, newsize: usize) -> *mut u8 {
     // branches each move arm decides in one compare, and each knows its copy
     // length outright (`usable` for a growth, `newsize` for a shrink), so the
     // `min` goes too.
-    if newsize > usable {
-        // SAFETY: forwarded contract; a growth copies the whole old block.
-        return unsafe { realloc_move_at(p, newsize, usable, seg, pg) };
-    }
-    if newsize >= usable / 2 {
+    //
+    // ONE move tail, reached by both arms with their copy length (census 4,
+    // vein 5). As two inlined copies of the tail, the shrink arm's length —
+    // `newsize`, which arrives in the register `memcpy` wants the source in —
+    // was parked in a callee-saved register for the whole function, and the
+    // growth arm paid that register's push and pop and the alignment pair
+    // that came with it.
+    let copy = if newsize > usable {
+        // A growth copies the whole old block.
+        usable
+    } else if newsize >= usable / 2 {
         // Keep in place. NOTE: this counter costs a TLS heap lookup (a call
         // into ld.so's __tls_get_addr in a cdylib) on the most common realloc
         // outcome, so removing it was tried as a brick -- and measured FLAT on
@@ -1740,16 +2490,18 @@ unsafe fn realloc_live(p: ptr::NonNull<u8>, newsize: usize) -> *mut u8 {
         // unmeasurable gain does not justify losing a work-parity counter.
         stat_realloc(true);
         return p;
-    }
+    } else {
+        // A shrink below half: the copy is the new, smaller size.
+        newsize
+    };
     // NOTE (2026-08-21): moving everything below into an `#[inline(never)]`
     // `realloc_move(p, newsize, usable)` — so `realloc`'s prologue would not
     // carry the register needs of an inlined malloc, memcpy and free — cost
     // **+12.00 Ir/op** and was reverted. The argument setup plus the call and
     // return are paid on every MOVING realloc, and the scan is all moves; the
     // frame it saved was smaller than the call it added.
-    // A shrink below half: the copy is the new, smaller size.
-    // SAFETY: forwarded contract.
-    unsafe { realloc_move_at(p, newsize, newsize, seg, pg) }
+    // SAFETY: forwarded contract; `copy <= usable` and `copy <= newsize`.
+    unsafe { realloc_move_at(p, newsize, copy, seg, pg) }
 }
 
 /// Allocate, copy `copy` bytes and free `p`, for a caller that has resolved
@@ -1766,7 +2518,7 @@ unsafe fn realloc_move_at(
     seg: *mut Segment,
     pg: *mut Page,
 ) -> *mut u8 {
-    let np = malloc(newsize);
+    let np = malloc_impl::<false, false>(newsize);
     if np.is_null() {
         return ptr::null_mut();
     }
@@ -1774,11 +2526,85 @@ unsafe fn realloc_move_at(
     // block of at least `newsize >= copy` bytes. `p` is freed once, through
     // the page resolved by the caller.
     unsafe {
-        core::ptr::copy_nonoverlapping(p, np, copy);
+        copy_block(p, np, copy);
         free_body::<true, true>(p, seg, pg);
         stat_realloc(false);
     }
     np
+}
+
+/// Copy the `n` live bytes of a block that is moving, without a call when
+/// `n` is small.
+///
+/// The 2026-08-21 note above tried a 32-byte chunk LOOP against `memcpy` for
+/// 64- and 128-byte moves and lost by 31 instructions: an increment, a
+/// compare and a branch per chunk. This is the mechanism that note asked
+/// for, and it has no loop: a range is copied as its first and its last
+/// 16 bytes, which overlap wherever `n` is not exactly 32 — two loads and two
+/// stores for every length from 16 to 32. The same with 8 bytes serves 8 to
+/// 15, and with 32 bytes 33 to 64.
+///
+/// What it replaces is not `memcpy`'s copy, which is the same two loads and
+/// two stores, but everything around it: the call, the size dispatch, the
+/// return. Measured in the real-program gate: lua makes 300,003 reallocs
+/// from a 16-byte block to a 32-byte one (a table's array part getting its
+/// second element), and each paid about 16 instructions for that: 11.5
+/// inside `memcpy` and the call around it (callgrind; census 4, vein 4).
+///
+/// # Safety
+/// `src` is valid for `n` bytes of reads, `dst` for `n` bytes of writes, and
+/// the two do not overlap.
+#[inline(always)]
+unsafe fn copy_block(src: *const u8, dst: *mut u8, n: usize) {
+    // SAFETY: forwarded contract.
+    unsafe {
+        // The large copy leaves FIRST, in one compare: it is the path that
+        // gains nothing here, so it pays the least for the question.
+        if n <= 64 {
+            copy_small(src, dst, n);
+        } else {
+            core::ptr::copy_nonoverlapping(src, dst, n);
+        }
+    }
+}
+
+/// Copy `n <= 64` bytes without a call or a loop.
+///
+/// # Safety
+/// As [`copy_block`], with `n <= 64`.
+#[inline(always)]
+unsafe fn copy_small(src: *const u8, dst: *mut u8, n: usize) {
+    debug_assert!(n <= 64, "copy_small: the ladder stops at 64 bytes");
+    // SAFETY: per contract; every access below lies inside `[0, n)` of its
+    // block, and unaligned reads and writes need no more than that.
+    unsafe {
+        // Each rung is two copies of a CONSTANT size, which is one load and
+        // one store apiece (two for 32). Written as `[u8; 16]` values read
+        // first and stored after, the second went through a stack slot: a
+        // frame adjustment on every realloc and six moves instead of four
+        // (`realloc_live` 46.0 -> 54.0 Ir per call on every path).
+        if n > 32 {
+            core::ptr::copy_nonoverlapping(src, dst, 32);
+            core::ptr::copy_nonoverlapping(src.add(n - 32), dst.add(n - 32), 32);
+        } else if n >= 16 {
+            core::ptr::copy_nonoverlapping(src, dst, 16);
+            core::ptr::copy_nonoverlapping(src.add(n - 16), dst.add(n - 16), 16);
+        } else if n >= 8 {
+            core::ptr::copy_nonoverlapping(src, dst, 8);
+            core::ptr::copy_nonoverlapping(src.add(n - 8), dst.add(n - 8), 8);
+        } else if n >= 4 {
+            // Below a word only a shrink can ask (a block is at least 8
+            // bytes): the same trick down to nothing, so the leaf has no
+            // call for any length.
+            core::ptr::copy_nonoverlapping(src, dst, 4);
+            core::ptr::copy_nonoverlapping(src.add(n - 4), dst.add(n - 4), 4);
+        } else if n >= 2 {
+            core::ptr::copy_nonoverlapping(src, dst, 2);
+            core::ptr::copy_nonoverlapping(src.add(n - 2), dst.add(n - 2), 2);
+        } else if n == 1 {
+            *dst = *src;
+        }
+    }
 }
 
 /// `mi_reallocn`: overflow-checked `count * size` realloc.

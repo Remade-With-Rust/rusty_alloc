@@ -255,6 +255,24 @@ const EMPTY_QUEUES: [PageQueue; BIN_COUNT] = {
 };
 
 impl Heap {
+    /// The heap inside the shared empty-heap SENTINEL (`init::EMPTY_HEAP_BOX`),
+    /// which every thread's TLS slot points at until its first allocation.
+    ///
+    /// It is [`Heap::new`] with `deferred_due` SET, and that one bit is how
+    /// the allocation miss recognises it. The miss used to ask two questions
+    /// in a row, "is this the sentinel?" (a compare against the sentinel's
+    /// address) and "is the deferred-free hook due?" (this flag), and both
+    /// are almost always no. The sentinel answering yes to the second makes
+    /// them one test on every slow-path allocation; the cold arm then tells
+    /// the two apart (census 4, vein 7). Nothing ever clears the flag here:
+    /// the sentinel is never written, and every path that fires the hook
+    /// runs on a real heap.
+    pub const fn sentinel() -> Heap {
+        let mut h = Heap::new();
+        h.deferred_due = true;
+        h
+    }
+
     /// Const-init empty heap (static bootstrap: usable before any OS call).
     pub const fn new() -> Heap {
         Heap {
@@ -764,6 +782,35 @@ impl Heap {
         unsafe { self.malloc_generic_walk(bin) }
     }
 
+    /// Park a full page: out of its bin's queue `q` and onto the full queue
+    /// `full`, with its slow-free flag set so the next free of one of its
+    /// blocks brings it back. Inline at both of the walk's uses (see the note
+    /// at the second).
+    ///
+    /// RAW POINTERS ONLY, and an associated function rather than a method.
+    /// As `park_full(&mut self, q, p)` it was undefined behaviour under
+    /// Stacked Borrows: `q` is derived from the caller's `self`, and the call
+    /// retagged `self` as a fresh, protected `&mut` that writing through `q`
+    /// then invalidated (miri, `heaps_arenas_subprocs_options`, 2026-11-12).
+    /// `&mut self` arguments are `noalias` to LLVM, so this was a latent
+    /// miscompile, not only a model violation. The caller derives both queue
+    /// pointers from its own `self`, as the inline sequence always did.
+    ///
+    /// # Safety
+    /// `p` is a live page of this heap, a member of `q`, with no free block;
+    /// `q` and `full` are queues of the same heap, owned by the caller.
+    #[inline(always)]
+    unsafe fn park_full(q: *mut PageQueue, full: *mut PageQueue, p: *mut Page) {
+        // SAFETY: per contract; owner thread.
+        unsafe {
+            queue_remove(q, p);
+            (*p).flags.fetch_or(pflags::IN_FULL, Ordering::Relaxed);
+            crate::page::page_owner_clear(p);
+            page_set_flag(p, XFLAG_DELAYED);
+            queue_push_front(full, p);
+        }
+    }
+
     /// The queue front has no block but has not been fully carved yet:
     /// extend it and serve from the new run.
     ///
@@ -801,7 +848,7 @@ impl Heap {
     unsafe fn grow_front(&mut self, bin: usize, w: usize, p: *mut Page) -> (*mut u8, u8) {
         // SAFETY: forwarded contract.
         unsafe {
-            page_extend(p, (*p).area);
+            crate::page::page_extend_inline(p, (*p).area);
             self.stats.extends += 1;
             if (*p).free.is_null() {
                 return self.malloc_generic_walk(bin);
@@ -824,9 +871,14 @@ impl Heap {
     /// instructions of push and nine of pop on EVERY generic allocation, 20%
     /// of the function, for machinery most calls never reach.
     ///
-    /// The first queue page is re-collected here rather than threaded in: the
-    /// collect is idempotent, and re-doing it keeps the two frames
+    /// Nothing is threaded in from the caller: that keeps the two frames
     /// independent of each other's register needs, which is the whole point.
+    /// The first queue page used to be RE-COLLECTED here for the same reason
+    /// ("the collect is idempotent"), and that was the walk asking a question
+    /// its caller answered one instruction earlier: both callers arrive
+    /// having just collected the front page and found it dry and fully
+    /// carved. Two loads say so again, where the collect, the extend test
+    /// and the serve test said it in fifteen instructions (census 4, vein 8).
     ///
     /// # Safety
     /// `bin` indexes `self.pages`.
@@ -838,6 +890,16 @@ impl Heap {
         unsafe {
             let q: *mut PageQueue = &raw mut self.pages[bin];
             let mut p = (*q).first;
+            // The front page, as the caller left it: dry and fully carved
+            // means full, so it is parked without another look. The test is
+            // real, not an assertion: a page that fails it (a caller that
+            // did not collect, a block that came back since) simply takes
+            // the loop like any other.
+            if !p.is_null() && (*p).free.is_null() && (*p).capacity >= (*p).reserved {
+                let next = (*p).next;
+                Self::park_full(q, &raw mut self.pages[BIN_FULL], p);
+                p = next;
+            }
             while !p.is_null() {
                 if (*p).free.is_null() {
                     // A steal ANYWHERE in this heap's queue means this heap
@@ -895,10 +957,7 @@ impl Heap {
                 // an outlining decision whenever the function around it is
                 // restructured; the frequency that justified it is a property
                 // of the enclosing frame, not of this code.
-                queue_remove(q, p);
-                (*p).flags.fetch_or(pflags::IN_FULL, Ordering::Relaxed);
-                page_set_flag(p, XFLAG_DELAYED);
-                queue_push_front(&raw mut self.pages[BIN_FULL], p);
+                Self::park_full(q, &raw mut self.pages[BIN_FULL], p);
                 p = next;
             }
             // No usable page — carve a fresh one.
@@ -997,6 +1056,7 @@ impl Heap {
             (*p).local_free = ptr::null_mut();
             (*p).bin = bin as u8;
             (*p).flags.store(0, Ordering::Relaxed);
+            crate::page::page_owner_sync(p, segment_of(p.cast::<u8>()));
             // Bump-fresh spans of an eager-committed zero mapping are zero;
             // RECLAIMED spans are recycled memory and are not.
             (*p).free_is_zero = fresh;
@@ -1073,7 +1133,14 @@ impl Heap {
                     return Some((p, fresh));
                 }
             }
-            let seg = segment::segment_alloc(self.arena_id).ok()?;
+            // A first segment commits what the span needs; a later one a
+            // whole step (see `later_segment_first`).
+            let first = if self.segments.is_null() {
+                slices
+            } else {
+                segment::later_segment_first(slices)
+            };
+            let seg = segment::segment_alloc_for(self.arena_id, first).ok()?;
             #[cfg(ra_shared_light_heap)]
             crate::shared_light::stamp_if_shared(self, seg);
             self.stats.segments += 1;
@@ -1134,6 +1201,7 @@ impl Heap {
                 (*p).payload = ptr::null_mut();
             }
             (*p).flags.store(pflags::SINGLE_BLOCK, Ordering::Relaxed); // unqueued single-block span
+            crate::page::page_owner_assert_clear(p);
             (*p).free_is_zero = fresh;
             // Unqueued → never scanned → remote frees must go via the
             // delayed list (same rule as parked-full pages).
@@ -1182,6 +1250,7 @@ impl Heap {
             let seg = segment_of(block);
             let pg: *mut Page = &raw mut (*seg).pages[1];
             (*pg).flags.fetch_or(pflags::HAS_ALIGNED, Ordering::Relaxed);
+            crate::page::page_owner_clear(pg);
             (p, true)
         }
     }
@@ -1208,6 +1277,7 @@ impl Heap {
                         pflags::HUGE_SEGMENT | pflags::SINGLE_BLOCK,
                         Ordering::Relaxed,
                     );
+                    crate::page::page_owner_assert_clear(pg);
                     page_set_flag(pg, XFLAG_DELAYED);
                     (*seg).next = self.huge_segments;
                     self.huge_segments = seg;
@@ -1439,6 +1509,7 @@ impl Heap {
                 let seg = segment_of(block);
                 let pg = segment::page_of(seg, block);
                 (*pg).flags.fetch_or(pflags::HAS_ALIGNED, Ordering::Relaxed);
+                crate::page::page_owner_clear(pg);
             }
         }
         // A fresh-zero block is zero at every interior position too.
@@ -1790,6 +1861,8 @@ impl Heap {
                         // docs/opps.md #9. It IS a latency win (no lock prefix
                         // on the common path); this project's metric is Ir.
                         (*slot).flags.fetch_and(!pflags::IN_FULL, Ordering::Relaxed);
+                        // The segment is ours now: its plain pages say so.
+                        crate::page::page_owner_sync(slot, seg);
                         // `next`/`prev` are NOT cleared here: `queue_push_front`
                         // below writes both unconditionally (`prev = null`,
                         // `next = q.first`), and nothing between here and there
@@ -1851,7 +1924,7 @@ impl Heap {
                 let slot: *mut Page = &raw mut (*seg).pages[idx];
                 let len = ((*slot).slice_count as usize).max(1);
                 if (*slot).block_size > 0
-                    && (*slot).slice_offset == 0
+                    && segment::slice_owner(seg, idx) == slot
                     && (*slot).bin as usize == BIN_HUGE
                     && (*slot).used == 0
                 {
@@ -1872,7 +1945,7 @@ impl Heap {
                     // Ir per op), so this bounds the worst case and is not a
                     // win. The +2.1 % that adoption costs over 2.2.3 there is
                     // retiring the other 63 dead spans, which 2.2.3 stranded.
-                    idx -= (*slot).slice_offset as usize;
+                    idx = segment::page_index(seg, segment::slice_owner(seg, idx));
                     continue;
                 }
                 idx += len;
@@ -2048,6 +2121,7 @@ impl Heap {
                     }
                     if (*pg).flags.load(Ordering::Relaxed) & pflags::IN_FULL != 0 {
                         (*pg).flags.fetch_and(!pflags::IN_FULL, Ordering::Relaxed);
+                        crate::page::page_owner_sync(pg, seg);
                         queue_remove(&raw mut self.pages[BIN_FULL], pg);
                         page_set_flag(pg, XFLAG_NORMAL);
                         let bin = (*pg).bin as usize;

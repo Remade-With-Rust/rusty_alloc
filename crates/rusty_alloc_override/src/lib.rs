@@ -72,13 +72,13 @@ mod unix_override {
     /// `memalign`.
     #[unsafe(no_mangle)]
     pub extern "C" fn memalign(align: usize, size: usize) -> *mut c_void {
-        alloc::malloc_aligned(size, align).cast()
+        alloc::malloc_aligned_c(align, size).cast()
     }
 
     /// `aligned_alloc`.
     #[unsafe(no_mangle)]
     pub extern "C" fn aligned_alloc(align: usize, size: usize) -> *mut c_void {
-        alloc::malloc_aligned(size, align).cast()
+        alloc::malloc_aligned_c(align, size).cast()
     }
 
     /// `valloc`.

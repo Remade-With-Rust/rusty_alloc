@@ -39,20 +39,8 @@ fn page_of_slice_index_is_always_in_range() {
     assert!(idx < SLICES_PER_SEGMENT);
 }
 
-/// The `slice_offset` field is a `u16` holding a SLICE distance back to the
-/// span start (M12; bytes until 2026-08-22). Prove the encoding cannot
-/// overflow for any interior slot — the const assert checks only the maximum,
-/// this checks every index. Also prove the byte distance the `debug_assert` in
-/// `page_of` reconstructs from it stays in range, since that scaling is where
-/// the old overflow risk lived.
-#[kani::proof]
-fn slice_offset_always_fits_u16() {
-    let idx: usize = kani::any();
-    kani::assume(idx < SLICES_PER_SEGMENT);
-    assert!(idx <= u16::MAX as usize);
-    let bytes = idx * core::mem::size_of::<crate::page::Page>();
-    assert!(bytes <= u16::MAX as usize);
-}
+// (`slice_offset_always_fits_u16` lived here until 2.4.1; the field it
+// bounded is gone, see `segment::span_mark`.)
 
 /// Every size maps to a queue index the heap actually has. A bin outside
 /// `0..=BIN_FULL` would index `Heap::pages` out of range on the allocation

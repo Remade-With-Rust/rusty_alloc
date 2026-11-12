@@ -105,7 +105,15 @@ pub struct Segment {
     ///
     /// It duplicates state, which is a real hazard, so `debug_validate_segment`
     /// checks the two agree on every slice of every span it walks.
-    pub page_off: [u32; SLICES_PER_SEGMENT],
+    ///
+    /// Since 2.4.1 the entries are the page POINTERS themselves, not `u32`
+    /// offsets from the base: `mov off(%seg,%idx,4); lea (%seg,%off)` became
+    /// one load, on every `free` and every other block-to-page resolution
+    /// (census 4, vein 2). Twice the table (4 KiB of a 32 MiB segment's
+    /// header on a 64-bit target, the same 2 KiB on a 32-bit one). The name
+    /// is kept: it is still what each slice's owner is. One build keeps the
+    /// offsets, for want of header room: see [`OwnerEntry`].
+    pub page_off: [OwnerEntry; SLICES_PER_SEGMENT],
     /// One metadata slot per slice; a span's slot is its first slice.
     pub pages: [Page; SLICES_PER_SEGMENT],
 }
@@ -116,8 +124,78 @@ pub const PAGES_OFFSET: usize = core::mem::offset_of!(Segment, pages);
 
 /// The byte offset a slice owned by the span starting at `start` must record.
 #[inline(always)]
-pub const fn page_off_for(start: usize) -> u32 {
-    (PAGES_OFFSET + start * core::mem::size_of::<Page>()) as u32
+pub const fn page_off_for(start: usize) -> usize {
+    PAGES_OFFSET + start * core::mem::size_of::<Page>()
+}
+
+/// One [`Segment::page_off`] entry: the owning page's pointer, or, where the
+/// header has no room for 8 bytes a slice, its `u32` byte offset from the
+/// segment base (the 2.4.0 form, one `lea` dearer per resolution). The one
+/// build without the room is `secure` + `blockmap`, whose page is 32 bytes
+/// larger: see [`crate::page::OwnerWord`], which makes the same choice for
+/// the same reason. The assertion below is what holds both to the budget.
+#[cfg(not(all(feature = "secure", feature = "blockmap")))]
+pub type OwnerEntry = *mut Page;
+/// See the roomy definition: this build's header keeps the offsets.
+#[cfg(all(feature = "secure", feature = "blockmap"))]
+pub type OwnerEntry = u32;
+
+/// The entry a slice owned by the span starting at `start` must record: that
+/// span's page slot.
+///
+/// # Safety
+/// `seg` is a live segment and `start < SLICES_PER_SEGMENT`.
+#[inline(always)]
+unsafe fn owner_entry(seg: *mut Segment, start: usize) -> OwnerEntry {
+    #[cfg(not(all(feature = "secure", feature = "blockmap")))]
+    // SAFETY: per contract, the slot lies inside the header.
+    unsafe {
+        seg.cast::<u8>().add(page_off_for(start)).cast::<Page>()
+    }
+    #[cfg(all(feature = "secure", feature = "blockmap"))]
+    {
+        let _ = seg;
+        page_off_for(start) as u32
+    }
+}
+
+/// [`owner_entry`] for a caller that holds the span's first slot: the slot
+/// pointer is the entry (or, for the one build with `u32` entries, the
+/// index still gives the offset).
+///
+/// # Safety
+/// `head` is slot `start` of `seg`.
+#[inline(always)]
+unsafe fn head_entry(seg: *mut Segment, head: *mut Page, start: usize) -> OwnerEntry {
+    #[cfg(not(all(feature = "secure", feature = "blockmap")))]
+    {
+        let _ = (seg, start);
+        head
+    }
+    #[cfg(all(feature = "secure", feature = "blockmap"))]
+    // SAFETY: forwarded contract.
+    unsafe {
+        let _ = head;
+        owner_entry(seg, start)
+    }
+}
+
+/// The page an owner-table entry of `seg` names.
+///
+/// # Safety
+/// `e` was read from `seg`'s owner table.
+#[inline(always)]
+unsafe fn entry_page(seg: *mut Segment, e: OwnerEntry) -> *mut Page {
+    #[cfg(not(all(feature = "secure", feature = "blockmap")))]
+    {
+        let _ = seg;
+        e
+    }
+    #[cfg(all(feature = "secure", feature = "blockmap"))]
+    // SAFETY: per contract, the offset names a slot inside the header.
+    unsafe {
+        seg.cast::<u8>().add(e as usize).cast::<Page>()
+    }
 }
 
 const _: () = assert!(
@@ -146,6 +224,25 @@ pub const LAZY_COMMIT: bool =
 /// dozen commit calls and the committed-but-uncarved tail stays under
 /// max(the carved size, 4 MiB).
 const COMMIT_STEP_MAX_SLICES: usize = (4 << 20) / SEGMENT_SLICE_SIZE;
+
+/// How many slices to commit at the creation of a segment for a heap that
+/// already owns one, when it wants `slices` from it: a whole step.
+///
+/// A segment's commits double from the header, which is right for a heap's
+/// FIRST segment: it may belong to a thread that allocates a hundred bytes.
+/// A heap that is asking for another has just failed to find the span in
+/// every segment it owns, so it has tens of megabytes carved, and its new
+/// segment still crept up from 128 KiB: five more system calls to reach the
+/// step it was always going to take (census 4, vein 10). The bound on
+/// committed-but-uncarved memory is the one the step already states, 4 MiB;
+/// it is only reached sooner.
+pub fn later_segment_first(slices: usize) -> usize {
+    if LAZY_COMMIT {
+        slices.max(COMMIT_STEP_MAX_SLICES - HEADER_SLICES)
+    } else {
+        slices
+    }
+}
 
 /// Slices reserved for the header.
 pub const HEADER_SLICES: usize = 1;
@@ -284,43 +381,35 @@ pub unsafe fn page_of(seg: *mut Segment, p: *mut u8) -> *mut Page {
         // offset from this segment's base to the page that owns it, so the
         // slot address, the `imul` by `size_of::<Page>()` and the
         // `slice_offset` follow-back all disappear — see `Segment::page_off`.
-        let tab: *const u32 = (&raw const (*seg).page_off).cast();
-        let off = *tab.add(idx) as usize;
-        // The two representations must agree. This is the check that makes the
-        // duplicated state safe to keep, and it is free in release.
-        // (A Huge segment keeps `page_off` alone: its interior slots' offsets
-        // are not written, see `huge_alloc`.)
+        let tab: *const OwnerEntry = (&raw const (*seg).page_off).cast();
+        let pg = entry_page(seg, *tab.add(idx));
+        // The table is the only record of this (see `span_mark`), so the
+        // check that is left is on its own shape: an entry names a span
+        // START, a slot whose own slice names it too. Free in release.
         debug_assert!(
-            (*seg).kind == SegmentKind::Huge || {
+            {
                 let base: *mut Page = (&raw mut (*seg).pages).cast();
-                let slot = base.add(idx);
-                let back = (*slot).slice_offset as usize * slot_stride();
-                back <= idx * core::mem::size_of::<Page>()
-                    && slot.cast::<u8>().sub(back).cast::<Page>()
-                        == seg.cast::<u8>().add(off).cast::<Page>()
+                let head = (pg.addr().wrapping_sub(base.addr())) / core::mem::size_of::<Page>();
+                head <= idx && entry_page(seg, *tab.add(head)) == pg
             },
-            "page_of: page_off table disagrees with slice_offset"
+            "page_of: the owner table names a slot that is not a span start"
         );
-        seg.cast::<u8>().add(off).cast::<Page>()
+        pg
     }
 }
 
-/// Byte distance between adjacent slice slots. No longer the unit of
-/// [`Page::slice_offset`], which counts slices; this scales it where a byte
-/// distance is actually wanted.
-#[inline]
-pub const fn slot_stride() -> usize {
-    core::mem::size_of::<Page>()
+/// The page slot that owns slice `idx`: its span's first slot.
+///
+/// # Safety
+/// `seg` is a live segment and `idx` a carved slice of it.
+#[inline(always)]
+pub unsafe fn slice_owner(seg: *mut Segment, idx: usize) -> *mut Page {
+    // SAFETY: per contract, the entry lies inside the header.
+    unsafe {
+        let tab: *const OwnerEntry = (&raw const (*seg).page_off).cast();
+        entry_page(seg, *tab.add(idx))
+    }
 }
-
-// A span can start at most SLICES_PER_SEGMENT-1 slots before an interior slot,
-// so the slice distance must fit the u16 it is stored in. This had far less
-// headroom when the field held bytes: 511 * 88 = 44,968, inside u16 but only
-// just — a larger `Page` or segment would have overflowed it silently.
-const _: () = assert!(
-    SLICES_PER_SEGMENT - 1 <= u16::MAX as usize,
-    "slice_offset (slices) must fit in u16"
-);
 
 /// Payload start of the page whose slot index is `idx`.
 ///
@@ -446,8 +535,31 @@ unsafe fn wait_no_remote_in_flight(seg: *mut Segment) {
 unsafe fn scrub_recycled(seg: *mut Segment, slots: usize, owner_table: bool) {
     // SAFETY: per contract, both ranges lie inside the header.
     unsafe {
-        let tab = (&raw mut (*seg).page_off).cast::<u32>();
-        core::ptr::write_bytes(tab, 0, if owner_table { SLICES_PER_SEGMENT } else { 1 });
+        let tab = (&raw mut (*seg).page_off).cast::<OwnerEntry>();
+        // Through `fill_owner`, not `write_bytes` (census 4, vein 2). At the
+        // default geometry the table is 4 KiB, which `memset` clears with
+        // `rep stosb`: 4,115 instructions per recycled segment (callgrind
+        // counts each repetition), and a short-lived thread's first
+        // allocation claims one. On the short-lived-threads workload that
+        // was 819,000 of 3.75M instructions; it had been half that until the
+        // entries became pointers. The paired fill clears the same bytes in
+        // about 450.
+        //
+        // The whole table still, deliberately: entries past what the last
+        // tenant carved are zero already, but nothing here can prove what
+        // the last tenant was (a huge block's payload, a caller's own
+        // memory), and a stale entry is what turns a dangling `free` from a
+        // fault into a write through a live page.
+        //
+        // `black_box` on the value is what keeps it a fill. Given a constant
+        // zero, LLVM recognises the loop and calls `memset` again: measured,
+        // 4,115 Ir before and after.
+        let zero: OwnerEntry = core::mem::zeroed();
+        if owner_table {
+            fill_owner(tab, SLICES_PER_SEGMENT, core::hint::black_box(zero));
+        } else {
+            *tab = zero;
+        }
         core::ptr::write_bytes((&raw mut (*seg).pages).cast::<Page>(), 0, slots);
     }
 }
@@ -456,6 +568,25 @@ unsafe fn scrub_recycled(seg: *mut Segment, slots: usize, owner_table: bool) {
 /// heap's `arena_id` restriction), else fresh OS memory — and register it in
 /// the segment map. Under [`LAZY_COMMIT`] only the header is committed here.
 pub fn segment_alloc(arena_id: i32) -> Result<*mut Segment, PrimError> {
+    segment_alloc_for(arena_id, 0)
+}
+
+/// [`segment_alloc`] for a caller about to carve `first` slices from the new
+/// segment: the header and those slices are committed in ONE call.
+///
+/// A segment is only ever created because a span is wanted from it, so the
+/// header's commit was always followed, a few instructions later, by a
+/// second commit of the very next slices (`commit_frontier` from
+/// `span_alloc`): two system calls on adjacent ranges at every segment's
+/// birth, which is every process's start and every thread's first
+/// allocation (census 4, vein 10; the pair is visible in a syscall trace as
+/// `mprotect(seg, 64K)` then `mprotect(seg + 64K, 64K)`). Nothing more is
+/// committed than those two calls committed between them.
+///
+/// If the OS refuses the larger range the header alone is tried, and the
+/// span's own commit then fails or succeeds as it did before.
+pub fn segment_alloc_for(arena_id: i32, first: usize) -> Result<*mut Segment, PrimError> {
+    let mut init = (HEADER_SLICES + first).min(SLICES_PER_SEGMENT);
     let claim = if LAZY_COMMIT {
         crate::arena::chunk_claim(arena_id)
     } else {
@@ -475,8 +606,15 @@ pub fn segment_alloc(arena_id: i32) -> Result<*mut Segment, PrimError> {
         // The header is written next, so it is committed first. On refusal
         // the memory goes back untouched: its chunk keeps a clear
         // `committed` bit, a fresh reservation is released whole.
-        // SAFETY: the header slice lies inside the reservation just obtained.
-        if unsafe { os::commit(ptr_, HEADER_SLICES * SEGMENT_SLICE_SIZE) }.is_err() {
+        // SAFETY: `ptr_` is the base of a reservation of `SEGMENT_SIZE`
+        // bytes this call owns; both ranges lie inside it.
+        let mut ok = unsafe { os::commit(ptr_, init * SEGMENT_SLICE_SIZE) }.is_ok();
+        if !ok && init > HEADER_SLICES {
+            init = HEADER_SLICES;
+            // SAFETY: as above.
+            ok = unsafe { os::commit(ptr_, init * SEGMENT_SLICE_SIZE) }.is_ok();
+        }
+        if !ok {
             crate::stats::commit_failed();
             if !crate::arena::chunk_free_marked(ptr_, false) {
                 let block = os::OsBlock {
@@ -506,11 +644,7 @@ pub fn segment_alloc(arena_id: i32) -> Result<*mut Segment, PrimError> {
         (*seg).kind = SegmentKind::Normal;
         (*seg).total_size = size;
         (*seg).next_free_slice = HEADER_SLICES as u32;
-        (*seg).commit_end = if committed {
-            SLICES_PER_SEGMENT
-        } else {
-            HEADER_SLICES
-        } as u32;
+        (*seg).commit_end = if committed { SLICES_PER_SEGMENT } else { init } as u32;
         (*seg).used_pages = 0;
         (*seg).thread_id = AtomicUsize::new(crate::init::thread_id());
         (*seg).mem_is_zero = mem_zero;
@@ -625,8 +759,115 @@ pub unsafe fn segment_free(seg: *mut Segment) -> Result<(), PrimError> {
     }
 }
 
-/// Write the span markers for a span at `idx` of `len` slices: first slot
-/// offset 0, interior+last offsets pointing back.
+/// Store `owner` into `n >= 1` consecutive owner-table entries.
+///
+/// # Safety
+/// `[ent, ent + n)` are entries of one segment's owner table, owned by the
+/// caller.
+#[cfg(not(all(
+    target_arch = "x86_64",
+    not(all(feature = "secure", feature = "blockmap")),
+    not(miri)
+)))]
+#[inline(always)]
+unsafe fn fill_owner(ent: *mut OwnerEntry, n: usize, owner: OwnerEntry) {
+    // SAFETY: per contract.
+    unsafe {
+        let mut e = ent;
+        let mut j = 0;
+        while j < n {
+            *e = owner;
+            e = e.add(1);
+            j += 1;
+        }
+    }
+}
+
+/// [`fill_owner`] on x86-64 with pointer entries: TWO entries a store, and
+/// no loop for the count's low bits.
+///
+/// Every entry gets the same value, so a store may overlap one already
+/// made. A run of eight or more is filled eight entries a pass (four
+/// 16-byte stores), and whatever is left over is covered by one more block
+/// of eight that ENDS at the run's end; shorter runs are two or four stores
+/// placed the same way, from both ends. 7 instructions per 8 entries, where
+/// the scalar loop LLVM kept for this (it does not vectorise it, with or
+/// without `slice::fill`: that form measured lua +2,072, sqlite +215) is one
+/// store and a share of the loop per entry.
+///
+/// The pair is loaded from two real entries, not built from an integer, so
+/// the pointers the table hands back keep their provenance.
+///
+/// # Safety
+/// As the scalar definition.
+#[cfg(all(
+    target_arch = "x86_64",
+    not(all(feature = "secure", feature = "blockmap")),
+    not(miri)
+))]
+#[inline(always)]
+unsafe fn fill_owner(ent: *mut OwnerEntry, n: usize, owner: OwnerEntry) {
+    use core::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_storeu_si128};
+    debug_assert!(n >= 1);
+    // SAFETY: per contract, every store below lies inside `[ent, ent + n)`:
+    // each branch is taken only when `n` covers the widest store it makes.
+    // SSE2 is part of the x86-64 baseline.
+    unsafe {
+        if n < 2 {
+            *ent = owner;
+            return;
+        }
+        let pair = [owner, owner];
+        let v = _mm_loadu_si128(pair.as_ptr().cast::<__m128i>());
+        let end = ent.add(n);
+        if n < 4 {
+            _mm_storeu_si128(ent.cast(), v);
+            _mm_storeu_si128(end.sub(2).cast(), v);
+            return;
+        }
+        if n < 8 {
+            _mm_storeu_si128(ent.cast(), v);
+            _mm_storeu_si128(ent.add(2).cast(), v);
+            _mm_storeu_si128(end.sub(4).cast(), v);
+            _mm_storeu_si128(end.sub(2).cast(), v);
+            return;
+        }
+        let last = end.sub(8);
+        let mut p = ent;
+        while p < last {
+            _mm_storeu_si128(p.cast(), v);
+            _mm_storeu_si128(p.add(2).cast(), v);
+            _mm_storeu_si128(p.add(4).cast(), v);
+            _mm_storeu_si128(p.add(6).cast(), v);
+            p = p.add(8);
+        }
+        _mm_storeu_si128(last.cast(), v);
+        _mm_storeu_si128(last.add(2).cast(), v);
+        _mm_storeu_si128(last.add(4).cast(), v);
+        _mm_storeu_si128(last.add(6).cast(), v);
+    }
+}
+
+/// Write the span markers for a span at `idx` of `len` slices: its length
+/// and payload in the first slot, and every slice's owner-table entry
+/// pointing at that slot.
+///
+/// **One record, not two** (census 4, vein 9). Until 2.4.1 each interior
+/// slot also carried `slice_offset`, the distance back to the first slot:
+/// the same fact, 96 bytes apart, written beside every table entry. Its
+/// release readers were two, both cold (the coalesce-left in `span_free`,
+/// one resume in `adopt_segment`), and both read the table now. The loop
+/// below was a table store and a strided `u16` store with its own counter,
+/// 4.7 instructions a slice, and it is the bulk of `span_free` wherever free
+/// spans grow long: lua, 241,627 of that function's 311,993 Ir. As a plain
+/// fill LLVM writes two entries a store.
+///
+/// What is NOT dropped is the marking of every slice of a FREE span, which
+/// was assessed and declined in 2026-08 for the validator's sake and stays
+/// declined for a second reason: it is what makes a dangling `free` into
+/// freed memory resolve to a dead slot and abort. Marked only at its ends,
+/// a free span's interior entries would keep naming whichever slot owned
+/// them last, and that slot can be a LIVE page again.
 ///
 /// Interior slices below `from` are NOT rewritten: the caller knows they
 /// already point back to `idx` in both representations. That holds for every
@@ -642,16 +883,24 @@ pub unsafe fn segment_free(seg: *mut Segment) -> Result<(), PrimError> {
 /// `[idx, idx+len)` must lie in the carved region of `seg` under the heap lock;
 /// `from >= 1`, and slices `idx+1 .. idx+min(from, len)` must already point
 /// back to `idx`.
-unsafe fn span_mark(seg: *mut Segment, idx: usize, len: usize, from: usize) {
+unsafe fn span_mark(seg: *mut Segment, head: *mut Page, idx: usize, len: usize, from: usize) {
     debug_assert!(from >= 1, "span_mark: slot 0 is the head, not an interior");
     // SAFETY: caller contract keeps every index in bounds.
     unsafe {
-        (*seg).pages[idx].slice_offset = 0;
-        (*seg).pages[idx].slice_count = len as u16;
+        // `head` is `pages[idx]`, handed in because every caller already
+        // holds it. Indexing again was a multiply by `size_of::<Page>()`
+        // (96, not a power of two) and a bounds check, at each of the three
+        // uses below and again in each caller afterwards (census 4, vein 9).
+        debug_assert_eq!(
+            head,
+            (&raw mut (*seg).pages).cast::<Page>().add(idx),
+            "span_mark: `head` is not slot `idx`"
+        );
+        (*head).slice_count = len as u16;
         // Cache the payload start now, while `idx` is an integer — a shift, no
         // division. The refill path then reads `(*p).area` instead of
         // recovering it with `page_index` (see `Page::area`).
-        (*seg).pages[idx].area = seg.cast::<u8>().add(idx * SEGMENT_SLICE_SIZE);
+        (*head).area = seg.cast::<u8>().add(idx * SEGMENT_SLICE_SIZE);
         // Interior slices, walked with RUNNING values rather than recomputed
         // indices. `(*seg).pages[idx + j]` costs a multiply by `size_of::<Page>()`
         // — which is 88, not a power of two — and `j * slot_stride()` costs a
@@ -661,8 +910,13 @@ unsafe fn span_mark(seg: *mut Segment, idx: usize, len: usize, from: usize) {
         // walks it constantly.
         // Every slice of this span resolves to the span's own slot, so the
         // table entry is one constant written across the run.
-        let owner = page_off_for(idx);
-        let tab: *mut u32 = (&raw mut (*seg).page_off).cast();
+        //
+        // And with pointer entries that constant is `head` itself, which
+        // the caller handed in: `owner_entry` rebuilt the same address from
+        // the index, a multiply by `size_of::<Page>()` and an add, at every
+        // span carved and every span freed (census 4, vein 2).
+        let owner = head_entry(seg, head, idx);
+        let tab: *mut OwnerEntry = (&raw mut (*seg).page_off).cast();
         *tab.wrapping_add(idx) = owner;
         // NOTE (2026-09-24, REFUTED): splitting the owner-table stores into
         // their own `slice::fill` pass, away from the stride-88 `slice_offset`
@@ -671,17 +925,8 @@ unsafe fn span_mark(seg: *mut Segment, idx: usize, len: usize, from: usize) {
         // unroll setup and scalar remainder. Opscan `huge` +28.00, perl +340,
         // lua -8,327, sqlite -862 allocator Ir — a sign flip by span length,
         // not a win. Same verdict as the fill `huge_alloc` measured flat.
-        let base: *mut Page = (&raw mut (*seg).pages).cast();
-        let mut slot = base.wrapping_add(idx + from);
-        let mut ent = tab.wrapping_add(idx + from);
-        let mut j = from;
-        while j < len {
-            // SLICES back to the span start, not bytes — see Page::slice_offset.
-            (*slot).slice_offset = j as u16;
-            *ent = owner;
-            slot = slot.wrapping_add(1);
-            ent = ent.wrapping_add(1);
-            j += 1;
+        if from < len {
+            fill_owner(tab.add(idx + from), len - from, owner);
         }
     }
 }
@@ -709,11 +954,10 @@ unsafe fn span_mark(seg: *mut Segment, idx: usize, len: usize, from: usize) {
 ///
 /// # Safety
 /// As [`span_mark`]; the span must not be in the free list already.
-unsafe fn span_mark_free(seg: *mut Segment, idx: usize, len: usize, from: usize) {
+unsafe fn span_mark_free(seg: *mut Segment, slot: *mut Page, idx: usize, len: usize, from: usize) {
     // SAFETY: caller contract.
     unsafe {
-        span_mark(seg, idx, len, from);
-        let slot: *mut Page = &raw mut (*seg).pages[idx];
+        span_mark(seg, slot, idx, len, from);
         (*slot).block_size = 0; // free marker
         (*slot).prev = ptr::null_mut();
         (*slot).next = (*seg).free_spans;
@@ -761,8 +1005,8 @@ pub unsafe fn debug_validate_segment(seg: *mut Segment, where_: &str) {
             while idx < end {
                 let slot: *mut Page = &raw mut (*seg).pages[idx];
                 assert_eq!(
-                    (*slot).slice_offset,
-                    0,
+                    slice_owner(seg, idx),
+                    slot,
                     "{where_}: slice {idx} is not a span start (layout not tiled)"
                 );
                 let len = (*slot).slice_count as usize;
@@ -773,8 +1017,8 @@ pub unsafe fn debug_validate_segment(seg: *mut Segment, where_: &str) {
                 // Interior slices must point back to this start.
                 for j in 1..len {
                     assert_eq!(
-                        (*seg).pages[idx + j].slice_offset as usize,
-                        j,
+                        slice_owner(seg, idx + j),
+                        slot,
                         "{where_}: slice {} lost its back-pointer",
                         idx + j
                     );
@@ -796,7 +1040,11 @@ pub unsafe fn debug_validate_segment(seg: *mut Segment, where_: &str) {
                     i >= HEADER_SLICES && i < end,
                     "{where_}: free span {i} out of region"
                 );
-                assert_eq!((*s).slice_offset, 0, "{where_}: free span {i} not a start");
+                assert_eq!(
+                    slice_owner(seg, i),
+                    s,
+                    "{where_}: free span {i} not a start"
+                );
                 assert_eq!((*s).block_size, 0, "{where_}: free span {i} marked live");
                 n += 1;
                 assert!(
@@ -848,12 +1096,13 @@ pub unsafe fn span_alloc(seg: *mut Segment, slices: usize) -> (*mut Page, bool) 
                 span_list_remove(seg, s);
                 if len > slices {
                     // The remainder starts at a new slice: re-mark all of it.
-                    span_mark_free(seg, idx + slices, len - slices, 1);
+                    let rest = s.add(slices);
+                    span_mark_free(seg, rest, idx + slices, len - slices, 1);
                     // It has been free as long as the span it came from.
-                    (*seg).pages[idx + slices].capacity = (*s).capacity;
+                    (*rest).capacity = (*s).capacity;
                 }
                 // The FRONT of a free span: its interiors already point here.
-                span_mark(seg, idx, slices, slices);
+                span_mark(seg, s, idx, slices, slices);
                 (*seg).used_pages += 1;
                 return (s, false);
             }
@@ -877,14 +1126,14 @@ pub unsafe fn span_alloc(seg: *mut Segment, slices: usize) -> (*mut Page, bool) 
         // they still hold the previous tenant's bytes (`scrub_recycled` left
         // them), and a stale `free_is_zero` or `xthread_free` would be read
         // as this page's. On fresh OS memory they are already zero.
+        let start: *mut Page = (&raw mut (*seg).pages).cast::<Page>().add(idx);
         if !(*seg).mem_is_zero {
-            ptr::write_bytes((&raw mut (*seg).pages).cast::<Page>().add(idx), 0, slices);
+            ptr::write_bytes(start, 0, slices);
         }
         (*seg).next_free_slice = (idx + slices) as u32;
         (*seg).used_pages += 1;
-        let start: *mut Page = &raw mut (*seg).pages[idx];
         // Never-carved slices: mark all of them.
-        span_mark(seg, idx, slices, 1);
+        span_mark(seg, start, idx, slices, 1);
         (start, (*seg).mem_is_zero)
     }
 }
@@ -928,6 +1177,7 @@ pub unsafe fn span_free(seg: *mut Segment, page: *mut Page) -> usize {
             (*page).payload = ptr::null_mut();
         }
         (*page).flags.store(0, Ordering::Relaxed);
+        crate::page::page_owner_clear(page);
         (*page).free_is_zero = false;
 
         // Merge right: the slot at idx+len (if carved) is a span START.
@@ -939,10 +1189,19 @@ pub unsafe fn span_free(seg: *mut Segment, page: *mut Page) -> usize {
         // `docs/plans/recommit-failure-ignored.md`, mechanism B. A spurious
         // flag costs only a re-commit of committed memory.
         let mut merged_purged = false;
+        // The merged span's first slot: ours, unless a left neighbour takes
+        // us in.
+        let mut head = page;
         let right = idx + len;
         if right < (*seg).next_free_slice as usize {
-            let rslot: *mut Page = &raw mut (*seg).pages[right];
-            debug_assert_eq!((*rslot).slice_offset, 0, "right neighbor not a span start");
+            // A span starts right after ours, and a span start's own slice
+            // names it: one load, where `pages[right]` is the multiply.
+            let rslot: *mut Page = slice_owner(seg, right);
+            debug_assert_eq!(
+                rslot,
+                (&raw mut (*seg).pages).cast::<Page>().add(right),
+                "right neighbor not a span start"
+            );
             if (*rslot).block_size == 0 {
                 span_list_remove(seg, rslot);
                 len += (*rslot).slice_count as usize;
@@ -952,15 +1211,15 @@ pub unsafe fn span_free(seg: *mut Segment, page: *mut Page) -> usize {
         // Merge left: follow the left slot back to its span start.
         if idx > HEADER_SLICES {
             let lslot_idx = idx - 1;
-            // slice_offset counts SLICES, so the span start is a subtract.
-            // This was `bytes / slot_stride()` — a `movabs; mul; shr` magic
-            // multiply by 88, `docs/opps.md` #1, now gone.
-            let lstart_idx = lslot_idx - (*seg).pages[lslot_idx].slice_offset as usize;
-            let lstart: *mut Page = &raw mut (*seg).pages[lstart_idx];
+            // The left neighbour's last slice names its first slot, and a
+            // span start's index is a shift of its `area` (`page_index`).
+            let lstart = slice_owner(seg, lslot_idx);
+            let lstart_idx = page_index(seg, lstart);
             if (*lstart).block_size == 0 {
                 span_list_remove(seg, lstart);
                 len += idx - lstart_idx;
                 idx = lstart_idx;
+                head = lstart;
                 merged_purged |= (*lstart).purged;
             }
         }
@@ -973,7 +1232,7 @@ pub unsafe fn span_free(seg: *mut Segment, page: *mut Page) -> usize {
         } else {
             freed_idx - idx
         };
-        span_mark_free(seg, idx, len, from);
+        span_mark_free(seg, head, idx, len, from);
         // PURGE the coalesced free span (the RSS lever): return its pages to
         // the OS. Only worthwhile for multi-slice spans — a syscall costs
         // more than the pages a single 64 KiB slice returns. The span is
@@ -1000,7 +1259,7 @@ pub unsafe fn span_free(seg: *mut Segment, page: *mut Page) -> usize {
             let bytes = len * SEGMENT_SLICE_SIZE;
             let decommits = crate::options::is_enabled(5); // purge_decommits
             if os::purge(area, bytes, decommits).is_ok() {
-                (*seg).pages[idx].purged = true;
+                (*head).purged = true;
                 (*seg).purged_any = true;
                 return 1;
             }
@@ -1010,7 +1269,7 @@ pub unsafe fn span_free(seg: *mut Segment, page: *mut Page) -> usize {
         // only if every part was. Never cleared here: the start may already
         // be flagged.
         if merged_purged {
-            (*seg).pages[idx].purged = true;
+            (*head).purged = true;
         }
         if crate::OS_PAGES && delay > 0 {
             return schedule_purge(seg, idx, delay as u64);
@@ -1368,7 +1627,6 @@ pub fn huge_alloc(
         (*page).capacity = 1;
         (*page).reserved = 1;
         (*page).slice_count = (SLICES_PER_SEGMENT - 1) as u16;
-        (*page).slice_offset = 0;
         // `header == SEGMENT_SLICE_SIZE`, so this is exactly `page_area(seg, 1)`.
         // Huge segments build their one slot by hand instead of through
         // `span_mark`, which is the only other writer of this field — so this
@@ -1386,6 +1644,7 @@ pub fn huge_alloc(
             crate::page::pflags::HUGE_SEGMENT | crate::page::pflags::SINGLE_BLOCK,
             Ordering::Relaxed,
         );
+        crate::page::page_owner_assert_clear(page);
         (*page).free_is_zero = b.is_zero;
         // Every slice of a huge segment resolves to slot 1, so the owner table
         // is one value repeated across the run, and it is the ONLY record of
@@ -1394,8 +1653,8 @@ pub fn huge_alloc(
         // their one reader was the `page_of` debug cross-check (which now
         // skips Huge segments). Nothing else reads a Huge segment's slots past
         // slot 1. With the strided stores gone, this is a contiguous 2 KB fill.
-        let owner = page_off_for(1);
-        let tab: *mut u32 = (&raw mut (*seg).page_off).cast();
+        let owner = owner_entry(seg, 1);
+        let tab: *mut OwnerEntry = (&raw mut (*seg).page_off).cast();
         let mut j = 1;
         while j < SLICES_PER_SEGMENT {
             *tab.add(j) = owner;

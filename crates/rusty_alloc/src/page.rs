@@ -402,22 +402,9 @@ pub struct Page {
     pub area: *mut u8,
     /// Slices this page spans.
     pub slice_count: u16,
-    /// For interior slices: distance BACK to the span-start slot, **in
-    /// slices** (not in bytes).
-    ///
-    /// This held BYTES until 2026-08-22, pre-scaled by `size_of::<Page>()`,
-    /// because `page_of` followed it back on every free and a slice count
-    /// would have to be scaled there. **That justification expired** when the
-    /// `Segment::page_off` table took over `page_of`: in a release build the
-    /// only remaining reader is `span_free`'s coalesce-left, and the only
-    /// byte-scaled reader is a `debug_assert`.
-    ///
-    /// Bytes therefore bought nothing and cost a division. `size_of::<Page>()`
-    /// is 88 — `8 * 11`, not a power of two — so recovering the slice count
-    /// from bytes is a real `movabs; mul; shr` magic-multiply sequence, which
-    /// is what `docs/opps.md` #1 named. In slices the same read is a bare
-    /// subtract, and the two loops that WRITE the field drop a multiply each.
-    pub slice_offset: u16,
+    // (No back-pointer here. Until 2.4.1 every slot carried `slice_offset`,
+    // the distance back to its span's first slot, beside the same fact in
+    // `Segment::page_off`; see `segment::span_mark` for why it went.)
     /// Bin index this page is queued under (BIN_HUGE marks unqueued larges).
     pub bin: u8,
     /// Fast-path flag byte (see [`pflags`]): any bit set ⇒ the free fast path
@@ -449,6 +436,23 @@ pub struct Page {
     /// synthetic microbenchmark. Upstream mimalloc reads these flags
     /// non-atomically and does not pay the instruction — and has the race.
     pub flags: AtomicU8,
+    /// The fast-path owner word: the owning thread's id (the segment's
+    /// `thread_id`) while this is a PLAIN page — live, binned, no
+    /// [`pflags::SLOW_FREE`] bit — and 0 otherwise (flagged, free, or in an
+    /// abandoned segment).
+    ///
+    /// `free` asked two questions with two loads and two branches: is the
+    /// segment mine (`Segment::thread_id`), and is the page plain (`flags`).
+    /// This word answers both with one load and one compare, because a
+    /// thread's own id can match only a plain page of a segment it owns. A
+    /// mismatch says nothing by itself — the cold arm asks the two original
+    /// questions — so a stale 0 costs speed and never correctness. A stale
+    /// NON-zero would be a defect: every writer of `flags` and of
+    /// `Segment::thread_id` keeps this in step ([`page_owner_sync`],
+    /// [`page_owner_clear`]), and the local free asserts it in debug builds.
+    /// Written only by the owning thread; read by any thread, hence atomic.
+    /// Measured: 6 -> 3 instructions on every local free (census 4, vein 1).
+    pub owner_plain: OwnerWord,
     /// The un-extended tail AND current free list are known zero.
     pub free_is_zero: bool,
     /// This span's memory was PURGED (decommitted/reset) while free. It must
@@ -497,7 +501,19 @@ pub unsafe fn debug_validate_page(page: *const Page, where_: &str) {
         // reading its metadata is exactly as valid as that use.
         unsafe {
             assert!(!page.is_null(), "{where_}: null page");
-            assert_eq!((*page).slice_offset, 0, "{where_}: not a span start");
+            // The shared empty page is in no segment (and the old form of
+            // this check, a field of the page itself, passed it by accident).
+            if !core::ptr::eq(page, empty_page_ptr()) {
+                // A span start is a slot whose own slice names it as owner.
+                let seg = crate::segment::segment_of(page.cast_mut().cast::<u8>());
+                let base: *const Page = (&raw const (*seg).pages).cast();
+                let idx = (page.addr() - base.addr()) / core::mem::size_of::<Page>();
+                assert_eq!(
+                    crate::segment::slice_owner(seg, idx).cast_const(),
+                    page,
+                    "{where_}: not a span start"
+                );
+            }
             assert!((*page).block_size > 0, "{where_}: dead page (block_size 0)");
             assert!(
                 (*page).block_size.is_multiple_of(8),
@@ -557,9 +573,9 @@ impl Page {
             block_size: 8,
             area: ptr::null_mut(),
             slice_count: 1,
-            slice_offset: 0,
             bin: 0,
             flags: AtomicU8::new(0),
+            owner_plain: OwnerWord::new(0),
             free_is_zero: false,
             purged: false,
             heap_tag: 0,
@@ -605,6 +621,39 @@ pub static EMPTY_PAGE: EmptyPage = EmptyPage(Page::empty_sentinel());
 #[inline]
 pub const fn empty_page_ptr() -> *mut Page {
     (&raw const EMPTY_PAGE.0).cast_mut()
+}
+
+/// The swap trip in one step: `block`, the head of `page`'s `local_free`,
+/// is handed out and the rest of that list becomes `free`.
+///
+/// What `page_collect` and then [`page_pop`] do to a dry page with local
+/// frees, without storing the head into `free` only to load it back.
+///
+/// # Safety
+/// `page` is a live page owned by the calling thread, its `free` list is
+/// empty, and `block` is its non-null `local_free`.
+#[inline]
+pub unsafe fn page_swap_pop(page: *mut Page, block: *mut Block) -> *mut u8 {
+    // SAFETY: caller already holds a valid page pointer (see fn contract).
+    unsafe { debug_validate_page(page, "page_swap_pop") };
+    // SAFETY: owner-only fields; `block` heads a list of this page's free
+    // blocks, so its first word is the next link. The order is `page_pop`'s:
+    // the transition check before the link is read.
+    unsafe {
+        debug_assert!((*page).free.is_null(), "page_swap_pop: `free` is not dry");
+        debug_assert!(
+            !block.is_null() && block == (*page).local_free,
+            "page_swap_pop: not the local list's head"
+        );
+        (*page).local_free = ptr::null_mut();
+        // Recycled blocks are not zero.
+        (*page).free_is_zero = false;
+        #[cfg(feature = "blockmap")]
+        blockmap_transition(page, block.cast(), true);
+        (*page).free = block_next(page, block);
+        (*page).used += 1;
+    }
+    block.cast()
 }
 
 /// Pop a block off the fast list. Returns null when dry (→ generic path).
@@ -773,6 +822,52 @@ pub(crate) fn corrupt_free_list_abort() -> ! {
 // workload where this function matters is one where every free reaches it, so
 // the call is paid every time AND the callee grows a frame of its own.
 pub unsafe fn remote_free(page: *mut Page, block: *mut Block) {
+    if crate::ONE_THREAD {
+        unreachable!("a cross-thread free on a build that asserted a single thread");
+    }
+    // THE COMMON STATE, STRAIGHT-LINE (census 4, vein 1). Nearly every
+    // cross-thread free finds the list's two flag bits NORMAL: a parked page
+    // goes back to NORMAL after the first remote free into it (see the
+    // DELAYED arm in `remote_free_general`), so on the `xthread` op 100,000
+    // of 100,000 take this. As one arm of the four-state match the same
+    // push cost a copy of the word, a mask, a jump table, a second mask to
+    // strip flag bits that are zero and an `or` to put them back.
+    //
+    // The other states are a CALL away, not a branch away, and that is
+    // measured: written as an early `if` inside the loop, LLVM folded it
+    // back into the same switch and nothing moved (free_slow 24.0 Ir per
+    // call before and after).
+    //
+    // SAFETY: `page` is live per the contract, so its atomic is readable
+    // from any thread; `block` is dead memory this thread owns until the
+    // exchange publishes it. With the flag bits zero, `x` IS the head
+    // pointer and the new word IS the block. A block that is already the
+    // head (a second free) and a lost race both go to the general path.
+    unsafe {
+        let x = (*page).xthread_free.load(Ordering::Acquire);
+        if x & XMASK == XFLAG_NORMAL && x != block as usize {
+            block_set_next(page, block, crate::ptr_with_addr(block, x));
+            if (*page)
+                .xthread_free
+                .compare_exchange(x, block as usize, Ordering::Release, Ordering::Relaxed)
+                .is_ok()
+            {
+                return;
+            }
+        }
+        remote_free_general(page, block);
+    }
+}
+
+/// [`remote_free`] in every state of the list word, as a retry loop: the
+/// parked page's DELAYED hand-off, a remote mid-flight, an abandoned page's
+/// NEVER, a second free of the head, and a NORMAL push that lost a race.
+///
+/// # Safety
+/// As [`remote_free`].
+#[cold]
+#[inline(never)]
+unsafe fn remote_free_general(page: *mut Page, block: *mut Block) {
     // Unreachable on a single-context build (`alloc::free` folds every free
     // to local there); if it runs anyway, the single-thread assertion the
     // target made was false.
@@ -1132,12 +1227,216 @@ const EXTEND_SHIFT_BASE: u32 = {
 /// that is already committed; it touches at most four block headers.
 const MIN_EXTEND: usize = 4;
 
+/// Link `n >= 1` fresh blocks of `bsize` bytes starting at `start` in address
+/// order, the last one to `tail`, and return the first.
+///
+/// # Safety
+/// `[start, start + n * bsize)` is dead, committed memory of `page` owned by
+/// the caller; `tail` is null or a free block of `page`.
+#[cfg(not(all(target_arch = "x86_64", not(feature = "secure"), not(miri))))]
+#[inline(always)]
+unsafe fn link_run(
+    page: *const Page,
+    start: *mut u8,
+    bsize: usize,
+    n: usize,
+    tail: *mut Block,
+) -> *mut Block {
+    // SAFETY: per contract.
+    unsafe {
+        let mut i = n;
+        let mut head = tail;
+        while i > 0 {
+            i -= 1;
+            let b: *mut Block = start.add(i * bsize).cast();
+            block_set_next(page, b, head);
+            head = b;
+        }
+        head
+    }
+}
+
+/// [`link_run`] on x86-64 with plain links: TWO links per vector, eight
+/// blocks per pass of the loop.
+///
+/// A block's link is the address of the next block, so the values written
+/// are an arithmetic sequence with the block size as its step. One vector
+/// holds two consecutive ones; its low half is stored into one block
+/// (`movq`), its high half into the next (`movhps`), and one `paddq` advances
+/// both. That is 3 instructions per 2 blocks, and with eight blocks per pass
+/// the pointer advance and the loop test are shared by all eight: 15
+/// instructions per 8 blocks, 1.875 each.
+///
+/// What it replaces is what LLVM made of the scalar loop (callgrind, per
+/// instruction, census 4, vein 8): an address computation and a store per
+/// block, unrolled by four with two counters, 2.75 per block, behind a setup
+/// of four multiplies and a pre-loop for the count's low two bits. Carving
+/// is where a real program's slow path spends its instructions: 1.6M of
+/// perl's 21.3M allocator Ir, 2.6M of lua's 48.2M.
+///
+/// A run of 64 blocks or more first takes sixteen a pass (1.75 each; see
+/// the body). The count's low three bits are linked one block at a time;
+/// the last block is written once more at the end, with `tail`. The list is
+/// the same list the scalar loop builds, so no address a program sees
+/// changes.
+///
+/// Not under `secure` (links are encoded per page, one at a time) nor miri
+/// (the links are stored as integers here).
+///
+/// # Safety
+/// As the scalar definition.
+#[cfg(all(target_arch = "x86_64", not(feature = "secure"), not(miri)))]
+#[inline(always)]
+unsafe fn link_run(
+    _page: *const Page,
+    start: *mut u8,
+    bsize: usize,
+    n: usize,
+    tail: *mut Block,
+) -> *mut Block {
+    use core::arch::x86_64::{_mm_set_epi64x, _mm_set1_epi64x};
+    debug_assert!(n >= 1 && bsize >= core::mem::size_of::<usize>());
+    // SAFETY: per contract, every store below is the first word of one of
+    // the `n` blocks. SSE2 is part of the x86-64 baseline.
+    unsafe {
+        let mut p = start;
+        // A LONG run first takes sixteen blocks a pass: the second eight go
+        // through a second base register, and the advance and the test are
+        // shared by twice as many (28 instructions per 16 blocks, 1.75
+        // each, against 1.875).
+        //
+        // Only from 64 blocks up, and that is measured. Taken by every run,
+        // with the count's low bits as straight-line stages in front of it,
+        // the same loop cost a 16-block carve more in stage tests than it
+        // saved: perl -53,587 and lua -84,869 allocator Ir, but sqlite
+        // +2,168 and python +218 (`grow_front` 78.2 -> 89.0 Ir per call on
+        // sqlite's short runs). Gated, a short run pays one compare.
+        let left = if n >= 64 {
+            let v = _mm_set_epi64x(
+                p.add(2 * bsize).expose_provenance() as i64,
+                p.add(bsize).expose_provenance() as i64,
+            );
+            let step = _mm_set1_epi64x((2 * bsize) as i64);
+            core::arch::asm!(
+                "2:",
+                "lea {q}, [{p} + {bs}*8]",
+                "movq qword ptr [{p}], {v}",
+                "movhps qword ptr [{p} + {bs}], {v}",
+                "paddq {v}, {step}",
+                "movq qword ptr [{p} + {bs}*2], {v}",
+                "movhps qword ptr [{p} + {b3}], {v}",
+                "paddq {v}, {step}",
+                "movq qword ptr [{p} + {bs}*4], {v}",
+                "movhps qword ptr [{p} + {b5}], {v}",
+                "paddq {v}, {step}",
+                "movq qword ptr [{p} + {b3}*2], {v}",
+                "movhps qword ptr [{p} + {b7}], {v}",
+                "paddq {v}, {step}",
+                "movq qword ptr [{q}], {v}",
+                "movhps qword ptr [{q} + {bs}], {v}",
+                "paddq {v}, {step}",
+                "movq qword ptr [{q} + {bs}*2], {v}",
+                "movhps qword ptr [{q} + {b3}], {v}",
+                "paddq {v}, {step}",
+                "movq qword ptr [{q} + {bs}*4], {v}",
+                "movhps qword ptr [{q} + {b5}], {v}",
+                "paddq {v}, {step}",
+                "movq qword ptr [{q} + {b3}*2], {v}",
+                "movhps qword ptr [{q} + {b7}], {v}",
+                "paddq {v}, {step}",
+                "lea {p}, [{q} + {bs}*8]",
+                "dec {g}",
+                "jnz 2b",
+                p = inout(reg) p,
+                q = out(reg) _,
+                bs = in(reg) bsize,
+                b3 = in(reg) 3 * bsize,
+                b5 = in(reg) 5 * bsize,
+                b7 = in(reg) 7 * bsize,
+                g = inout(reg) n >> 4 => _,
+                v = inout(xmm_reg) v => _,
+                step = in(xmm_reg) step,
+                options(nostack),
+            );
+            n & 15
+        } else {
+            n
+        };
+        let mut r = left & 7;
+        while r > 0 {
+            let next = p.add(bsize);
+            p.cast::<*mut u8>().write(next);
+            p = next;
+            r -= 1;
+        }
+        let groups = left >> 3;
+        if groups != 0 {
+            let v = _mm_set_epi64x(
+                p.add(2 * bsize).expose_provenance() as i64,
+                p.add(bsize).expose_provenance() as i64,
+            );
+            let step = _mm_set1_epi64x((2 * bsize) as i64);
+            core::arch::asm!(
+                "2:",
+                "movq qword ptr [{p}], {v}",
+                "movhps qword ptr [{p} + {bs}], {v}",
+                "paddq {v}, {step}",
+                "movq qword ptr [{p} + {bs}*2], {v}",
+                "movhps qword ptr [{p} + {b3}], {v}",
+                "paddq {v}, {step}",
+                "movq qword ptr [{p} + {bs}*4], {v}",
+                "movhps qword ptr [{p} + {b5}], {v}",
+                "paddq {v}, {step}",
+                "movq qword ptr [{p} + {b3}*2], {v}",
+                "movhps qword ptr [{p} + {b7}], {v}",
+                "paddq {v}, {step}",
+                "lea {p}, [{p} + {bs}*8]",
+                "dec {g}",
+                "jnz 2b",
+                p = inout(reg) p => _,
+                bs = in(reg) bsize,
+                b3 = in(reg) 3 * bsize,
+                b5 = in(reg) 5 * bsize,
+                b7 = in(reg) 7 * bsize,
+                g = inout(reg) groups => _,
+                v = inout(xmm_reg) v => _,
+                step = in(xmm_reg) step,
+                options(nostack),
+            );
+        }
+        // Every block now points at its successor, the last one past the
+        // run: that one gets the list it is prepended to.
+        start.add((n - 1) * bsize).cast::<*mut Block>().write(tail);
+        start.cast()
+    }
+}
+
 /// Lazily extend the free list into never-used capacity (`mi_page_extend_free`).
 ///
 /// # Safety
 /// `page` owned by the calling thread; `area` must be the page's payload
 /// start, valid committed memory of `reserved * block_size` bytes.
+#[inline(never)]
 pub unsafe fn page_extend(page: *mut Page, area: *mut u8) {
+    // SAFETY: forwarded contract.
+    unsafe { page_extend_inline(page, area) }
+}
+
+/// The body of [`page_extend`], for the one caller that wants it in line.
+///
+/// Two names for one body, because the callers disagree. `grow_front` is
+/// where a program's carving happens (perl: 2,029 calls linking ~290 blocks
+/// each) and wants the loop in its own frame. The walk reaches a carve on a
+/// fraction of its trips, twice in its source, and as two inlined copies
+/// they were most of that function's text. LLVM used to inline all three and
+/// stopped inlining ANY once the long-run loop was added (`link_run`), which
+/// cost every carve a call: sqlite +3,052 allocator Ir, where the loop
+/// gained it nothing.
+///
+/// # Safety
+/// As [`page_extend`].
+#[inline(always)]
+pub unsafe fn page_extend_inline(page: *mut Page, area: *mut u8) {
     // SAFETY: caller already holds a valid page pointer (see fn contract).
     unsafe { debug_validate_page(page, "page_extend") };
     // SAFETY: heap lock held; arithmetic stays inside the page area by the
@@ -1280,14 +1579,9 @@ pub unsafe fn page_extend(page: *mut Page, area: *mut u8) {
         // forward form makes each store depend on the previous address
         // computation, where the backward form's decrementing induction
         // variable does not. Left as it is.
-        let mut i = take;
-        let mut head: *mut Block = (*page).free;
-        while i > 0 {
-            i -= 1;
-            let b: *mut Block = start.add(i * bsize).cast();
-            block_set_next(page, b, head);
-            head = b;
-        }
+        //
+        // A third form WON, on x86-64: see `link_run`.
+        let head = link_run(page, start, bsize, take, (*page).free);
         (*page).free = head;
         (*page).capacity = (capacity + take) as u32;
     }
@@ -1384,6 +1678,112 @@ pub unsafe fn page_purge_free_slots(
             }
         }
         n
+    }
+}
+
+/// The type of [`Page::owner_plain`]: a word, except where the segment header
+/// has no room for one.
+///
+/// The header must fit in slice 0, and at the default geometry that leaves
+/// 127 bytes per slice for a `Page` and its owner-table entry. A `secure` +
+/// `blockmap` page is 32 bytes larger than the plain one (two keys, a payload
+/// base, a reciprocal): 120 without this word, so it keeps the 2.4.0 layout —
+/// no owner word, and a `u32` owner-table entry
+/// ([`crate::segment::OwnerEntry`]). Either feature alone has the room.
+#[cfg(not(all(feature = "secure", feature = "blockmap")))]
+pub type OwnerWord = AtomicUsize;
+/// See the roomy definition: this build's page has no room for the word.
+#[cfg(all(feature = "secure", feature = "blockmap"))]
+pub type OwnerWord = NoOwnerWord;
+
+/// The zero-sized stand-in for the owner word, with the three calls its
+/// users make, so no use site carries a `cfg`. [`FAST_OWNER`] is false
+/// wherever this is the type, and every one of those calls is dead code.
+#[cfg(all(feature = "secure", feature = "blockmap"))]
+pub struct NoOwnerWord;
+
+#[cfg(all(feature = "secure", feature = "blockmap"))]
+impl NoOwnerWord {
+    /// Nothing to initialise.
+    #[inline(always)]
+    pub const fn new(_: usize) -> Self {
+        NoOwnerWord
+    }
+    /// Never a thread's id.
+    #[inline(always)]
+    pub fn load(&self, _: Ordering) -> usize {
+        0
+    }
+    /// Nothing to store.
+    #[inline(always)]
+    pub fn store(&self, _: usize, _: Ordering) {}
+}
+
+/// Whether pages carry a live [`Page::owner_plain`]. Not on a one-context
+/// build, where the owner test folds away, nor on wasm, which has one thread
+/// and a size budget, nor where the page has no room for the word
+/// ([`OwnerWord`]) — derived from the type, so the two cannot disagree.
+pub(crate) const FAST_OWNER: bool = !crate::ONE_THREAD
+    && cfg!(not(all(target_arch = "wasm32", not(miri))))
+    && core::mem::size_of::<OwnerWord>() != 0;
+
+/// Set `page`'s owner word from its flags and its segment's owner: call after
+/// initialising a page, after CLEARING a slow flag, and when a segment
+/// changes hands.
+///
+/// # Safety
+/// `page` is a live page slot of `seg`, owned by the calling thread.
+#[inline(always)]
+pub unsafe fn page_owner_sync(page: *mut Page, seg: *mut crate::segment::Segment) {
+    if FAST_OWNER {
+        // SAFETY: per contract.
+        unsafe {
+            let plain = (*page).flags.load(Ordering::Relaxed) & pflags::SLOW_FREE == 0;
+            let tid = (*seg).thread_id.load(Ordering::Relaxed);
+            (*page)
+                .owner_plain
+                .store(if plain { tid } else { 0 }, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Debug-assert that `page`'s owner word is already zero: for a slot that
+/// has just been taken from the span allocator or a new segment.
+///
+/// **A slot that is not a live page has a zero owner word**, always: the
+/// word is cleared when a page dies (`span_free`) and when its segment is
+/// abandoned, a never-used slot is zero memory, and a recycled segment's
+/// slots are scrubbed. So a single-block page, which is born flagged and is
+/// never plain, needs no clear of its own. It had one at each of its three
+/// births (the large span, the huge page, the huge segment's adoption by a
+/// heap): one store per large allocation that wrote the value already
+/// there, which is one of the three instructions the owner word cost a
+/// 2 MiB alloc/free pair (census 4, vein 1).
+///
+/// # Safety
+/// `page` is a page slot the calling thread owns.
+#[inline(always)]
+pub unsafe fn page_owner_assert_clear(page: *mut Page) {
+    if FAST_OWNER {
+        // SAFETY: per contract.
+        let word = unsafe { (*page).owner_plain.load(Ordering::Relaxed) };
+        debug_assert_eq!(
+            word, 0,
+            "a slot that was not a live page carried an owner word"
+        );
+    }
+}
+
+/// Clear `page`'s owner word: call after SETTING a slow flag, when the page
+/// dies, and when its segment is abandoned.
+///
+/// # Safety
+/// `page` is a page slot the calling thread owns.
+#[inline(always)]
+pub unsafe fn page_owner_clear(page: *mut Page) {
+    if FAST_OWNER {
+        // SAFETY: per contract.
+        unsafe { (*page).owner_plain.store(0, Ordering::Relaxed) };
     }
 }
 

@@ -120,6 +120,22 @@ pub unsafe fn alloc(
     unsafe { sys::alloc(size, try_alignment, commit, allow_large) }
 }
 
+/// [`alloc`] for a reservation that will never be released, without the
+/// trim: see `unix::reserve_untrimmed`. Only where the trim exists and the
+/// address space to leave untrimmed is plentiful (64-bit Unix).
+///
+/// # Safety
+/// As [`alloc`]; the block is never passed to [`free`] (or the caller
+/// accepts that up to `alignment` bytes of address space stay reserved).
+#[cfg(all(unix, not(miri), target_pointer_width = "64"))]
+pub unsafe fn reserve_untrimmed(size: usize, alignment: usize) -> Result<Alloc, PrimError> {
+    if !alignment.is_power_of_two() {
+        return Err(22);
+    }
+    // SAFETY: forwarded contract; alignment is a power of two.
+    unsafe { sys::reserve_untrimmed(size, alignment) }
+}
+
 /// Release a mapping obtained from [`alloc`].
 ///
 /// # Safety

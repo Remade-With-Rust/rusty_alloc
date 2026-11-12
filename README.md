@@ -34,7 +34,7 @@ toolchain, no emscripten, no per-platform allocator to qualify.
 
 ```toml
 [dependencies]
-rusty_alloc-api = "2.2"
+rusty_alloc-api = "2.5"
 ```
 
 ```rust
@@ -94,9 +94,9 @@ WHOLE-PROGRAM instructions:
 
 | workload | vs mimalloc | vs jemalloc | vs glibc |
 |---|---:|---:|---:|
-| lua | **0.96** | **0.84** | 0.81 |
-| perl | **0.99** | **0.89** | 0.81 |
-| sqlite | **1.00** | **0.98** | 0.99 |
+| lua | **0.962** | **0.835** | 0.813 |
+| perl | **0.988** | **0.889** | 0.810 |
+| sqlite | **0.995** | **0.976** | 0.988 |
 
 Those are whole-program ratios, and they understate the allocator by design,
 because in a real program most instructions are not the allocator. The same
@@ -104,28 +104,35 @@ runs, decomposed:
 
 | workload | allocator share | **allocator-only ra/mi** | whole program | floor if our allocator cost ZERO |
 |---|---:|---:|---:|---:|
-| lua | 3.9% | **0.52** | 0.96 | 0.93 |
-| perl | 3.2% | **0.81** | 0.99 | 0.96 |
-| sqlite | 1.5% | **0.83** | 1.00 | 0.98 |
+| lua | 3.3% | **0.44** | 0.962 | 0.93 |
+| perl | 2.7% | **0.68** | 0.988 | 0.96 |
+| sqlite | 1.2% | **0.70** | 0.995 | 0.98 |
 
 Allocator-only Ir is summed by OBJECT from the raw callgrind file
 (`bench/icount-arms.sh`), so code inlined from any source file counts. Measured
-2026-09-25 against the mimalloc v2.4.5 oracle build.
+2026-11-12 (2.5.0) against the mimalloc v2.4.5 oracle build and jemalloc
+5.3.0. At 2.4.0 the allocator-only column read 0.52 / 0.81 / 0.83.
 
-**What moved since 2.2.0** — four rounds of exact-instruction work, every
+**What moved since 2.2.0** — five rounds of exact-instruction work, every
 change gated on the counts and on the full suites (`docs/LEDGER.md`,
-CURIOSITY rounds one to four). Per-op, `bench/opscan.c` (lower is better):
+CURIOSITY rounds one to four; `docs/opps.md`, vein census 4, for 2.5.0).
+Per-op, `bench/opscan.sh` (lower is better):
 
-| op | 2.2.0 (`c9631f4`) | now | Δ |
-|---|---:|---:|---:|
-| cross-thread free (`xthread`) | 113.71 | **77.26** | −32 % |
-| huge (2 MiB) alloc + free | 689.68 | **293.68** | −57 % |
-| `big` (4 KiB) alloc + free | 121.00 | **92.00** | −24 % |
-| `mixed` sizes | 110.93 | **92.82** | −16 % |
-| `calloc` | 107.57 | **93.19** | −13 % |
-| `posix_memalign` | 97.88 | **83.69** | −14 % |
-| `realloc` (grow) | 259.86 | **231.20** | −11 % |
-| `small` (32 B) alloc + free | 54.39 | **52.25** | −4 % |
+| op | 2.2.0 (`c9631f4`) | 2.4.0 | 2.5.0 | Δ since 2.2.0 |
+|---|---:|---:|---:|---:|
+| cross-thread free (`xthread`) | 113.71 | 74.81 | **65.83** | −42 % |
+| huge (2 MiB) alloc + free | 689.68 | 144.00 | **144.00** | −79 % |
+| `big` (4 KiB) alloc + free | 121.00 | 94.00 | **89.00** | −26 % |
+| `mixed` sizes | 110.93 | 93.56 | **85.80** | −23 % |
+| `calloc` | 107.57 | 93.01 | **83.01** | −23 % |
+| `posix_memalign` | 97.88 | 83.01 | **79.13** | −19 % |
+| `realloc` (grow) | 259.86 | 227.97 | **203.45** | −22 % |
+| `small` (32 B) alloc + free | 54.39 | 52.25 | **47.07** | −13 % |
+
+Against mimalloc v2.4.5 on the same scan, every one of the 16 operations is
+below it: 0.003× on the 2 MiB pair, 0.39× on the 256-byte pair, and 0.86× at
+the narrowest (`liveset`, 65,536 live objects with a random victim replaced
+each step).
 
 Process start-up also got cheaper: reading the allocator's options used to
 walk the environment 76 times; on Linux it now walks it once, about 25,000
@@ -134,16 +141,21 @@ instructions saved on every process launch.
 ### Rust programs (`GlobalAlloc`)
 
 Rust deliverables reach the allocator through `GlobalAlloc`, which the C
-instruments above never exercise. Three deterministic Rust workloads
+instruments above never exercise. Four deterministic Rust workloads
 (`bench/rust-globalalloc.sh`, whole-program Ir per 20,000 steps, identical
 checksums between arms):
 
-| workload | 2.2.0 (`c9631f4`) | now | Δ |
+| workload | 2.4.0 | 2.5.0 | Δ |
 |---|---:|---:|---:|
-| boxed trees, buffers, `Rc` | 23,357,670 | 18,436,430 | **−21.1 %** |
-| hash maps, B-trees, strings | 28,220,088 | 26,577,921 | **−5.8 %** |
-| cache-line-aligned buffers (`realloc`) | 1,856,092 | 1,349,905 | **−27.3 %** |
-| short-lived threads | 12,201,584 | 12,105,054 | −0.8 % |
+| boxed trees, buffers, `Rc` | 18,436,007 | 17,477,878 | **−5.2 %** |
+| hash maps, B-trees, strings | 26,485,019 | 26,301,891 | −0.7 % |
+| cache-line-aligned buffers (`realloc`) | 1,292,463 | 1,213,478 | **−6.1 %** |
+| short-lived threads | 2,769,878 | 2,560,766 | **−7.5 %** |
+
+Both columns measured 2026-11-12 with the same script and toolchain. Against
+2.2.0 (`c9631f4`, measured 2026-09-25) the boxed-trees workload has gone from
+23,357,670 to 17,477,878 (−25 %) and the hash-maps one from 28,220,088 to
+26,301,891 (−7 %).
 
 What changed: the `GlobalAlloc` methods are `#[inline]` (as the `mimalloc`
 crate's are), so rustc's `__rust_alloc` shims carry the fast path instead of
@@ -152,6 +164,28 @@ away; layouts aligned to 16 bytes — every hashbrown table — are served from
 the ordinary size classes, which are already 16-aligned, instead of the
 aligned path; and `realloc` at any alignment keeps a block in place when it
 fits instead of always copying.
+
+**One more instruction, if the allocator is linked into an executable.** On
+x86-64 Linux, add `--cfg ra_tls_local_exec` to `RUSTFLAGS` for a binary that
+declares `#[global_allocator]`:
+
+```sh
+RUSTFLAGS="--cfg ra_tls_local_exec" cargo build --release
+```
+
+Every allocation finds its thread's heap through a thread-local slot. A
+library has to reach it in two instructions, because the slot's offset is
+only known when the program is loaded. In an executable the linker knows it,
+and the load takes it as its own displacement: one instruction. Measured on
+the workloads above, same checksums: boxed trees **−220,144** whole-program
+(−1.24 %), hash maps −29,141, aligned buffers −3,684; `__rust_alloc` 16 → 15
+instructions per call.
+
+It is a `--cfg` and not a default because the same code cannot be linked into
+a shared library: set it on a `cdylib` (the `LD_PRELOAD` override, a plugin)
+and the link fails with `relocation R_X86_64_TPOFF32 ... cannot be used with
+-shared`. That is the whole failure mode. It is a link error, never a wrong
+program.
 
 **Checked on real consumers, not just counted.** On 2026-09-25 SpaceDB (whole
 workspace, 314 tests) and rusty_zstd (194 tests plus C-zstd cross tests) ran
@@ -162,20 +196,25 @@ rusty_zstd's CLI: every file at levels 1/3/9/19 and 4 threads compressed
 
 **Where this came from: `free`.** It is the function a real program spends its
 allocator time in, so it is the one worth counting instruction by instruction.
-Ours is now **21 instructions on the fast path against mimalloc's 25**, down
-from 27:
+Ours is now **17 instructions on the fast path against mimalloc's 25**, down
+from 27 at 2.2.0 and 21 at 2.4.0:
 
 | stage | rusty_alloc | mimalloc |
 |---|---:|---:|
 | null check + segment resolve | 4 | 4 |
 | owner thread-id load | 1 | 1 |
-| resolve pointer &rarr; page | **5** | 9 |
-| page flags test | 3 | 2 |
+| resolve pointer &rarr; page | **4** | 9 |
+| page flags test | **0** | 2 |
 | owner-thread compare | 2 | 2 |
 | push onto `local_free` | 3 | 3 |
 | `used--` and retire branch | **2** | 2 |
 | CET landing pad + return | 1 | 2 |
-| **total** | **21** | **25** |
+| **total** | **17** | **25** |
+
+The flags test is gone in 2.5.0: each page carries one owner word that holds
+its thread's id only while the page is plain, so the same load and compare
+that asks "is this my page" also asks "is it plain". The page is found
+through a per-slice table of page pointers in the segment header.
 
 ## Embedded: bare metal, measured on silicon
 
@@ -428,7 +467,7 @@ in the `options` module docs, and a test holds it to the source.
 
 ```toml
 [dependencies]
-rusty_alloc-api = "2.2"
+rusty_alloc-api = "2.5"
 ```
 
 | crate | docs | what |

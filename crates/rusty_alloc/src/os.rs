@@ -121,6 +121,36 @@ pub fn page_align_up(size: usize) -> usize {
     }
 }
 
+/// Reserve, uncommitted, an aligned block that will be held for the life of
+/// the process (an arena).
+///
+/// On 64-bit Unix the aligned block is cut from an over-reservation, and
+/// [`alloc_aligned`] returns the unaligned head and tail to the OS: two
+/// `munmap` calls at every process start, for address space nothing would
+/// have used (census 4, vein 10). Here they stay reserved. Everywhere else
+/// this is `alloc_aligned(size, alignment, false, false)`.
+pub fn reserve_aligned_forever(size: usize, alignment: usize) -> Result<OsBlock, PrimError> {
+    #[cfg(all(unix, not(miri), target_pointer_width = "64"))]
+    if !crate::FIXED_REGION {
+        if !alignment.is_power_of_two() {
+            return Err(22);
+        }
+        let alignment = alignment.max(page_size());
+        let size = page_align_up(size);
+        // SAFETY: size is page-multiple, alignment a power of two; the
+        // mapping is owned by the OsBlock handed out, which its one caller
+        // never frees.
+        let a = unsafe { prim::reserve_untrimmed(size, alignment)? };
+        return Ok(OsBlock {
+            ptr: a.ptr,
+            size,
+            is_large: a.is_large,
+            is_zero: a.is_zero,
+        });
+    }
+    alloc_aligned(size, alignment, false, false)
+}
+
 /// Reserve (and optionally commit) an aligned block of OS memory.
 ///
 /// `alignment` must be a power of two ≥ page size; `size` is rounded up to

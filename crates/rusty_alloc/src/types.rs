@@ -117,9 +117,11 @@ pub const SLICES_PER_SEGMENT: usize = 512;
 ///
 /// **Why the slice count stops at 32, why 256k doubles the SLICE instead, and
 /// why there is no 128 KiB rung.** Two hard constraints bracket this.
-/// `Segment` is `48 + 92 * SLICES_PER_SEGMENT` bytes (a `Page` is 88, a
-/// `page_off` entry 4) and must fit in slice 0, which caps the count at 44 for
-/// a 4 KiB slice; and `SEGMENT_SIZE` must remain a POWER OF TWO, because
+/// `Segment` is `48 + 104 * SLICES_PER_SEGMENT` bytes on a 64-bit host (a
+/// `Page` is 96, a `page_off` entry 8; it was 92 a slice until 2.4.1) and must
+/// fit in slice 0, which caps the count at 38 for a 4 KiB slice (it was 44
+/// when the first rung was chosen, which is the number the next sentence
+/// argues from); and `SEGMENT_SIZE` must remain a POWER OF TWO, because
 /// `segment_of` recovers a segment by masking with `SEGMENT_SIZE - 1` and
 /// `segment_map` asserts `1 << WINDOW_SHIFT == SEGMENT_SIZE`. 44 slices is
 /// neither, so the next power of two above 32 needs a bigger slice.

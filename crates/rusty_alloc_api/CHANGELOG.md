@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.0](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-api-v2.4.0...rusty_alloc-api-v2.5.0) - 2026-11-12
+
+### Changed
+
+- **`GlobalAlloc::realloc` lands on a body that takes its arguments where
+  `__rust_realloc` holds them** (`alloc::realloc_rust`): a word-aligned
+  layout is one compare and a jump, 8 -> 5 instructions at the entry. An
+  over-aligned `realloc` that stays in place no longer pushes five
+  registers: the in-place answer is frameless, and the move is an
+  out-of-line jump with the four arguments in place.
+- Picks up `rusty_alloc` 2.5.0: allocator instructions perl -15.0 %,
+  sqlite -15.2 %, lua -12.6 % against 2.4.0; Rust workloads boxed trees
+  -5.2 %, short-lived threads -7.5 %, cache-line-aligned buffers -6.1 %.
+  The core's changelog has the itemised list and the new opt-in
+  `--cfg ra_tls_local_exec` (one instruction fewer per allocation in an
+  executable).
+
 ## [2.4.0](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-api-v2.3.1...rusty_alloc-api-v2.4.0) - 2026-11-01
 
 ### Changed

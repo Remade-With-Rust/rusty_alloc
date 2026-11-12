@@ -256,7 +256,16 @@ pub fn reserve_os_memory_ex(
     // process on Windows (measured: 1027 MiB with a 4 MiB working set) and a
     // Linux box with about 1 GiB of RAM refused it outright
     // (`__vm_enough_memory`) and logged a line at every process start.
-    let b = os::alloc_aligned(total, SEGMENT_SIZE, commit, allow_large).map_err(|_| ())?;
+    // An arena holds its memory for the life of the process, so a plain
+    // reservation need not be trimmed to its aligned part (the registration
+    // failure below is the one path that frees it, and leaves at most one
+    // segment's worth of address space reserved).
+    let b = if commit || allow_large {
+        os::alloc_aligned(total, SEGMENT_SIZE, commit, allow_large)
+    } else {
+        os::reserve_aligned_forever(total, SEGMENT_SIZE)
+    }
+    .map_err(|_| ())?;
     match arena_register(b.ptr, total, exclusive, true, -1, commit) {
         Ok(id) => Ok(id),
         Err(()) => {

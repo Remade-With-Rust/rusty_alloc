@@ -1,22 +1,22 @@
-   123  crates/rusty_alloc/src/alloc.rs
+   180  crates/rusty_alloc/src/alloc.rs
     24  crates/rusty_alloc/src/arena.rs
-    80  crates/rusty_alloc/src/heap.rs
-    43  crates/rusty_alloc/src/init.rs
+    82  crates/rusty_alloc/src/heap.rs
+    44  crates/rusty_alloc/src/init.rs
      2  crates/rusty_alloc/src/lib.rs
     17  crates/rusty_alloc/src/options.rs
-    15  crates/rusty_alloc/src/os.rs
-    40  crates/rusty_alloc/src/page.rs
+    16  crates/rusty_alloc/src/os.rs
+    57  crates/rusty_alloc/src/page.rs
     37  crates/rusty_alloc/src/prim/fixed.rs
      8  crates/rusty_alloc/src/prim/mock.rs
-    17  crates/rusty_alloc/src/prim/mod.rs
-    33  crates/rusty_alloc/src/prim/unix.rs
+    19  crates/rusty_alloc/src/prim/mod.rs
+    35  crates/rusty_alloc/src/prim/unix.rs
      6  crates/rusty_alloc/src/prim/wasm.rs
     36  crates/rusty_alloc/src/prim/windows.rs
      2  crates/rusty_alloc/src/random.rs
-    92  crates/rusty_alloc/src/segment.rs
+   105  crates/rusty_alloc/src/segment.rs
      8  crates/rusty_alloc/src/shared_light.rs
      3  crates/rusty_alloc/src/stats.rs
-    16  crates/rusty_alloc_api/src/lib.rs
+    19  crates/rusty_alloc_api/src/lib.rs
     15  crates/rusty_alloc_bench/src/kernels.rs
     14  crates/rusty_alloc_bench/src/replay.rs
    358  crates/rusty_alloc_ffi/src/lib.rs

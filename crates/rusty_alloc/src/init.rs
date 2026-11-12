@@ -122,7 +122,7 @@ pub static EMPTY_HEAP_BOX: EmptyHeapBox = EmptyHeapBox(HeapBox {
     subproc: AtomicUsize::new(0),
     tag: 0,
     allow_destroy: false,
-    heap: UnsafeCell::new(Heap::new()),
+    heap: UnsafeCell::new(Heap::sentinel()),
 });
 
 /// Pointer to the shared empty heap box.
@@ -309,17 +309,45 @@ mod heap_tls {
     /// segment-relative load, so the explicit `fs:0` read and the add both
     /// disappear. Measured at 4.00 Ir per malloc before this change — a
     /// quarter of our entire malloc-side deficit spent just locating the heap.
+    ///
+    /// **ONE, with `--cfg ra_tls_local_exec`** (census 4, vein 7). The two
+    /// above are the initial-exec model: the slot's offset from the thread
+    /// pointer is a load-time constant the loader writes into the GOT, so it
+    /// has to be fetched. In an EXECUTABLE that offset is a link-time
+    /// constant (local-exec), and x86 takes it as the displacement of the
+    /// load itself: `mov reg, fs:[sym@TPOFF]`. A static linker already
+    /// relaxes the GOT load into `mov reg, imm`, but it cannot merge two
+    /// instructions into one, which is why a Rust binary with this allocator
+    /// linked in still paid two.
+    ///
+    /// Opt-in, and it cannot be otherwise: that relocation
+    /// (`R_X86_64_TPOFF32`) does not link into a shared object, and a library
+    /// cannot see what it will be linked into. Set it for a binary that links
+    /// `rusty_alloc` statically (`#[global_allocator]` in an executable);
+    /// never for the LD_PRELOAD override or any `cdylib`. Getting it wrong is
+    /// a link error, not a miscompile.
     #[inline(always)]
     pub fn get() -> *mut HeapBox {
         let v: *mut HeapBox;
         // SAFETY: reads the GOT entry the loader relocated at startup, then
         // loads 8 aligned bytes of this thread's own TLS block through the fs
         // segment. Both are reads; nothing is written.
+        #[cfg(not(ra_tls_local_exec))]
         unsafe {
             core::arch::asm!(
                 "mov {t}, qword ptr [rip + __ra_tls_heap@GOTTPOFF]",
                 "mov {o}, qword ptr fs:[{t}]",
                 t = out(reg) _,
+                o = out(reg) v,
+                options(nostack, preserves_flags, readonly),
+            );
+        }
+        // SAFETY: loads 8 aligned bytes of this thread's own TLS block
+        // through the fs segment, at the offset the static linker resolved.
+        #[cfg(ra_tls_local_exec)]
+        unsafe {
+            core::arch::asm!(
+                "mov {o}, qword ptr fs:[__ra_tls_heap@TPOFF]",
                 o = out(reg) v,
                 options(nostack, preserves_flags, readonly),
             );
@@ -712,6 +740,17 @@ fn create_heap_uninstalled(tag: i32, allow_destroy: bool, arena_id: i32) -> *mut
         (*(*hb).heap.get()).delayed = &raw const (*hb).delayed;
         (*(*hb).heap.get()).arena_id = arena_id;
         (*(*hb).heap.get()).tag = tag;
+        // A NEW HEAP HAS NOTHING TO COLLECT, so its periodic-collect
+        // countdown starts full. `Heap::new` is `const` and leaves it 0,
+        // and the generic path reads 0 as "the count ran out": every heap's
+        // FIRST slow-path allocation swept all of its (empty) page queues
+        // and asked the arena, by the clock, whether a purge was due. 570
+        // instructions and a `clock_gettime` at every thread's first
+        // allocation and every process's start (census 4, vein 10; the
+        // short-lived-threads workload made 201 of those sweeps for 200
+        // threads).
+        (*(*hb).heap.get()).generic_countdown =
+            crate::options::get_clamp(crate::options::GENERIC_COLLECT, 1, 1_000_000) as usize;
         // Per-heap CSPRNG stream (free-list keys, guarded sampling) -- seeded
         // only where something draws from it. A build with neither `secure`
         // nor guard pages has no consumer, and seeding still cost the ChaCha
@@ -925,6 +964,9 @@ unsafe fn thread_done_one(hb: *mut HeapBox) {
                     // live page of every segment a dying thread owns.
                     page_collect_and_set_flag(slot, XFLAG_NEVER);
                     (*slot).xheap.store(0, Ordering::Release);
+                    // No owner from here: a thread that later reuses this
+                    // thread's id must not match the page.
+                    crate::page::page_owner_clear(slot);
                 }
                 idx += len;
                 // `wrapping_add`, not `add`: the pointer is only ever
