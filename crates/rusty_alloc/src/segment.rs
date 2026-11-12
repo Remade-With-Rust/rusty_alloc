@@ -674,6 +674,95 @@ pub unsafe fn segment_free(seg: *mut Segment) -> Result<(), PrimError> {
     }
 }
 
+/// Store `owner` into `n >= 1` consecutive owner-table entries.
+///
+/// # Safety
+/// `[ent, ent + n)` are entries of one segment's owner table, owned by the
+/// caller.
+#[cfg(not(all(
+    target_arch = "x86_64",
+    not(all(feature = "secure", feature = "blockmap")),
+    not(miri)
+)))]
+#[inline(always)]
+unsafe fn fill_owner(ent: *mut OwnerEntry, n: usize, owner: OwnerEntry) {
+    // SAFETY: per contract.
+    unsafe {
+        let mut e = ent;
+        let mut j = 0;
+        while j < n {
+            *e = owner;
+            e = e.add(1);
+            j += 1;
+        }
+    }
+}
+
+/// [`fill_owner`] on x86-64 with pointer entries: TWO entries a store, and
+/// no loop for the count's low bits.
+///
+/// Every entry gets the same value, so a store may overlap one already
+/// made. A run of eight or more is filled eight entries a pass (four
+/// 16-byte stores), and whatever is left over is covered by one more block
+/// of eight that ENDS at the run's end; shorter runs are two or four stores
+/// placed the same way, from both ends. 7 instructions per 8 entries, where
+/// the scalar loop LLVM kept for this (it does not vectorise it, with or
+/// without `slice::fill`: that form measured lua +2,072, sqlite +215) is one
+/// store and a share of the loop per entry.
+///
+/// The pair is loaded from two real entries, not built from an integer, so
+/// the pointers the table hands back keep their provenance.
+///
+/// # Safety
+/// As the scalar definition.
+#[cfg(all(
+    target_arch = "x86_64",
+    not(all(feature = "secure", feature = "blockmap")),
+    not(miri)
+))]
+#[inline(always)]
+unsafe fn fill_owner(ent: *mut OwnerEntry, n: usize, owner: OwnerEntry) {
+    use core::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_storeu_si128};
+    debug_assert!(n >= 1);
+    // SAFETY: per contract, every store below lies inside `[ent, ent + n)`:
+    // each branch is taken only when `n` covers the widest store it makes.
+    // SSE2 is part of the x86-64 baseline.
+    unsafe {
+        if n < 2 {
+            *ent = owner;
+            return;
+        }
+        let pair = [owner, owner];
+        let v = _mm_loadu_si128(pair.as_ptr().cast::<__m128i>());
+        let end = ent.add(n);
+        if n < 4 {
+            _mm_storeu_si128(ent.cast(), v);
+            _mm_storeu_si128(end.sub(2).cast(), v);
+            return;
+        }
+        if n < 8 {
+            _mm_storeu_si128(ent.cast(), v);
+            _mm_storeu_si128(ent.add(2).cast(), v);
+            _mm_storeu_si128(end.sub(4).cast(), v);
+            _mm_storeu_si128(end.sub(2).cast(), v);
+            return;
+        }
+        let last = end.sub(8);
+        let mut p = ent;
+        while p < last {
+            _mm_storeu_si128(p.cast(), v);
+            _mm_storeu_si128(p.add(2).cast(), v);
+            _mm_storeu_si128(p.add(4).cast(), v);
+            _mm_storeu_si128(p.add(6).cast(), v);
+            p = p.add(8);
+        }
+        _mm_storeu_si128(last.cast(), v);
+        _mm_storeu_si128(last.add(2).cast(), v);
+        _mm_storeu_si128(last.add(4).cast(), v);
+        _mm_storeu_si128(last.add(6).cast(), v);
+    }
+}
+
 /// Write the span markers for a span at `idx` of `len` slices: its length
 /// and payload in the first slot, and every slice's owner-table entry
 /// pointing at that slot.
@@ -737,12 +826,8 @@ unsafe fn span_mark(seg: *mut Segment, idx: usize, len: usize, from: usize) {
         // unroll setup and scalar remainder. Opscan `huge` +28.00, perl +340,
         // lua -8,327, sqlite -862 allocator Ir — a sign flip by span length,
         // not a win. Same verdict as the fill `huge_alloc` measured flat.
-        let mut ent = tab.wrapping_add(idx + from);
-        let mut j = from;
-        while j < len {
-            *ent = owner;
-            ent = ent.wrapping_add(1);
-            j += 1;
+        if from < len {
+            fill_owner(tab.add(idx + from), len - from, owner);
         }
     }
 }

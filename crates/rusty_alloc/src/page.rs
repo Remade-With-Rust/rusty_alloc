@@ -1267,7 +1267,10 @@ unsafe fn link_run(
         // +2,168 and python +218 (`grow_front` 78.2 -> 89.0 Ir per call on
         // sqlite's short runs). Gated, a short run pays one compare.
         if n >= 64 {
-            let v = _mm_set_epi64x(p.add(2 * bsize).addr() as i64, p.add(bsize).addr() as i64);
+            let v = _mm_set_epi64x(
+                p.add(2 * bsize).expose_provenance() as i64,
+                p.add(bsize).expose_provenance() as i64,
+            );
             let step = _mm_set1_epi64x((2 * bsize) as i64);
             core::arch::asm!(
                 "2:",
@@ -1321,7 +1324,10 @@ unsafe fn link_run(
         }
         let groups = left >> 3;
         if groups != 0 {
-            let v = _mm_set_epi64x(p.add(2 * bsize).addr() as i64, p.add(bsize).addr() as i64);
+            let v = _mm_set_epi64x(
+                p.add(2 * bsize).expose_provenance() as i64,
+                p.add(bsize).expose_provenance() as i64,
+            );
             let step = _mm_set1_epi64x((2 * bsize) as i64);
             core::arch::asm!(
                 "2:",
