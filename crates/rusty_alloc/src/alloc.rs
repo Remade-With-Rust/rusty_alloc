@@ -1932,6 +1932,34 @@ unsafe fn free_general(p: *mut u8, seg: *mut Segment, pg: *mut Page, owner_tid: 
     }
 }
 
+/// [`usable_size`] when it is one load: `Some` for a block on a plain page,
+/// `None` for one on a flagged page (an interior aligned block, a
+/// single-block span, a huge segment), which needs the general answer.
+///
+/// For a caller that wants the common answer WITHOUT a call in its body:
+/// `usable_size` reaches `usable_size_slow` on the flagged arm, and a call
+/// with anything live across it is a frame on every path.
+///
+/// # Safety
+/// `p` must be a live pointer from this allocator.
+#[inline]
+pub unsafe fn usable_size_plain(p: ptr::NonNull<u8>) -> Option<usize> {
+    let p = p.as_ptr();
+    let seg = segment_of(p);
+    // SAFETY: as `usable_size`: the page metadata of a live block is stable
+    // while it lives, and a page with none of the three flags holds whole
+    // blocks of `block_size` bytes.
+    unsafe {
+        let pg = page_of(seg, p);
+        let flags = (*pg).flags.load(Ordering::Relaxed);
+        if flags & (pflags::HAS_ALIGNED | pflags::SINGLE_BLOCK | pflags::HUGE_SEGMENT) == 0 {
+            Some((*pg).block_size)
+        } else {
+            None
+        }
+    }
+}
+
 /// Usable size of a live block (≥ requested); 0 for null. Any thread.
 ///
 /// # Safety

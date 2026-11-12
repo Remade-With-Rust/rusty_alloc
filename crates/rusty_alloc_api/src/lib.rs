@@ -244,25 +244,85 @@ unsafe impl GlobalAlloc for RustyAlloc {
             // stays. This arm used to allocate, copy and free every time,
             // shrinks and fits included (bench/rust-globalalloc
             // `overaligned`).
+            //
+            // "It stays" is answered HERE, with no frame, and everything
+            // else is a jump with the four arguments where `__rust_realloc`
+            // received them. As one body, the move's allocation, copy and
+            // free had the entry push five callee-saved registers before
+            // the first test, and pop them again to return the pointer it
+            // was handed.
             // SAFETY: GlobalAlloc contract — ptr is a live, non-null block
             // of ours.
-            let usable = unsafe { rusty_alloc::alloc::usable_size(ptr) };
-            if new_size <= usable && new_size >= usable / 2 {
-                return ptr;
-            }
-            // Otherwise allocate through the aligned path, copy the bytes the
-            // layout says are live, free.
-            // SAFETY: forwarded GlobalAlloc contract.
             unsafe {
-                let new_layout = Layout::from_size_align_unchecked(new_size, layout.align());
-                let np = GlobalAlloc::alloc(self, new_layout);
-                if !np.is_null() {
-                    core::ptr::copy_nonoverlapping(ptr, np, layout.size().min(new_size));
-                    GlobalAlloc::dealloc(self, ptr, layout);
+                let p = core::ptr::NonNull::new_unchecked(ptr);
+                match rusty_alloc::alloc::usable_size_plain(p) {
+                    Some(usable) => {
+                        if new_size <= usable && new_size >= usable / 2 {
+                            return ptr;
+                        }
+                        realloc_overaligned_move(ptr, layout.size(), layout.align(), new_size)
+                    }
+                    // A flagged page (an interior aligned block, a
+                    // single-block span): the general question.
+                    None => realloc_overaligned(ptr, layout.size(), layout.align(), new_size),
                 }
-                np
             }
         }
+    }
+}
+
+/// The move of an over-aligned `realloc`: allocate through the aligned path,
+/// copy the bytes the layout says are live, free. Out of line, with the
+/// arguments in `__rust_realloc`'s own registers, so the in-place answer in
+/// front of it carries no frame.
+///
+/// # Safety
+/// `GlobalAlloc::realloc`'s contract, with `align` above two words.
+#[inline(never)]
+unsafe fn realloc_overaligned_move(
+    ptr: *mut u8,
+    old_size: usize,
+    align: usize,
+    new_size: usize,
+) -> *mut u8 {
+    // SAFETY: forwarded GlobalAlloc contract; `align` came from a `Layout`.
+    unsafe {
+        let np = GlobalAlloc::alloc(
+            &RustyAlloc,
+            Layout::from_size_align_unchecked(new_size, align),
+        );
+        if !np.is_null() {
+            core::ptr::copy_nonoverlapping(ptr, np, old_size.min(new_size));
+            GlobalAlloc::dealloc(
+                &RustyAlloc,
+                ptr,
+                Layout::from_size_align_unchecked(old_size, align),
+            );
+        }
+        np
+    }
+}
+
+/// An over-aligned `realloc` of a block on a flagged page: its usable size
+/// is not its page's block size, so ask the general way, then stay or move.
+///
+/// # Safety
+/// As [`realloc_overaligned_move`].
+#[cold]
+#[inline(never)]
+unsafe fn realloc_overaligned(
+    ptr: *mut u8,
+    old_size: usize,
+    align: usize,
+    new_size: usize,
+) -> *mut u8 {
+    // SAFETY: forwarded contract; `ptr` is a live block of ours.
+    unsafe {
+        let usable = rusty_alloc::alloc::usable_size(ptr);
+        if new_size <= usable && new_size >= usable / 2 {
+            return ptr;
+        }
+        realloc_overaligned_move(ptr, old_size, align, new_size)
     }
 }
 
