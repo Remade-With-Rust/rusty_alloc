@@ -798,15 +798,24 @@ unsafe fn fill_owner(ent: *mut OwnerEntry, n: usize, owner: OwnerEntry) {
 /// `[idx, idx+len)` must lie in the carved region of `seg` under the heap lock;
 /// `from >= 1`, and slices `idx+1 .. idx+min(from, len)` must already point
 /// back to `idx`.
-unsafe fn span_mark(seg: *mut Segment, idx: usize, len: usize, from: usize) {
+unsafe fn span_mark(seg: *mut Segment, head: *mut Page, idx: usize, len: usize, from: usize) {
     debug_assert!(from >= 1, "span_mark: slot 0 is the head, not an interior");
     // SAFETY: caller contract keeps every index in bounds.
     unsafe {
-        (*seg).pages[idx].slice_count = len as u16;
+        // `head` is `pages[idx]`, handed in because every caller already
+        // holds it. Indexing again was a multiply by `size_of::<Page>()`
+        // (96, not a power of two) and a bounds check, at each of the three
+        // uses below and again in each caller afterwards (census 4, vein 9).
+        debug_assert_eq!(
+            head,
+            (&raw mut (*seg).pages).cast::<Page>().add(idx),
+            "span_mark: `head` is not slot `idx`"
+        );
+        (*head).slice_count = len as u16;
         // Cache the payload start now, while `idx` is an integer — a shift, no
         // division. The refill path then reads `(*p).area` instead of
         // recovering it with `page_index` (see `Page::area`).
-        (*seg).pages[idx].area = seg.cast::<u8>().add(idx * SEGMENT_SLICE_SIZE);
+        (*head).area = seg.cast::<u8>().add(idx * SEGMENT_SLICE_SIZE);
         // Interior slices, walked with RUNNING values rather than recomputed
         // indices. `(*seg).pages[idx + j]` costs a multiply by `size_of::<Page>()`
         // — which is 88, not a power of two — and `j * slot_stride()` costs a
@@ -855,11 +864,10 @@ unsafe fn span_mark(seg: *mut Segment, idx: usize, len: usize, from: usize) {
 ///
 /// # Safety
 /// As [`span_mark`]; the span must not be in the free list already.
-unsafe fn span_mark_free(seg: *mut Segment, idx: usize, len: usize, from: usize) {
+unsafe fn span_mark_free(seg: *mut Segment, slot: *mut Page, idx: usize, len: usize, from: usize) {
     // SAFETY: caller contract.
     unsafe {
-        span_mark(seg, idx, len, from);
-        let slot: *mut Page = &raw mut (*seg).pages[idx];
+        span_mark(seg, slot, idx, len, from);
         (*slot).block_size = 0; // free marker
         (*slot).prev = ptr::null_mut();
         (*slot).next = (*seg).free_spans;
@@ -998,12 +1006,13 @@ pub unsafe fn span_alloc(seg: *mut Segment, slices: usize) -> (*mut Page, bool) 
                 span_list_remove(seg, s);
                 if len > slices {
                     // The remainder starts at a new slice: re-mark all of it.
-                    span_mark_free(seg, idx + slices, len - slices, 1);
+                    let rest = s.add(slices);
+                    span_mark_free(seg, rest, idx + slices, len - slices, 1);
                     // It has been free as long as the span it came from.
-                    (*seg).pages[idx + slices].capacity = (*s).capacity;
+                    (*rest).capacity = (*s).capacity;
                 }
                 // The FRONT of a free span: its interiors already point here.
-                span_mark(seg, idx, slices, slices);
+                span_mark(seg, s, idx, slices, slices);
                 (*seg).used_pages += 1;
                 return (s, false);
             }
@@ -1027,14 +1036,14 @@ pub unsafe fn span_alloc(seg: *mut Segment, slices: usize) -> (*mut Page, bool) 
         // they still hold the previous tenant's bytes (`scrub_recycled` left
         // them), and a stale `free_is_zero` or `xthread_free` would be read
         // as this page's. On fresh OS memory they are already zero.
+        let start: *mut Page = (&raw mut (*seg).pages).cast::<Page>().add(idx);
         if !(*seg).mem_is_zero {
-            ptr::write_bytes((&raw mut (*seg).pages).cast::<Page>().add(idx), 0, slices);
+            ptr::write_bytes(start, 0, slices);
         }
         (*seg).next_free_slice = (idx + slices) as u32;
         (*seg).used_pages += 1;
-        let start: *mut Page = &raw mut (*seg).pages[idx];
         // Never-carved slices: mark all of them.
-        span_mark(seg, idx, slices, 1);
+        span_mark(seg, start, idx, slices, 1);
         (start, (*seg).mem_is_zero)
     }
 }
@@ -1090,12 +1099,17 @@ pub unsafe fn span_free(seg: *mut Segment, page: *mut Page) -> usize {
         // `docs/plans/recommit-failure-ignored.md`, mechanism B. A spurious
         // flag costs only a re-commit of committed memory.
         let mut merged_purged = false;
+        // The merged span's first slot: ours, unless a left neighbour takes
+        // us in.
+        let mut head = page;
         let right = idx + len;
         if right < (*seg).next_free_slice as usize {
-            let rslot: *mut Page = &raw mut (*seg).pages[right];
+            // A span starts right after ours, and a span start's own slice
+            // names it: one load, where `pages[right]` is the multiply.
+            let rslot: *mut Page = slice_owner(seg, right);
             debug_assert_eq!(
-                slice_owner(seg, right),
                 rslot,
+                (&raw mut (*seg).pages).cast::<Page>().add(right),
                 "right neighbor not a span start"
             );
             if (*rslot).block_size == 0 {
@@ -1115,6 +1129,7 @@ pub unsafe fn span_free(seg: *mut Segment, page: *mut Page) -> usize {
                 span_list_remove(seg, lstart);
                 len += idx - lstart_idx;
                 idx = lstart_idx;
+                head = lstart;
                 merged_purged |= (*lstart).purged;
             }
         }
@@ -1127,7 +1142,7 @@ pub unsafe fn span_free(seg: *mut Segment, page: *mut Page) -> usize {
         } else {
             freed_idx - idx
         };
-        span_mark_free(seg, idx, len, from);
+        span_mark_free(seg, head, idx, len, from);
         // PURGE the coalesced free span (the RSS lever): return its pages to
         // the OS. Only worthwhile for multi-slice spans — a syscall costs
         // more than the pages a single 64 KiB slice returns. The span is
@@ -1154,7 +1169,7 @@ pub unsafe fn span_free(seg: *mut Segment, page: *mut Page) -> usize {
             let bytes = len * SEGMENT_SLICE_SIZE;
             let decommits = crate::options::is_enabled(5); // purge_decommits
             if os::purge(area, bytes, decommits).is_ok() {
-                (*seg).pages[idx].purged = true;
+                (*head).purged = true;
                 (*seg).purged_any = true;
                 return 1;
             }
@@ -1164,7 +1179,7 @@ pub unsafe fn span_free(seg: *mut Segment, page: *mut Page) -> usize {
         // only if every part was. Never cleared here: the start may already
         // be flagged.
         if merged_purged {
-            (*seg).pages[idx].purged = true;
+            (*head).purged = true;
         }
         if crate::OS_PAGES && delay > 0 {
             return schedule_purge(seg, idx, delay as u64);
