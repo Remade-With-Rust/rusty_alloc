@@ -235,8 +235,24 @@ fn stat_realloc(in_place: bool) {
 /// gone from the hot path entirely, and no `&mut` is ever formed on a heap
 /// that might be the shared sentinel. The miss is a tail call, so the fast
 /// path also needs no callee-saved registers.
+///
+/// The miss takes `size` FIRST. It took the heap box first until 2.4.1, and
+/// since `size` arrives in the first argument register, every `malloc` opened
+/// with a register move to put it where the cold call wanted it: one
+/// instruction on the hot path for the benefit of the cold one (callgrind:
+/// 1.00 Ir per call on the entry line; perl 608,388 of them).
 #[inline]
 pub fn malloc(size: usize) -> *mut u8 {
+    malloc_impl::<true>(size)
+}
+
+/// [`malloc`], with the miss's argument order chosen by the caller:
+/// `SIZE_FIRST` where `size` arrives in the first argument register (`malloc`
+/// itself), heap-first where it arrives in the second (`realloc`'s null arm,
+/// whose slow trips each paid three register moves under the other order:
+/// lua +12,174 Ir over 4,151 trips).
+#[inline(always)]
+fn malloc_impl<const SIZE_FIRST: bool>(size: usize) -> *mut u8 {
     let hb = init::heap_box_fast();
     // SAFETY: raw reads only — `hb` may be the shared immortal sentinel (see
     // `heap_box_fast`), which must never see a `&mut` or a write. `direct`
@@ -259,7 +275,11 @@ pub fn malloc(size: usize) -> *mut u8 {
                 return b;
             }
         }
-        malloc_slow(hb, size)
+        if SIZE_FIRST {
+            malloc_slow(size, hb)
+        } else {
+            malloc_slow_hb_first(hb, size)
+        }
     }
 }
 
@@ -300,7 +320,7 @@ pub fn malloc_or(size: usize, on_oom: fn(usize) -> *mut u8) -> *mut u8 {
                 return b;
             }
         }
-        malloc_or_slow(hb, size, on_oom)
+        malloc_or_slow(size, hb, on_oom)
     }
 }
 
@@ -335,7 +355,7 @@ pub fn malloc_or_with<H: OnOom>(size: usize) -> *mut u8 {
                 return b;
             }
         }
-        malloc_or_slow_with::<H>(hb, size)
+        malloc_or_slow_with::<H>(size, hb)
     }
 }
 
@@ -345,9 +365,9 @@ pub fn malloc_or_with<H: OnOom>(size: usize) -> *mut u8 {
 /// As [`malloc_slow`].
 #[cold]
 #[inline(never)]
-unsafe fn malloc_or_slow_with<H: OnOom>(hb: *mut init::HeapBox, size: usize) -> *mut u8 {
+unsafe fn malloc_or_slow_with<H: OnOom>(size: usize, hb: *mut init::HeapBox) -> *mut u8 {
     // SAFETY: forwarded contract.
-    let p = unsafe { malloc_slow(hb, size) };
+    let p = unsafe { malloc_slow(size, hb) };
     if p.is_null() { H::on_oom(size) } else { p }
 }
 
@@ -359,8 +379,8 @@ unsafe fn malloc_or_slow_with<H: OnOom>(hb: *mut init::HeapBox, size: usize) -> 
 #[cold]
 #[inline(never)]
 unsafe fn malloc_or_slow(
-    hb: *mut init::HeapBox,
     size: usize,
+    hb: *mut init::HeapBox,
     on_oom: fn(usize) -> *mut u8,
 ) -> *mut u8 {
     // Duplicating `malloc_slow`'s body here to avoid nesting a second cold
@@ -368,7 +388,7 @@ unsafe fn malloc_or_slow(
     // because the call it would remove is already a tail-call `jmp`. Reverted;
     // the plain call is the clearer code for the same instruction count.
     // SAFETY: forwarded contract.
-    let p = unsafe { malloc_slow(hb, size) };
+    let p = unsafe { malloc_slow(size, hb) };
     if p.is_null() { on_oom(size) } else { p }
 }
 
@@ -383,7 +403,27 @@ unsafe fn malloc_or_slow(
 /// shared sentinel.
 #[cold]
 #[inline(never)]
-unsafe fn malloc_slow(hb: *mut init::HeapBox, size: usize) -> *mut u8 {
+unsafe fn malloc_slow(size: usize, hb: *mut init::HeapBox) -> *mut u8 {
+    // SAFETY: forwarded contract.
+    unsafe { malloc_slow_body(size, hb) }
+}
+
+/// [`malloc_slow`] for a caller holding `size` in the SECOND argument
+/// register. The same body under a second symbol, not a jump to the first.
+///
+/// # Safety
+/// As [`malloc_slow`].
+#[cold]
+#[inline(never)]
+unsafe fn malloc_slow_hb_first(hb: *mut init::HeapBox, size: usize) -> *mut u8 {
+    // SAFETY: forwarded contract.
+    unsafe { malloc_slow_body(size, hb) }
+}
+
+/// # Safety
+/// As [`malloc_slow`].
+#[inline(always)]
+unsafe fn malloc_slow_body(size: usize, hb: *mut init::HeapBox) -> *mut u8 {
     if hb != init::empty_heap_box_ptr() {
         // SAFETY: a non-sentinel box is this thread's live, initialised box —
         // exclusive &mut scope on the calling thread's own heap. Straight to
@@ -548,6 +588,9 @@ pub fn zalloc(size: usize) -> *mut u8 {
 /// `hb` is `heap_box_fast()` of the calling thread.
 #[cold]
 #[inline(never)]
+// (`hb` first here, unlike `malloc_slow`: calloc's size is the product it
+// just computed, not an incoming register, and `size` first measured
+// +1.06 Ir per calloc.)
 unsafe fn zalloc_slow(hb: *mut init::HeapBox, size: usize) -> *mut u8 {
     if hb == init::empty_heap_box_ptr() {
         return zalloc_first(size);
@@ -694,7 +737,7 @@ fn aligned_at_impl<const POW2: bool>(size: usize, align: usize, offset: usize) -
                 }
             }
         }
-        malloc_aligned_slow(hb, size, align, offset)
+        malloc_aligned_slow(size, align, offset, hb)
     }
 }
 
@@ -706,11 +749,14 @@ fn aligned_at_impl<const POW2: bool>(size: usize, align: usize, offset: usize) -
 /// shared sentinel.
 #[cold]
 #[inline(never)]
+// (`size`, `align`, `offset` first, in the registers they arrive in: with the
+// heap box first, `__rust_alloc` moved `size` out of its register at entry,
+// on every allocation, to make room. See `malloc`.)
 unsafe fn malloc_aligned_slow(
-    hb: *mut init::HeapBox,
     size: usize,
     align: usize,
     offset: usize,
+    hb: *mut init::HeapBox,
 ) -> *mut u8 {
     if hb != init::empty_heap_box_ptr() {
         // MEDIUM sizes get the peek here, in the COLD function, rather than
@@ -1678,7 +1724,7 @@ unsafe fn usable_size_slow(pg: *mut Page, p: *const u8, flags: u8) -> usize {
 #[inline]
 pub unsafe fn realloc(p: *mut u8, newsize: usize) -> *mut u8 {
     if p.is_null() {
-        return malloc(newsize);
+        return malloc_impl::<false>(newsize);
     }
     // SAFETY: forwarded contract; `p` is non-null here.
     unsafe { realloc_live(ptr::NonNull::new_unchecked(p), newsize) }
@@ -1766,7 +1812,7 @@ unsafe fn realloc_move_at(
     seg: *mut Segment,
     pg: *mut Page,
 ) -> *mut u8 {
-    let np = malloc(newsize);
+    let np = malloc_impl::<false>(newsize);
     if np.is_null() {
         return ptr::null_mut();
     }
