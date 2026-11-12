@@ -109,6 +109,32 @@ pub(super) unsafe fn alloc(
     })
 }
 
+/// Reserve (never commit) `size` bytes aligned to `alignment`, leaving the
+/// over-reservation's unaligned head and tail MAPPED.
+///
+/// For a reservation that is never released (an arena): the trim that
+/// [`alloc`] performs is two `munmap` calls, and what they give back is
+/// address space nothing was going to use. Untouched `PROT_NONE`,
+/// `MAP_NORESERVE` pages cost no memory and no commit charge.
+///
+/// # Safety
+/// As [`alloc`]. The block must not be handed to [`free`] expecting the
+/// whole mapping to go: `free(ptr, size)` leaves up to `alignment` bytes of
+/// reserved address space behind.
+#[cfg(target_pointer_width = "64")]
+pub(super) unsafe fn reserve_untrimmed(size: usize, alignment: usize) -> Result<Alloc, PrimError> {
+    let Some(over) = size.checked_add(alignment) else {
+        return Err(12);
+    };
+    // SAFETY: forwarded contract.
+    let raw = unsafe { mmap_anon(ptr::null_mut(), over, false)? };
+    Ok(Alloc {
+        ptr: align_up(raw as usize, alignment) as *mut u8,
+        is_large: false,
+        is_zero: true,
+    })
+}
+
 pub(super) unsafe fn free(ptr_: *mut u8, size: usize) -> Result<(), PrimError> {
     // SAFETY: caller passes a range from alloc per the prim contract.
     let r = unsafe { libc::munmap(ptr_.cast(), size) };
