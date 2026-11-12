@@ -782,21 +782,32 @@ impl Heap {
         unsafe { self.malloc_generic_walk(bin) }
     }
 
-    /// Park a full page: out of its bin's queue and onto the full queue, with
-    /// its slow-free flag set so the next free of one of its blocks brings it
-    /// back. Inline at both of the walk's uses (see the note at the second).
+    /// Park a full page: out of its bin's queue `q` and onto the full queue
+    /// `full`, with its slow-free flag set so the next free of one of its
+    /// blocks brings it back. Inline at both of the walk's uses (see the note
+    /// at the second).
+    ///
+    /// RAW POINTERS ONLY, and an associated function rather than a method.
+    /// As `park_full(&mut self, q, p)` it was undefined behaviour under
+    /// Stacked Borrows: `q` is derived from the caller's `self`, and the call
+    /// retagged `self` as a fresh, protected `&mut` that writing through `q`
+    /// then invalidated (miri, `heaps_arenas_subprocs_options`, 2026-11-12).
+    /// `&mut self` arguments are `noalias` to LLVM, so this was a latent
+    /// miscompile, not only a model violation. The caller derives both queue
+    /// pointers from its own `self`, as the inline sequence always did.
     ///
     /// # Safety
-    /// `p` is a live page of this heap, a member of `q`, with no free block.
+    /// `p` is a live page of this heap, a member of `q`, with no free block;
+    /// `q` and `full` are queues of the same heap, owned by the caller.
     #[inline(always)]
-    unsafe fn park_full(&mut self, q: *mut PageQueue, p: *mut Page) {
+    unsafe fn park_full(q: *mut PageQueue, full: *mut PageQueue, p: *mut Page) {
         // SAFETY: per contract; owner thread.
         unsafe {
             queue_remove(q, p);
             (*p).flags.fetch_or(pflags::IN_FULL, Ordering::Relaxed);
             crate::page::page_owner_clear(p);
             page_set_flag(p, XFLAG_DELAYED);
-            queue_push_front(&raw mut self.pages[BIN_FULL], p);
+            queue_push_front(full, p);
         }
     }
 
@@ -886,7 +897,7 @@ impl Heap {
             // the loop like any other.
             if !p.is_null() && (*p).free.is_null() && (*p).capacity >= (*p).reserved {
                 let next = (*p).next;
-                self.park_full(q, p);
+                Self::park_full(q, &raw mut self.pages[BIN_FULL], p);
                 p = next;
             }
             while !p.is_null() {
@@ -946,7 +957,7 @@ impl Heap {
                 // an outlining decision whenever the function around it is
                 // restructured; the frequency that justified it is a property
                 // of the enclosing frame, not of this code.
-                self.park_full(q, p);
+                Self::park_full(q, &raw mut self.pages[BIN_FULL], p);
                 p = next;
             }
             // No usable page — carve a fresh one.
