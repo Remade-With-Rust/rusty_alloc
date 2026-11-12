@@ -2068,13 +2068,232 @@ pub unsafe fn realloc_rust(
     unsafe { realloc_live_body(p, newsize) }
 }
 
+/// Whether [`realloc_live_body`] has its leaf: the targets where the local
+/// free is the one-compare form ([`free_body`]) and both of its cold exits
+/// can be `asm!` gotos, so nothing is live across a call.
+const LEAF_MOVE: bool =
+    crate::page::FAST_OWNER && cfg!(all(target_arch = "x86_64", target_os = "linux", not(miri)));
+
 /// The body of [`realloc_live`] and [`realloc_rust`]: one body, two symbols,
 /// because the two callers hold `newsize` in different registers.
+///
+/// **A LEAF for the small move, and that is the point of its shape** (census
+/// 4, vein 4). A move of at most 64 bytes into a block the direct table can
+/// hand over needs no call at all: the pop, the straight-line copy
+/// ([`copy_small`]), the local free. Everything else it might have to do is
+/// a call with the old block, its page and the new block live across it,
+/// which is three callee-saved registers pushed and popped by EVERY realloc,
+/// the in-place return and the 16-byte move included. So each of those is a
+/// tail call to a function with a frame of its own:
+///
+/// - a flagged page (aligned, single-block, huge): [`realloc_flagged`];
+/// - a copy above 64 bytes: [`realloc_move_out`] with `BIG`, which calls
+///   `memcpy`;
+/// - a new size above the direct table, or its page dry:
+///   [`realloc_move_out`] without it;
+/// - the free's two cold outcomes: [`free_moved`]'s own tail calls.
 ///
 /// # Safety
 /// As [`realloc_live`].
 #[inline(always)]
 unsafe fn realloc_live_body(p: ptr::NonNull<u8>, newsize: usize) -> *mut u8 {
+    if !LEAF_MOVE {
+        // SAFETY: forwarded contract.
+        return unsafe { realloc_live_classic(p, newsize) };
+    }
+    let p = p.as_ptr();
+    let seg = segment_of(p);
+    // SAFETY: `p` is a live block of ours (contract), so `seg` is its live
+    // segment and `pg` its page. A plain page's `block_size` is the block's
+    // usable size. `direct` entries are live pages of this thread's heap or
+    // the immortal empty page, as in `malloc`; a non-null pop is a fresh
+    // block of at least `newsize >= copy` bytes, distinct from `p`.
+    unsafe {
+        let pg = page_of(seg, p);
+        let flags = (*pg).flags.load(Ordering::Relaxed);
+        if flags & (pflags::HAS_ALIGNED | pflags::SINGLE_BLOCK | pflags::HUGE_SEGMENT) != 0 {
+            return realloc_flagged(p, newsize);
+        }
+        let usable = (*pg).block_size;
+        // The same two branches and the same copy lengths as the classic
+        // body; see its notes.
+        let copy = if newsize > usable {
+            usable
+        } else if newsize >= usable / 2 {
+            stat_realloc(true);
+            return p;
+        } else {
+            newsize
+        };
+        if copy > 64 {
+            return realloc_move_out::<true>(p, newsize, copy, pg);
+        }
+        if newsize <= SMALL_SIZE_MAX {
+            let hb = init::heap_box_fast();
+            let h = (*hb).heap.get();
+            let np = crate::page::page_pop((*h).direct[crate::types::wsize_from_size(newsize)]);
+            if !np.is_null() {
+                #[cfg(debug_assertions)]
+                {
+                    (*h).stats.allocs += 1;
+                }
+                copy_small(p, np, copy);
+                stat_realloc(false);
+                return free_moved(p, pg, np);
+            }
+        }
+        realloc_move_out::<false>(p, newsize, copy, pg)
+    }
+}
+
+/// [`realloc_live_body`] for a block on a flagged page, whose usable size is
+/// not its page's block size. Out of line: it is the classic body, frame and
+/// all.
+///
+/// # Safety
+/// As [`realloc_live`].
+#[cold]
+#[inline(never)]
+unsafe fn realloc_flagged(p: *mut u8, newsize: usize) -> *mut u8 {
+    // SAFETY: forwarded contract; `p` is live, so non-null.
+    unsafe { realloc_live_classic(ptr::NonNull::new_unchecked(p), newsize) }
+}
+
+/// The move [`realloc_live_body`] could not make as a leaf: allocate through
+/// the whole of `malloc`, copy, free. `BIG` says the copy is above 64 bytes,
+/// so it is `memcpy` without the ladder's question.
+///
+/// # Safety
+/// As [`realloc_move_at`], with `pg == page_of(segment_of(p), p)`.
+#[inline(never)]
+unsafe fn realloc_move_out<const BIG: bool>(
+    p: *mut u8,
+    newsize: usize,
+    copy: usize,
+    pg: *mut Page,
+) -> *mut u8 {
+    let np = malloc_impl::<false, false>(newsize);
+    if np.is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: as `realloc_move_at`.
+    unsafe {
+        if BIG {
+            core::ptr::copy_nonoverlapping(p, np, copy);
+        } else {
+            copy_block(p, np, copy);
+        }
+        free_body::<true, true>(p, segment_of(p), pg);
+        stat_realloc(false);
+    }
+    np
+}
+
+/// Free `p`, the block a realloc just moved out of, and return `np`: the
+/// local free of [`free_body`] and [`free_local_plain`] with both cold
+/// outcomes as TAIL calls that carry `np` through, so the caller keeps
+/// nothing alive across them.
+///
+/// # Safety
+/// `p` is a live block of ours, `pg == page_of(segment_of(p), p)` is a plain
+/// page (no slow-free flag need be assumed: a flagged page's owner word is
+/// 0 and takes the cold arm), and `np` is the value to return.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", not(miri)))]
+#[inline(always)]
+unsafe fn free_moved(p: *mut u8, pg: *mut Page, np: *mut u8) -> *mut u8 {
+    // SAFETY: per contract; the two `asm!` blocks are those of `free_body`
+    // and `free_local_plain`, which document them.
+    unsafe {
+        let owner = (*pg).owner_plain.load(Ordering::Relaxed);
+        core::arch::asm!(
+            "cmp {owner}, fs:0",
+            "jne {slow}",
+            owner = in(reg) owner,
+            slow = label {
+                // SAFETY: forwarded contract.
+                return unsafe { free_slow_ret(p, pg, np) };
+            },
+            options(nostack, readonly),
+        );
+        crate::page::page_link_local(pg, p.cast::<Block>());
+        #[cfg(debug_assertions)]
+        {
+            (*owner_heap(pg)).stats.frees += 1;
+        }
+        core::arch::asm!(
+            "sub dword ptr [{pg} + {off}], 1",
+            "jle {cold}",
+            pg = in(reg) pg,
+            off = const crate::page::USED_OFFSET,
+            cold = label {
+                // SAFETY: `pg` is the live page this free resolved, owned by
+                // this thread (the owner word matched).
+                unsafe {
+                    if ((*pg).used as usize | (*pg).next.addr() | (*pg).prev.addr()) == 0 {
+                        return np;
+                    }
+                    return retire_ret(pg, np);
+                }
+            },
+            options(nostack),
+        );
+        np
+    }
+}
+
+/// [`free_moved`] where the leaf does not exist; never called
+/// ([`LEAF_MOVE`] is false), present so the one body compiles everywhere.
+///
+/// # Safety
+/// As the other definition.
+#[cfg(not(all(target_arch = "x86_64", target_os = "linux", not(miri))))]
+#[inline(always)]
+unsafe fn free_moved(p: *mut u8, pg: *mut Page, np: *mut u8) -> *mut u8 {
+    // SAFETY: forwarded contract.
+    unsafe { free_body::<true, true>(p, segment_of(p), pg) };
+    np
+}
+
+/// [`free_moved`]'s cold arm: not a local free into a plain page.
+///
+/// # Safety
+/// As [`free_slow_known`].
+#[cfg(all(target_arch = "x86_64", target_os = "linux", not(miri)))]
+#[cold]
+#[inline(never)]
+unsafe fn free_slow_ret(p: *mut u8, pg: *mut Page, np: *mut u8) -> *mut u8 {
+    // SAFETY: forwarded contract.
+    unsafe { free_slow_known(p, pg) };
+    // `black_box`, and it is the reason this is a tail call at all. Returned
+    // plainly, LLVM proves the result IS the third argument, rewrites the
+    // caller to use its own copy, and the jump becomes a call with `np`
+    // parked in a callee-saved register: a push and a pop on every realloc,
+    // for the sake of this arm (`realloc_live` 44.9 -> 46.9 Ir per call).
+    core::hint::black_box(np)
+}
+
+/// [`free_moved`]'s other cold arm: the page emptied and has neighbours, or
+/// its count wrapped.
+///
+/// # Safety
+/// As [`retire_or_abort`].
+#[cfg(all(target_arch = "x86_64", target_os = "linux", not(miri)))]
+#[cold]
+#[inline(never)]
+unsafe fn retire_ret(pg: *mut Page, np: *mut u8) -> *mut u8 {
+    // SAFETY: forwarded contract.
+    unsafe { retire_or_abort(pg) };
+    // As `free_slow_ret`: opaque, so the caller's jump stays a jump.
+    core::hint::black_box(np)
+}
+
+/// [`realloc_live_body`] in one framed piece: the only body where the leaf
+/// does not exist ([`LEAF_MOVE`]), and the flagged-page arm where it does.
+///
+/// # Safety
+/// As [`realloc_live`].
+#[inline(always)]
+unsafe fn realloc_live_classic(p: ptr::NonNull<u8>, newsize: usize) -> *mut u8 {
     let p = p.as_ptr();
     // The segment and page are resolved ONCE, here, and handed to the free
     // of a moved block: through `usable_size` and then `free_inline` they
@@ -2183,14 +2402,33 @@ unsafe fn realloc_move_at(
 /// two stores, but everything around it: the call, the size dispatch, the
 /// return. Measured in the real-program gate: lua makes 300,003 reallocs
 /// from a 16-byte block to a 32-byte one (a table's array part getting its
-/// second element), and `memcpy` cost 21.7 instructions for each of them
-/// (callgrind, inclusive per call; census 4, vein 4).
+/// second element), and each paid about 16 instructions for that: 11.5
+/// inside `memcpy` and the call around it (callgrind; census 4, vein 4).
 ///
 /// # Safety
 /// `src` is valid for `n` bytes of reads, `dst` for `n` bytes of writes, and
 /// the two do not overlap.
 #[inline(always)]
 unsafe fn copy_block(src: *const u8, dst: *mut u8, n: usize) {
+    // SAFETY: forwarded contract.
+    unsafe {
+        // The large copy leaves FIRST, in one compare: it is the path that
+        // gains nothing here, so it pays the least for the question.
+        if n <= 64 {
+            copy_small(src, dst, n);
+        } else {
+            core::ptr::copy_nonoverlapping(src, dst, n);
+        }
+    }
+}
+
+/// Copy `n <= 64` bytes without a call or a loop.
+///
+/// # Safety
+/// As [`copy_block`], with `n <= 64`.
+#[inline(always)]
+unsafe fn copy_small(src: *const u8, dst: *mut u8, n: usize) {
+    debug_assert!(n <= 64, "copy_small: the ladder stops at 64 bytes");
     // SAFETY: per contract; every access below lies inside `[0, n)` of its
     // block, and unaligned reads and writes need no more than that.
     unsafe {
@@ -2199,27 +2437,27 @@ unsafe fn copy_block(src: *const u8, dst: *mut u8, n: usize) {
         // first and stored after, the second went through a stack slot: a
         // frame adjustment on every realloc and six moves instead of four
         // (`realloc_live` 46.0 -> 54.0 Ir per call on every path).
-        //
-        // The large copy leaves FIRST, in one compare: it is the path that
-        // gains nothing here, so it pays the least for the question.
-        if n <= 64 {
-            if n > 32 {
-                core::ptr::copy_nonoverlapping(src, dst, 32);
-                core::ptr::copy_nonoverlapping(src.add(n - 32), dst.add(n - 32), 32);
-                return;
-            }
-            if n >= 16 {
-                core::ptr::copy_nonoverlapping(src, dst, 16);
-                core::ptr::copy_nonoverlapping(src.add(n - 16), dst.add(n - 16), 16);
-                return;
-            }
-            if n >= 8 {
-                core::ptr::copy_nonoverlapping(src, dst, 8);
-                core::ptr::copy_nonoverlapping(src.add(n - 8), dst.add(n - 8), 8);
-                return;
-            }
+        if n > 32 {
+            core::ptr::copy_nonoverlapping(src, dst, 32);
+            core::ptr::copy_nonoverlapping(src.add(n - 32), dst.add(n - 32), 32);
+        } else if n >= 16 {
+            core::ptr::copy_nonoverlapping(src, dst, 16);
+            core::ptr::copy_nonoverlapping(src.add(n - 16), dst.add(n - 16), 16);
+        } else if n >= 8 {
+            core::ptr::copy_nonoverlapping(src, dst, 8);
+            core::ptr::copy_nonoverlapping(src.add(n - 8), dst.add(n - 8), 8);
+        } else if n >= 4 {
+            // Below a word only a shrink can ask (a block is at least 8
+            // bytes): the same trick down to nothing, so the leaf has no
+            // call for any length.
+            core::ptr::copy_nonoverlapping(src, dst, 4);
+            core::ptr::copy_nonoverlapping(src.add(n - 4), dst.add(n - 4), 4);
+        } else if n >= 2 {
+            core::ptr::copy_nonoverlapping(src, dst, 2);
+            core::ptr::copy_nonoverlapping(src.add(n - 2), dst.add(n - 2), 2);
+        } else if n == 1 {
+            *dst = *src;
         }
-        core::ptr::copy_nonoverlapping(src, dst, n);
     }
 }
 
