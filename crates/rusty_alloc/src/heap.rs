@@ -1104,7 +1104,14 @@ impl Heap {
                     return Some((p, fresh));
                 }
             }
-            let seg = segment::segment_alloc_for(self.arena_id, slices).ok()?;
+            // A first segment commits what the span needs; a later one a
+            // whole step (see `later_segment_first`).
+            let first = if self.segments.is_null() {
+                slices
+            } else {
+                segment::later_segment_first(slices)
+            };
+            let seg = segment::segment_alloc_for(self.arena_id, first).ok()?;
             #[cfg(ra_shared_light_heap)]
             crate::shared_light::stamp_if_shared(self, seg);
             self.stats.segments += 1;

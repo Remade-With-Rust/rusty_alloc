@@ -204,6 +204,25 @@ pub const LAZY_COMMIT: bool =
 /// max(the carved size, 4 MiB).
 const COMMIT_STEP_MAX_SLICES: usize = (4 << 20) / SEGMENT_SLICE_SIZE;
 
+/// How many slices to commit at the creation of a segment for a heap that
+/// already owns one, when it wants `slices` from it: a whole step.
+///
+/// A segment's commits double from the header, which is right for a heap's
+/// FIRST segment: it may belong to a thread that allocates a hundred bytes.
+/// A heap that is asking for another has just failed to find the span in
+/// every segment it owns, so it has tens of megabytes carved, and its new
+/// segment still crept up from 128 KiB: five more system calls to reach the
+/// step it was always going to take (census 4, vein 10). The bound on
+/// committed-but-uncarved memory is the one the step already states, 4 MiB;
+/// it is only reached sooner.
+pub fn later_segment_first(slices: usize) -> usize {
+    if LAZY_COMMIT {
+        slices.max(COMMIT_STEP_MAX_SLICES - HEADER_SLICES)
+    } else {
+        slices
+    }
+}
+
 /// Slices reserved for the header.
 pub const HEADER_SLICES: usize = 1;
 
