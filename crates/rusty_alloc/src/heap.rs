@@ -255,6 +255,24 @@ const EMPTY_QUEUES: [PageQueue; BIN_COUNT] = {
 };
 
 impl Heap {
+    /// The heap inside the shared empty-heap SENTINEL (`init::EMPTY_HEAP_BOX`),
+    /// which every thread's TLS slot points at until its first allocation.
+    ///
+    /// It is [`Heap::new`] with `deferred_due` SET, and that one bit is how
+    /// the allocation miss recognises it. The miss used to ask two questions
+    /// in a row, "is this the sentinel?" (a compare against the sentinel's
+    /// address) and "is the deferred-free hook due?" (this flag), and both
+    /// are almost always no. The sentinel answering yes to the second makes
+    /// them one test on every slow-path allocation; the cold arm then tells
+    /// the two apart (census 4, vein 7). Nothing ever clears the flag here:
+    /// the sentinel is never written, and every path that fires the hook
+    /// runs on a real heap.
+    pub const fn sentinel() -> Heap {
+        let mut h = Heap::new();
+        h.deferred_due = true;
+        h
+    }
+
     /// Const-init empty heap (static bootstrap: usable before any OS call).
     pub const fn new() -> Heap {
         Heap {

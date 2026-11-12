@@ -122,7 +122,7 @@ pub static EMPTY_HEAP_BOX: EmptyHeapBox = EmptyHeapBox(HeapBox {
     subproc: AtomicUsize::new(0),
     tag: 0,
     allow_destroy: false,
-    heap: UnsafeCell::new(Heap::new()),
+    heap: UnsafeCell::new(Heap::sentinel()),
 });
 
 /// Pointer to the shared empty heap box.

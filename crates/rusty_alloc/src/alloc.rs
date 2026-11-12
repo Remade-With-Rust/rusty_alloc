@@ -571,6 +571,25 @@ unsafe fn malloc_slow_hb_first(hb: *mut init::HeapBox, size: usize) -> *mut u8 {
 /// As [`malloc_slow`].
 #[inline(always)]
 unsafe fn malloc_slow_body(size: usize, hb: *mut init::HeapBox) -> *mut u8 {
+    if SENTINEL_BY_FLAG {
+        // ONE test for the two rare things a miss can find: a thread with
+        // no heap yet (the sentinel, whose flag is permanently set: see
+        // `Heap::sentinel`) and a deferred-free hook that is due. It was a
+        // compare against the sentinel's address and then this flag, two
+        // instructions more on every slow-path allocation, and a medium
+        // allocation takes this path every time (opscan big 90 -> 88).
+        //
+        // SAFETY: a raw one-byte read; `hb` is the TLS box, real or the
+        // immortal sentinel. `&mut Heap` is formed only when the flag is
+        // clear, which the sentinel's never is.
+        unsafe {
+            let h = (*hb).heap.get();
+            if (*h).deferred_due {
+                return malloc_slow_rare(size, hb);
+            }
+            return (*h).malloc_generic(size).0;
+        }
+    }
     if hb != init::empty_heap_box_ptr() {
         // SAFETY: a non-sentinel box is this thread's live, initialised box —
         // exclusive &mut scope on the calling thread's own heap. Straight to
@@ -608,6 +627,25 @@ unsafe fn malloc_slow_body(size: usize, hb: *mut init::HeapBox) -> *mut u8 {
         }
     }
     malloc_first(size)
+}
+
+/// Whether the allocation miss recognises the sentinel by its heap's
+/// `deferred_due` flag. Everywhere: the flag is part of the static.
+const SENTINEL_BY_FLAG: bool = true;
+
+/// The rare half of [`malloc_slow_body`]'s one test: no heap yet, or the
+/// deferred-free hook is due.
+///
+/// # Safety
+/// As [`malloc_slow`].
+#[cold]
+#[inline(never)]
+unsafe fn malloc_slow_rare(size: usize, hb: *mut init::HeapBox) -> *mut u8 {
+    if hb == init::empty_heap_box_ptr() {
+        return malloc_first(size);
+    }
+    // SAFETY: a non-sentinel box is this thread's live, initialised box.
+    unsafe { malloc_slow_deferred((*hb).heap.get(), size) }
 }
 
 /// [`malloc_slow`] when the heartbeat marked the deferred-free hook due: fire
