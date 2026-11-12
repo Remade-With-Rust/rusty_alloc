@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.0](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.4.0...rusty_alloc-v2.5.0) - 2026-11-12
+
 ### Changed
 
 - **Census 4: thirty measured instruction wins across ten veins, three
