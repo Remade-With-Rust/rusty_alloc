@@ -853,6 +853,17 @@ pub fn malloc_aligned(size: usize, align: usize) -> *mut u8 {
     malloc_aligned_at(size, align, 0)
 }
 
+/// [`malloc_aligned`] with its arguments in C's order, `(align, size)`: the
+/// entry for `aligned_alloc` and `memalign`.
+///
+/// Through `malloc_aligned(size, align)` those exports opened by swapping
+/// their two argument registers, three moves, and then jumped: the same
+/// defect as `malloc`'s miss (census 4, vein 3), on the other side of the
+/// call. Here the body is compiled for the registers the values arrive in.
+pub fn malloc_aligned_c(align: usize, size: usize) -> *mut u8 {
+    aligned_at_impl::<false>(size, align, 0)
+}
+
 /// `mi_malloc_aligned_at(size, alignment, offset)`: returns `p` with
 /// `(p + offset) % alignment == 0`.
 // NOTE (2026-08-21): marking this and `malloc_aligned` `#[inline]` — so the

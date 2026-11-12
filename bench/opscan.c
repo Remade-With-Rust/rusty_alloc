@@ -147,6 +147,16 @@ static void op_aligned(size_t align, size_t n, long iters) {
     }
 }
 
+/* The same pair through C11 `aligned_alloc`, whose arguments are
+ * (alignment, size): the other order from every internal entry. */
+static void op_aligned_alloc_pair(size_t align, size_t n, long iters) {
+    for (long i = 0; i < iters; i++) {
+        void *p = aligned_alloc(align, n);
+        sink = p;
+        free(p);
+    }
+}
+
 static void op_usable(size_t n, long iters) {
     void *p = malloc(n);
     size_t acc = 0;
@@ -365,6 +375,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(op, "realloc"))     op_realloc_grow(n);
     else if (!strcmp(op, "realloc_small")) op_realloc_small(n);
     else if (!strcmp(op, "aligned"))     op_aligned(64, 256, n);
+    else if (!strcmp(op, "aligned_alloc")) op_aligned_alloc_pair(64, 256, n);
     else if (!strcmp(op, "usable"))      op_usable(256, n);
     else if (!strcmp(op, "mixed"))       op_mixed(n);
     else if (!strcmp(op, "liveset"))     op_liveset(n);
