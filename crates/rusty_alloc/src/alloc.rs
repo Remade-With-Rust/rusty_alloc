@@ -1321,14 +1321,24 @@ unsafe fn free_body<const OWNER_FIRST: bool, const KNOWN_PAGE: bool>(
                 owner = in(reg) owner,
                 slow = label {
                     // SAFETY: forwarded contract; `pg` is `p`'s page.
-                    unsafe { free_slow(p, seg, pg) };
+                    unsafe {
+                        if KNOWN_PAGE {
+                            free_slow_known(p, pg)
+                        } else {
+                            free_slow(p, seg, pg)
+                        }
+                    };
                     return;
                 },
                 options(nostack, readonly),
             );
             #[cfg(not(all(target_arch = "x86_64", target_os = "linux", not(miri))))]
             if owner != init::thread_id() {
-                return free_slow(p, seg, pg);
+                return if KNOWN_PAGE {
+                    free_slow_known(p, pg)
+                } else {
+                    free_slow(p, seg, pg)
+                };
             }
             debug_assert_eq!(
                 (*pg).flags.load(Ordering::Relaxed) & pflags::SLOW_FREE,
@@ -1356,6 +1366,30 @@ unsafe fn free_body<const OWNER_FIRST: bool, const KNOWN_PAGE: bool>(
 unsafe fn free_slow(p: *mut u8, seg: *mut Segment, pg: *mut Page) {
     // SAFETY: forwarded contract.
     unsafe { free_body_classic::<true, true>(p, seg, pg) }
+}
+
+/// [`free_slow`] for the caller that resolved the page long ago (a moving
+/// `realloc`): it takes the block and its page and RECOMPUTES the segment.
+///
+/// Handed the segment, that caller had to keep it alive up to this call, and
+/// the local fast path no longer reads it: a callee-saved register held
+/// across the `memcpy` for the sake of this arm alone — a push, a pop, a
+/// copy, and on the Rust entry the stack-alignment pair an even count of
+/// pushes brings with it. 52.1 -> 48.1 Ir per Rust realloc (census 4,
+/// vein 5).
+///
+/// A second symbol, not a change to [`free_slow`], and that is measured:
+/// with ONE arm recomputing for everybody, `free`'s own cold arm — which
+/// has the segment in a register already — paid for it. Opscan xthread
+/// +3.00 Ir/op, huge +8.00, perl +1,831 allocator Ir.
+///
+/// # Safety
+/// As [`free_body_classic`], with `pg == page_of(segment_of(p), p)`.
+#[cold]
+#[inline(never)]
+unsafe fn free_slow_known(p: *mut u8, pg: *mut Page) {
+    // SAFETY: forwarded contract.
+    unsafe { free_slow(p, segment_of(p), pg) }
 }
 
 /// The tail of a local free into a plain page: push, decrement, and the one
