@@ -153,6 +153,28 @@ the ordinary size classes, which are already 16-aligned, instead of the
 aligned path; and `realloc` at any alignment keeps a block in place when it
 fits instead of always copying.
 
+**One more instruction, if the allocator is linked into an executable.** On
+x86-64 Linux, add `--cfg ra_tls_local_exec` to `RUSTFLAGS` for a binary that
+declares `#[global_allocator]`:
+
+```sh
+RUSTFLAGS="--cfg ra_tls_local_exec" cargo build --release
+```
+
+Every allocation finds its thread's heap through a thread-local slot. A
+library has to reach it in two instructions, because the slot's offset is
+only known when the program is loaded. In an executable the linker knows it,
+and the load takes it as its own displacement: one instruction. Measured on
+the workloads above, same checksums: boxed trees **−220,144** whole-program
+(−1.24 %), hash maps −29,141, aligned buffers −3,684; `__rust_alloc` 16 → 15
+instructions per call.
+
+It is a `--cfg` and not a default because the same code cannot be linked into
+a shared library: set it on a `cdylib` (the `LD_PRELOAD` override, a plugin)
+and the link fails with `relocation R_X86_64_TPOFF32 ... cannot be used with
+-shared`. That is the whole failure mode. It is a link error, never a wrong
+program.
+
 **Checked on real consumers, not just counted.** On 2026-09-25 SpaceDB (whole
 workspace, 314 tests) and rusty_zstd (194 tests plus C-zstd cross tests) ran
 on this allocator on Windows and Linux, and the Silesia corpus went through

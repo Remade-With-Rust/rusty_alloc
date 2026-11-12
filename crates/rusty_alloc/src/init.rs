@@ -309,17 +309,45 @@ mod heap_tls {
     /// segment-relative load, so the explicit `fs:0` read and the add both
     /// disappear. Measured at 4.00 Ir per malloc before this change — a
     /// quarter of our entire malloc-side deficit spent just locating the heap.
+    ///
+    /// **ONE, with `--cfg ra_tls_local_exec`** (census 4, vein 7). The two
+    /// above are the initial-exec model: the slot's offset from the thread
+    /// pointer is a load-time constant the loader writes into the GOT, so it
+    /// has to be fetched. In an EXECUTABLE that offset is a link-time
+    /// constant (local-exec), and x86 takes it as the displacement of the
+    /// load itself: `mov reg, fs:[sym@TPOFF]`. A static linker already
+    /// relaxes the GOT load into `mov reg, imm`, but it cannot merge two
+    /// instructions into one, which is why a Rust binary with this allocator
+    /// linked in still paid two.
+    ///
+    /// Opt-in, and it cannot be otherwise: that relocation
+    /// (`R_X86_64_TPOFF32`) does not link into a shared object, and a library
+    /// cannot see what it will be linked into. Set it for a binary that links
+    /// `rusty_alloc` statically (`#[global_allocator]` in an executable);
+    /// never for the LD_PRELOAD override or any `cdylib`. Getting it wrong is
+    /// a link error, not a miscompile.
     #[inline(always)]
     pub fn get() -> *mut HeapBox {
         let v: *mut HeapBox;
         // SAFETY: reads the GOT entry the loader relocated at startup, then
         // loads 8 aligned bytes of this thread's own TLS block through the fs
         // segment. Both are reads; nothing is written.
+        #[cfg(not(ra_tls_local_exec))]
         unsafe {
             core::arch::asm!(
                 "mov {t}, qword ptr [rip + __ra_tls_heap@GOTTPOFF]",
                 "mov {o}, qword ptr fs:[{t}]",
                 t = out(reg) _,
+                o = out(reg) v,
+                options(nostack, preserves_flags, readonly),
+            );
+        }
+        // SAFETY: loads 8 aligned bytes of this thread's own TLS block
+        // through the fs segment, at the offset the static linker resolved.
+        #[cfg(ra_tls_local_exec)]
+        unsafe {
+            core::arch::asm!(
+                "mov {o}, qword ptr fs:[__ra_tls_heap@TPOFF]",
                 o = out(reg) v,
                 options(nostack, preserves_flags, readonly),
             );
