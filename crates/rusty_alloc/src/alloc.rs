@@ -243,7 +243,7 @@ fn stat_realloc(in_place: bool) {
 /// 1.00 Ir per call on the entry line; perl 608,388 of them).
 #[inline]
 pub fn malloc(size: usize) -> *mut u8 {
-    malloc_impl::<true>(size)
+    malloc_impl::<true, true>(size)
 }
 
 /// [`malloc`], with the miss's argument order chosen by the caller:
@@ -252,7 +252,7 @@ pub fn malloc(size: usize) -> *mut u8 {
 /// whose slow trips each paid three register moves under the other order:
 /// lua +12,174 Ir over 4,151 trips).
 #[inline(always)]
-fn malloc_impl<const SIZE_FIRST: bool>(size: usize) -> *mut u8 {
+fn malloc_impl<const SIZE_FIRST: bool, const DRY: bool>(size: usize) -> *mut u8 {
     let hb = init::heap_box_fast();
     // SAFETY: raw reads only — `hb` may be the shared immortal sentinel (see
     // `heap_box_fast`), which must never see a `&mut` or a write. `direct`
@@ -274,12 +274,134 @@ fn malloc_impl<const SIZE_FIRST: bool>(size: usize) -> *mut u8 {
                 }
                 return b;
             }
+            // The miss knows WHY it missed, and says so: a dry list and a
+            // non-small size go to different cold symbols, at no cost here
+            // (each was a jump to a stub already). The dry one gets the page
+            // it just looked at.
+            //
+            // `DRY` is false at ONE site, the allocation inside a moving
+            // `realloc`, and that is measured: there the miss is a real call
+            // with the copy length live across it, in the register the page
+            // would have to travel in, and LLVM answered by giving the whole
+            // function a fourth callee-saved register again —
+            // `realloc_live` 46.0 -> 50.0 Ir on EVERY call (lua +1,165,302
+            // allocator Ir) to save 45 on 1,179 of them.
+            if DRY {
+                return if SIZE_FIRST {
+                    malloc_dry(size, hb, p)
+                } else {
+                    malloc_dry_hb_first(hb, size, p)
+                };
+            }
         }
         if SIZE_FIRST {
             malloc_slow(size, hb)
         } else {
             malloc_slow_hb_first(hb, size)
         }
+    }
+}
+
+/// `malloc`'s small miss: the direct page's `free` list is dry.
+///
+/// **The swap trip.** A page's blocks come back on `local_free`, and the next
+/// allocation that finds `free` dry moves that list over and carries on. That
+/// is the commonest reason a real program leaves the fast path at all —
+/// perl: 6,175 of its slow trips did nothing else; sqlite: 2,478 of 2,729 —
+/// and it went the whole way round: the generic path's entry, the heartbeat,
+/// the bin, the queue front, the collect, the direct-table check. 63 to 72
+/// instructions to move one pointer (callgrind, census 4, vein 6).
+///
+/// Here it is the move and the pop, when the heartbeat has nothing to do:
+///
+/// - no cross-thread free is waiting on the heap's delayed list (the
+///   heartbeat's first duty — the same peek it makes);
+/// - no deferred-free hook is registered (its second);
+/// - the periodic-collect countdown has not run out. It is DECREMENTED here,
+///   so the sweep comes round after exactly as many slow trips as before;
+/// - guarded sampling is off, since the generic path is where a sample is
+///   taken.
+///
+/// Otherwise, and whenever `local_free` is empty too, this is `malloc_slow`
+/// — by a JUMP to it, not a copy of it. Inlined here, the generic call stopped
+/// being a tail call (its pair return, narrowed to the pointer, no longer met
+/// a lone `ret`), and a dry trip with nothing to swap paid 14 instructions
+/// where `malloc_slow` pays 8; behind the jump it pays 4 more than before
+/// the split, which is the price of asking (perl: 1,226 such trips).
+/// The page's cross-thread list is not collected by the swap; it is the next
+/// time both lists are dry, which the generic path still handles. With no
+/// other thread freeing into the page the blocks come out in the same order
+/// as before, so a single-threaded program's addresses do not change.
+///
+/// # Safety
+/// As [`malloc_slow`], with `pg` the page `hb`'s direct table holds for
+/// `size`, its `free` list empty.
+#[cold]
+#[inline(never)]
+unsafe fn malloc_dry(size: usize, hb: *mut init::HeapBox, pg: *mut Page) -> *mut u8 {
+    // SAFETY: forwarded contract.
+    unsafe {
+        if let Some(b) = swap_trip(hb, pg) {
+            return b;
+        }
+        malloc_slow(size, hb)
+    }
+}
+
+/// [`malloc_dry`] for a caller holding `size` in the SECOND argument
+/// register (see [`malloc_slow_hb_first`]).
+///
+/// # Safety
+/// As [`malloc_dry`].
+#[cold]
+#[inline(never)]
+unsafe fn malloc_dry_hb_first(hb: *mut init::HeapBox, size: usize, pg: *mut Page) -> *mut u8 {
+    // SAFETY: forwarded contract.
+    unsafe {
+        if let Some(b) = swap_trip(hb, pg) {
+            return b;
+        }
+        malloc_slow_hb_first(hb, size)
+    }
+}
+
+/// The swap itself: `Some(block)` when `pg` had frees to hand back and the
+/// heartbeat had nothing to do, `None` for the generic path.
+///
+/// # Safety
+/// As [`malloc_dry`].
+#[inline(always)]
+unsafe fn swap_trip(hb: *mut init::HeapBox, pg: *mut Page) -> Option<*mut u8> {
+    // SAFETY: `pg` is a live page of this thread's heap or the immortal
+    // empty-page sentinel. The sentinel is never freed into, so a non-null
+    // `local_free` proves `pg` is a real page and `hb` this thread's real,
+    // initialised box; every write below is behind that test.
+    unsafe {
+        let lf = (*pg).local_free;
+        if lf.is_null() {
+            return None;
+        }
+        let h = (*hb).heap.get();
+        let quiet = (crate::ONE_THREAD || (*hb).delayed.head.load(Ordering::Acquire) == 0)
+            && !(crate::GUARD_PAGES && (*h).guarded_rate != 0)
+            && !crate::options::deferred_registered();
+        if !quiet {
+            return None;
+        }
+        // One decrement whose wrap means "it was zero" (as the generic
+        // path's own): a wrap puts the zero back and leaves the trip, and
+        // the sweep, to the generic path.
+        let left = (*h).generic_countdown.wrapping_sub(1);
+        (*h).generic_countdown = left;
+        if left == usize::MAX {
+            (*h).generic_countdown = 0;
+            return None;
+        }
+        #[cfg(debug_assertions)]
+        {
+            (*h).stats.allocs += 1;
+        }
+        Some(crate::page::page_swap_pop(pg, lf))
     }
 }
 
@@ -1844,7 +1966,7 @@ unsafe fn usable_size_slow(pg: *mut Page, p: *const u8, flags: u8) -> usize {
 #[inline]
 pub unsafe fn realloc(p: *mut u8, newsize: usize) -> *mut u8 {
     if p.is_null() {
-        return malloc_impl::<false>(newsize);
+        return malloc_impl::<false, true>(newsize);
     }
     // SAFETY: forwarded contract; `p` is non-null here.
     unsafe { realloc_live(ptr::NonNull::new_unchecked(p), newsize) }
@@ -1977,7 +2099,7 @@ unsafe fn realloc_move_at(
     seg: *mut Segment,
     pg: *mut Page,
 ) -> *mut u8 {
-    let np = malloc_impl::<false>(newsize);
+    let np = malloc_impl::<false, false>(newsize);
     if np.is_null() {
         return ptr::null_mut();
     }

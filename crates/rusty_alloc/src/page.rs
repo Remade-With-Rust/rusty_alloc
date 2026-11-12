@@ -625,6 +625,39 @@ pub const fn empty_page_ptr() -> *mut Page {
     (&raw const EMPTY_PAGE.0).cast_mut()
 }
 
+/// The swap trip in one step: `block`, the head of `page`'s `local_free`,
+/// is handed out and the rest of that list becomes `free`.
+///
+/// What `page_collect` and then [`page_pop`] do to a dry page with local
+/// frees, without storing the head into `free` only to load it back.
+///
+/// # Safety
+/// `page` is a live page owned by the calling thread, its `free` list is
+/// empty, and `block` is its non-null `local_free`.
+#[inline]
+pub unsafe fn page_swap_pop(page: *mut Page, block: *mut Block) -> *mut u8 {
+    // SAFETY: caller already holds a valid page pointer (see fn contract).
+    unsafe { debug_validate_page(page, "page_swap_pop") };
+    // SAFETY: owner-only fields; `block` heads a list of this page's free
+    // blocks, so its first word is the next link. The order is `page_pop`'s:
+    // the transition check before the link is read.
+    unsafe {
+        debug_assert!((*page).free.is_null(), "page_swap_pop: `free` is not dry");
+        debug_assert!(
+            !block.is_null() && block == (*page).local_free,
+            "page_swap_pop: not the local list's head"
+        );
+        (*page).local_free = ptr::null_mut();
+        // Recycled blocks are not zero.
+        (*page).free_is_zero = false;
+        #[cfg(feature = "blockmap")]
+        blockmap_transition(page, block.cast(), true);
+        (*page).free = block_next(page, block);
+        (*page).used += 1;
+    }
+    block.cast()
+}
+
 /// Pop a block off the fast list. Returns null when dry (→ generic path).
 ///
 /// # Safety
