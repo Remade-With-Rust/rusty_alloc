@@ -740,6 +740,17 @@ fn create_heap_uninstalled(tag: i32, allow_destroy: bool, arena_id: i32) -> *mut
         (*(*hb).heap.get()).delayed = &raw const (*hb).delayed;
         (*(*hb).heap.get()).arena_id = arena_id;
         (*(*hb).heap.get()).tag = tag;
+        // A NEW HEAP HAS NOTHING TO COLLECT, so its periodic-collect
+        // countdown starts full. `Heap::new` is `const` and leaves it 0,
+        // and the generic path reads 0 as "the count ran out": every heap's
+        // FIRST slow-path allocation swept all of its (empty) page queues
+        // and asked the arena, by the clock, whether a purge was due. 570
+        // instructions and a `clock_gettime` at every thread's first
+        // allocation and every process's start (census 4, vein 10; the
+        // short-lived-threads workload made 201 of those sweeps for 200
+        // threads).
+        (*(*hb).heap.get()).generic_countdown =
+            crate::options::get_clamp(crate::options::GENERIC_COLLECT, 1, 1_000_000) as usize;
         // Per-heap CSPRNG stream (free-list keys, guarded sampling) -- seeded
         // only where something draws from it. A build with neither `secure`
         // nor guard pages has no consumer, and seeding still cost the ChaCha
