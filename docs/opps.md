@@ -637,6 +637,56 @@ Totals against 2.4.0 (`9831347`), outputs identical:
 | 9. span re-marking | one record (no `slice_offset`), paired fill, held slot pointers | lua `span_free` 522 -> 196 Ir |
 | 10. commit calls (syscalls) | creation commit covers the first span, later segments start a step in, arena not trimmed | lua 28 -> 21 commits; munmap 3 -> 1 |
 
+### The ledger: three wins per vein, each in instructions
+
+Every figure is a deterministic instruction count: an entry point's
+instruction count from the disassembly, Ir per call from the function
+census, Ir per operation from opscan's two-point estimator, or the allocator
+object's self Ir on a real program. Each is the change made by that commit
+alone, measured against the commit before it.
+
+| vein | win | commit | measured |
+|---|---|---|---|
+| 1 | `free` / `operator delete` | `dbb0b7b` | 21 -> 18 instructions |
+| 1 | `__rust_dealloc` | `dbb0b7b` | 19 -> 16 instructions |
+| 1 | the free inlined in `realloc` | `dbb0b7b` | opscan realloc 226.99 -> 217.99 Ir/op |
+| 2 | `free`'s page resolution | `55cf589` | 18 -> 17 instructions; perl 21,882,785 -> 21,279,990 |
+| 2 | `realloc`'s three resolutions | `55cf589` | opscan realloc 217.99 -> 214.99 |
+| 2 | cross-thread and span frees | `55cf589` | xthread 74.83 -> 73.82, huge 148 -> 147, big 91 -> 90 |
+| 3 | `malloc` / `operator new` entry | `94058fd` | 15 -> 14 instructions; perl 24,269,734 -> 23,670,241 |
+| 3 | `__rust_alloc` entry | `94058fd` | 18 -> 16 instructions; rust-maps -32,903 |
+| 3 | `realloc`'s allocations | `94058fd` | opscan realloc 227.97 -> 226.99 |
+| 4 | straight-line copy to 64 bytes | `223c66c` | realloc_small 327.19 -> 315.19 Ir/op |
+| 4 | the small move is a leaf | `d51ef9a` | lua 50,017,235 -> 48,246,145; realloc_small 315.19 -> 292.47 |
+| 4 | over-aligned in-place, frameless | `609a60b` | rust-overaligned 1,535,412 -> 1,513,859 |
+| 5 | Rust realloc entry | `832c3ed` | `__rust_realloc` 8.0 -> 5.0 Ir per call |
+| 5 | cold free arm recomputes the segment | `e9f8e3a` | `realloc_rust` 52.1 -> 48.1 Ir per call |
+| 5 | one move tail | `d764c80` | `realloc_live` 50.0 -> 46.0; lua 49,166,702 -> 47,966,208 |
+| 6 | `malloc`'s swap trip | `1f3d34a` | sqlite 3,989,736 -> 3,903,848; med 51.07 -> 48.07 |
+| 6 | `calloc`'s swap trip | `85f74e3` | opscan calloc 89.01 -> 84.01 |
+| 6 | `operator new`'s swap trip | `ad82133` | opscan new_batch 44.31 -> 43.45 |
+| 7 | `__rust_alloc` (cfg on) | `2752680` | 16.0 -> 15.0 Ir per call; rust-trees -220,144 |
+| 7 | `alloc_natural` (cfg on) | `2752680` | 17.9 -> 16.9 Ir per call |
+| 7 | realloc and aligned paths (cfg on) | `2752680` | `realloc_rust` 29.5 -> 29.1; rust-overaligned -3,684 |
+| 8 | paired-link carve | `bec6ebe` | perl 21,284,114 -> 20,714,157; lua 48,246,247 -> 47,427,722 |
+| 8 | front page not asked twice | `b058cec` | walk 303.5 -> 297.1 Ir per call; perl -4,637 |
+| 8 | sixteen a pass for long runs | `8d39963` | perl -54,105; lua -83,764 |
+| 9 | one owner record | `e4d6d2b` | lua 47,339,680 -> 47,171,329; `span_free` 521.7 -> 246.3 |
+| 9 | paired fill | `2e9b579` | lua -28,792; `span_free` 246.3 -> 200.0 |
+| 9 | held slot pointers | `abce1b6` | perl -2,092; lua -3,434; `span_free` 200.0 -> 196.1 |
+| 10 | creation commit covers the first span | `4ebd432` | -62 Ir per segment: perl -124, sqlite -62, python -62 |
+| 10 | later segments start a step in | `e2efb01` | perl -72, lua -554 (one-segment programs +2) |
+| 10 | arena not trimmed | `afb35e2` | -66 Ir per process: perl, sqlite, python, a ten-block program |
+
+Veins 1, 2, 3 and 7 are one commit each: one mechanism, three entry points
+or paths measured separately. Vein 10's instruction counts are small
+because its real unit is the system call (lua 28 -> 21 commits, every
+process 3 -> 1 `munmap`); the instructions above are the userspace cost of
+the calls that no longer happen, counted in the allocator object alone.
+The second vein 10 change costs a one-segment program two instructions
+(the test for an existing segment) and is a win only where a second
+segment is created.
+
 ### Refuted in census 4 (each recorded where the code is)
 
 - **Routing a foreign non-zero owner word straight to `remote_free`**:
