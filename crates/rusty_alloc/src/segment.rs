@@ -159,6 +159,27 @@ unsafe fn owner_entry(seg: *mut Segment, start: usize) -> OwnerEntry {
     }
 }
 
+/// [`owner_entry`] for a caller that holds the span's first slot: the slot
+/// pointer is the entry (or, for the one build with `u32` entries, the
+/// index still gives the offset).
+///
+/// # Safety
+/// `head` is slot `start` of `seg`.
+#[inline(always)]
+unsafe fn head_entry(seg: *mut Segment, head: *mut Page, start: usize) -> OwnerEntry {
+    #[cfg(not(all(feature = "secure", feature = "blockmap")))]
+    {
+        let _ = (seg, start);
+        head
+    }
+    #[cfg(all(feature = "secure", feature = "blockmap"))]
+    // SAFETY: forwarded contract.
+    unsafe {
+        let _ = head;
+        owner_entry(seg, start)
+    }
+}
+
 /// The page an owner-table entry of `seg` names.
 ///
 /// # Safety
@@ -866,7 +887,12 @@ unsafe fn span_mark(seg: *mut Segment, head: *mut Page, idx: usize, len: usize, 
         // walks it constantly.
         // Every slice of this span resolves to the span's own slot, so the
         // table entry is one constant written across the run.
-        let owner = owner_entry(seg, idx);
+        //
+        // And with pointer entries that constant is `head` itself, which
+        // the caller handed in: `owner_entry` rebuilt the same address from
+        // the index, a multiply by `size_of::<Page>()` and an add, at every
+        // span carved and every span freed (census 4, vein 2).
+        let owner = head_entry(seg, head, idx);
         let tab: *mut OwnerEntry = (&raw mut (*seg).page_off).cast();
         *tab.wrapping_add(idx) = owner;
         // NOTE (2026-09-24, REFUTED): splitting the owner-table stores into

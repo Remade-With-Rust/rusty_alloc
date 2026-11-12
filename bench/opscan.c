@@ -367,6 +367,8 @@ int main(int argc, char **argv) {
     else if (!strcmp(op, "big"))         op_pair(4096, n);
     else if (!strcmp(op, "large"))       op_pair(65536, n);
     else if (!strcmp(op, "huge"))        op_pair(2 * 1024 * 1024, n);
+    /* Above one segment: a dedicated huge segment per allocation. */
+    else if (!strcmp(op, "giant"))       op_pair(48 * 1024 * 1024, n);
     else if (!strcmp(op, "calloc"))      op_calloc(256, n);
     else if (!strcmp(op, "batch_lifo"))  op_batch(64, n, 1);
     else if (!strcmp(op, "batch_fifo"))  op_batch(64, n, 0);
