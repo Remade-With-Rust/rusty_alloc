@@ -1230,9 +1230,11 @@ unsafe fn link_run(
 /// is where a real program's slow path spends its instructions: 1.6M of
 /// perl's 21.3M allocator Ir, 2.6M of lua's 48.2M.
 ///
-/// The count's low three bits are linked first, one block at a time; the
-/// last block is written once more at the end, with `tail`. The list is the
-/// same list the scalar loop builds, so no address a program sees changes.
+/// A run of 64 blocks or more first takes sixteen a pass (1.75 each; see
+/// the body). The count's low three bits are linked one block at a time;
+/// the last block is written once more at the end, with `tail`. The list is
+/// the same list the scalar loop builds, so no address a program sees
+/// changes.
 ///
 /// Not under `secure` (links are encoded per page, one at a time) nor miri
 /// (the links are stored as integers here).
@@ -1254,14 +1256,72 @@ unsafe fn link_run(
     // the `n` blocks. SSE2 is part of the x86-64 baseline.
     unsafe {
         let mut p = start;
-        let mut r = n & 7;
+        let mut left = n;
+        // A LONG run first takes sixteen blocks a pass: the second eight go
+        // through a second base register, and the advance and the test are
+        // shared by twice as many (28 instructions per 16 blocks, 1.75
+        // each, against 1.875).
+        //
+        // Only from 64 blocks up, and that is measured. Taken by every run,
+        // with the count's low bits as straight-line stages in front of it,
+        // the same loop cost a 16-block carve more in stage tests than it
+        // saved: perl -53,587 and lua -84,869 allocator Ir, but sqlite
+        // +2,168 and python +218 (`grow_front` 78.2 -> 89.0 Ir per call on
+        // sqlite's short runs). Gated, a short run pays one compare.
+        if n >= 64 {
+            let v = _mm_set_epi64x(p.add(2 * bsize).addr() as i64, p.add(bsize).addr() as i64);
+            let step = _mm_set1_epi64x((2 * bsize) as i64);
+            core::arch::asm!(
+                "2:",
+                "lea {q}, [{p} + {bs}*8]",
+                "movq qword ptr [{p}], {v}",
+                "movhps qword ptr [{p} + {bs}], {v}",
+                "paddq {v}, {step}",
+                "movq qword ptr [{p} + {bs}*2], {v}",
+                "movhps qword ptr [{p} + {b3}], {v}",
+                "paddq {v}, {step}",
+                "movq qword ptr [{p} + {bs}*4], {v}",
+                "movhps qword ptr [{p} + {b5}], {v}",
+                "paddq {v}, {step}",
+                "movq qword ptr [{p} + {b3}*2], {v}",
+                "movhps qword ptr [{p} + {b7}], {v}",
+                "paddq {v}, {step}",
+                "movq qword ptr [{q}], {v}",
+                "movhps qword ptr [{q} + {bs}], {v}",
+                "paddq {v}, {step}",
+                "movq qword ptr [{q} + {bs}*2], {v}",
+                "movhps qword ptr [{q} + {b3}], {v}",
+                "paddq {v}, {step}",
+                "movq qword ptr [{q} + {bs}*4], {v}",
+                "movhps qword ptr [{q} + {b5}], {v}",
+                "paddq {v}, {step}",
+                "movq qword ptr [{q} + {b3}*2], {v}",
+                "movhps qword ptr [{q} + {b7}], {v}",
+                "paddq {v}, {step}",
+                "lea {p}, [{q} + {bs}*8]",
+                "dec {g}",
+                "jnz 2b",
+                p = inout(reg) p,
+                q = out(reg) _,
+                bs = in(reg) bsize,
+                b3 = in(reg) 3 * bsize,
+                b5 = in(reg) 5 * bsize,
+                b7 = in(reg) 7 * bsize,
+                g = inout(reg) n >> 4 => _,
+                v = inout(xmm_reg) v => _,
+                step = in(xmm_reg) step,
+                options(nostack),
+            );
+            left = n & 15;
+        }
+        let mut r = left & 7;
         while r > 0 {
             let next = p.add(bsize);
             p.cast::<*mut u8>().write(next);
             p = next;
             r -= 1;
         }
-        let groups = n >> 3;
+        let groups = left >> 3;
         if groups != 0 {
             let v = _mm_set_epi64x(p.add(2 * bsize).addr() as i64, p.add(bsize).addr() as i64);
             let step = _mm_set1_epi64x((2 * bsize) as i64);
@@ -1305,7 +1365,27 @@ unsafe fn link_run(
 /// # Safety
 /// `page` owned by the calling thread; `area` must be the page's payload
 /// start, valid committed memory of `reserved * block_size` bytes.
+#[inline(never)]
 pub unsafe fn page_extend(page: *mut Page, area: *mut u8) {
+    // SAFETY: forwarded contract.
+    unsafe { page_extend_inline(page, area) }
+}
+
+/// The body of [`page_extend`], for the one caller that wants it in line.
+///
+/// Two names for one body, because the callers disagree. `grow_front` is
+/// where a program's carving happens (perl: 2,029 calls linking ~290 blocks
+/// each) and wants the loop in its own frame. The walk reaches a carve on a
+/// fraction of its trips, twice in its source, and as two inlined copies
+/// they were most of that function's text. LLVM used to inline all three and
+/// stopped inlining ANY once the long-run loop was added (`link_run`), which
+/// cost every carve a call: sqlite +3,052 allocator Ir, where the loop
+/// gained it nothing.
+///
+/// # Safety
+/// As [`page_extend`].
+#[inline(always)]
+pub unsafe fn page_extend_inline(page: *mut Page, area: *mut u8) {
     // SAFETY: caller already holds a valid page pointer (see fn contract).
     unsafe { debug_validate_page(page, "page_extend") };
     // SAFETY: heap lock held; arithmetic stays inside the page area by the

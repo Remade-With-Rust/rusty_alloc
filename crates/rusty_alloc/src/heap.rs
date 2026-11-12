@@ -819,7 +819,7 @@ impl Heap {
     unsafe fn grow_front(&mut self, bin: usize, w: usize, p: *mut Page) -> (*mut u8, u8) {
         // SAFETY: forwarded contract.
         unsafe {
-            page_extend(p, (*p).area);
+            crate::page::page_extend_inline(p, (*p).area);
             self.stats.extends += 1;
             if (*p).free.is_null() {
                 return self.malloc_generic_walk(bin);
