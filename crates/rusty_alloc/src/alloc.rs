@@ -807,6 +807,31 @@ unsafe fn zalloc_dry(hb: *mut init::HeapBox, size: usize, pg: *mut Page) -> *mut
 // just computed, not an incoming register, and `size` first measured
 // +1.06 Ir per calloc.)
 unsafe fn zalloc_slow(hb: *mut init::HeapBox, size: usize) -> *mut u8 {
+    // The one test of `malloc_slow_body`: the sentinel's heap has the
+    // deferred-hook flag permanently set (`Heap::sentinel`), so "no heap
+    // yet" and "the hook is due" are one read, and both leave. With the
+    // hook's call gone from this body, nothing is live across a call and
+    // the common miss is a tail call into the heap (census 4, vein 7).
+    //
+    // SAFETY: a raw one-byte read of the TLS box's heap, real or sentinel;
+    // `&mut Heap` is formed only when the flag is clear.
+    unsafe {
+        let h = (*hb).heap.get();
+        if (*h).deferred_due {
+            return zalloc_slow_rare(hb, size);
+        }
+        (*h).zalloc(size)
+    }
+}
+
+/// The rare half of [`zalloc_slow`]: no heap yet, or the deferred-free hook
+/// is due.
+///
+/// # Safety
+/// As [`zalloc_slow`].
+#[cold]
+#[inline(never)]
+unsafe fn zalloc_slow_rare(hb: *mut init::HeapBox, size: usize) -> *mut u8 {
     if hb == init::empty_heap_box_ptr() {
         return zalloc_first(size);
     }

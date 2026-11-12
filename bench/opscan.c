@@ -370,6 +370,8 @@ int main(int argc, char **argv) {
     /* Above one segment: a dedicated huge segment per allocation. */
     else if (!strcmp(op, "giant"))       op_pair(48 * 1024 * 1024, n);
     else if (!strcmp(op, "calloc"))      op_calloc(256, n);
+    /* A medium zeroed block: above the direct table, so every call misses. */
+    else if (!strcmp(op, "calloc_big"))  op_calloc(4096, n);
     else if (!strcmp(op, "batch_lifo"))  op_batch(64, n, 1);
     else if (!strcmp(op, "batch_fifo"))  op_batch(64, n, 0);
     else if (!strcmp(op, "calloc_batch")) op_calloc_batch(64, n);

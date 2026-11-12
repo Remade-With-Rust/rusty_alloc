@@ -1765,13 +1765,12 @@ pub unsafe fn page_owner_sync(page: *mut Page, seg: *mut crate::segment::Segment
 pub unsafe fn page_owner_assert_clear(page: *mut Page) {
     if FAST_OWNER {
         // SAFETY: per contract.
+        let word = unsafe { (*page).owner_plain.load(Ordering::Relaxed) };
         debug_assert_eq!(
-            unsafe { (*page).owner_plain.load(Ordering::Relaxed) },
-            0,
+            word, 0,
             "a slot that was not a live page carried an owner word"
         );
     }
-    let _ = page;
 }
 
 /// Clear `page`'s owner word: call after SETTING a slow flag, when the page
