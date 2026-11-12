@@ -38,25 +38,28 @@ theirs; **lower is better**):
 
 | workload | vs mimalloc | vs jemalloc | vs glibc |
 |---|---:|---:|---:|
-| lua | **0.97** | **0.84** | 0.82 |
-| perl | **0.99** | **0.89** | 0.81 |
-| sqlite | **1.00** | **0.98** | 0.99 |
+| lua | **0.962** | **0.835** | 0.813 |
+| perl | **0.988** | **0.889** | 0.810 |
+| sqlite | **0.995** | **0.976** | 0.988 |
 
-We match mimalloc and come in **2–15% under jemalloc** (jemalloc 5.3.0) across
-all three real programs, and ~17% under glibc.
+Whole programs come in at or under mimalloc (0.5–4 %), **2–17 % under
+jemalloc** (jemalloc 5.3.0) and up to 19 % under glibc. Counting only the
+allocator's own instructions, rusty_alloc executes **0.44× (lua), 0.68×
+(perl) and 0.70× (sqlite)** of mimalloc's. Measured 2026-11-12 (2.5.0).
 
 The per-operation scan (small/med/big/large/huge, calloc, realloc, aligned,
-usable, batch and mixed working-set ops) measures **below mimalloc on all 13
-operations**. Per-op ratios vs mimalloc: med **0.47**, small **0.49**, aligned **0.50**,
-realloc **0.51**, small_touch **0.51**, big/large **0.53**, calloc **0.63**,
-mixed **0.67**, usable **0.73**, batch lifo/fifo **0.89**, huge **0.01**.
+usable, batch, mixed and cross-thread ops) measures **below mimalloc on all 14
+operations**. Per-op ratios vs mimalloc: med **0.39**, big/large **0.40**,
+realloc **0.41**, small and aligned **0.42**, small_touch **0.45**, xthread
+**0.50**, calloc **0.52**, mixed **0.54**, usable **0.74**, batch lifo/fifo
+**0.80**, huge **0.003**.
 
 Five of those hold ONE BLOCK LIVE at a time, so the page empties on every free
 and what they measure is page retire-and-recarve rather than steady-state
 service. On workloads with a real working set — the honest number for a
-program — it is `liveset` **0.92** (65,536 live objects, random victim replaced
-each step), `shbench` **0.91** (bulk batches released in waves) and `xthread`
-**0.83** (every free performed by a non-owning thread). Wall-clock time is deliberately not claimed: the measurement box
+program — it is `liveset` **0.86** (65,536 live objects, random victim replaced
+each step), `shbench` **0.85** (bulk batches released in waves) and `xthread`
+**0.50** (every free performed by a non-owning thread). Wall-clock time is deliberately not claimed: the measurement box
 cannot resolve it above its own noise floor, and instructions are not seconds.
 
 Batch is the narrowest margin, and it is the one with a story. It sat at
@@ -66,15 +69,17 @@ test's memory operand. That trade was kept — upstream reads the same byte
 non-atomically and has the race — and the instruction was won back elsewhere on
 the same path rather than by undoing it.
 
-`free`'s fast path is **21 instructions against mimalloc's 25**, down from 27.
-The `used--` codegen floor `docs/opps.md` recorded is closed: it took five
-instructions from safe Rust because LLVM will not emit a memory-destination
-read-modify-write when the value must also drive a branch, and it is two now,
-written directly. Resolving a pointer to its page went from nine instructions
-to five on the back of a per-slice owner table in the segment header. The flags
-test is the single row where upstream is still cheaper, and it stays that way
-deliberately: closing it would keep the read atomic in hardware while hiding it
-from the sanitizer that found the race.
+`free`'s fast path is **17 instructions against mimalloc's 25**, down from 27
+at 2.2.0 and 21 at 2.4.0. The `used--` codegen floor `docs/opps.md` recorded
+is closed: it took five instructions from safe Rust because LLVM will not emit
+a memory-destination read-modify-write when the value must also drive a
+branch, and it is two now, written directly. Resolving a pointer to its page
+went from nine instructions to four: the segment header keeps a per-slice
+table of page pointers. And the flags test, the one row where upstream used
+to be cheaper, is gone: each page carries an owner word that holds its
+thread's id only while the page is plain, so one load and one compare answer
+both "is this my page" and "is it plain". The word is read atomically, so
+the sanitizer that found the old flags race still sees every access.
 
 Correctness on real software: jq, sqlite3, python3, git, xz, zstd, lua and
 perl produce **byte-identical output** under rusty_alloc, mimalloc and glibc;
