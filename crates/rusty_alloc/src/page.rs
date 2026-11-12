@@ -1183,6 +1183,123 @@ const EXTEND_SHIFT_BASE: u32 = {
 /// that is already committed; it touches at most four block headers.
 const MIN_EXTEND: usize = 4;
 
+/// Link `n >= 1` fresh blocks of `bsize` bytes starting at `start` in address
+/// order, the last one to `tail`, and return the first.
+///
+/// # Safety
+/// `[start, start + n * bsize)` is dead, committed memory of `page` owned by
+/// the caller; `tail` is null or a free block of `page`.
+#[cfg(not(all(target_arch = "x86_64", not(feature = "secure"), not(miri))))]
+#[inline(always)]
+unsafe fn link_run(
+    page: *const Page,
+    start: *mut u8,
+    bsize: usize,
+    n: usize,
+    tail: *mut Block,
+) -> *mut Block {
+    // SAFETY: per contract.
+    unsafe {
+        let mut i = n;
+        let mut head = tail;
+        while i > 0 {
+            i -= 1;
+            let b: *mut Block = start.add(i * bsize).cast();
+            block_set_next(page, b, head);
+            head = b;
+        }
+        head
+    }
+}
+
+/// [`link_run`] on x86-64 with plain links: TWO links per vector, eight
+/// blocks per pass of the loop.
+///
+/// A block's link is the address of the next block, so the values written
+/// are an arithmetic sequence with the block size as its step. One vector
+/// holds two consecutive ones; its low half is stored into one block
+/// (`movq`), its high half into the next (`movhps`), and one `paddq` advances
+/// both. That is 3 instructions per 2 blocks, and with eight blocks per pass
+/// the pointer advance and the loop test are shared by all eight: 15
+/// instructions per 8 blocks, 1.875 each.
+///
+/// What it replaces is what LLVM made of the scalar loop (callgrind, per
+/// instruction, census 4, vein 8): an address computation and a store per
+/// block, unrolled by four with two counters, 2.75 per block, behind a setup
+/// of four multiplies and a pre-loop for the count's low two bits. Carving
+/// is where a real program's slow path spends its instructions: 1.6M of
+/// perl's 21.3M allocator Ir, 2.6M of lua's 48.2M.
+///
+/// The count's low three bits are linked first, one block at a time; the
+/// last block is written once more at the end, with `tail`. The list is the
+/// same list the scalar loop builds, so no address a program sees changes.
+///
+/// Not under `secure` (links are encoded per page, one at a time) nor miri
+/// (the links are stored as integers here).
+///
+/// # Safety
+/// As the scalar definition.
+#[cfg(all(target_arch = "x86_64", not(feature = "secure"), not(miri)))]
+#[inline(always)]
+unsafe fn link_run(
+    _page: *const Page,
+    start: *mut u8,
+    bsize: usize,
+    n: usize,
+    tail: *mut Block,
+) -> *mut Block {
+    use core::arch::x86_64::{_mm_set_epi64x, _mm_set1_epi64x};
+    debug_assert!(n >= 1 && bsize >= core::mem::size_of::<usize>());
+    // SAFETY: per contract, every store below is the first word of one of
+    // the `n` blocks. SSE2 is part of the x86-64 baseline.
+    unsafe {
+        let mut p = start;
+        let mut r = n & 7;
+        while r > 0 {
+            let next = p.add(bsize);
+            p.cast::<*mut u8>().write(next);
+            p = next;
+            r -= 1;
+        }
+        let groups = n >> 3;
+        if groups != 0 {
+            let v = _mm_set_epi64x(p.add(2 * bsize).addr() as i64, p.add(bsize).addr() as i64);
+            let step = _mm_set1_epi64x((2 * bsize) as i64);
+            core::arch::asm!(
+                "2:",
+                "movq qword ptr [{p}], {v}",
+                "movhps qword ptr [{p} + {bs}], {v}",
+                "paddq {v}, {step}",
+                "movq qword ptr [{p} + {bs}*2], {v}",
+                "movhps qword ptr [{p} + {b3}], {v}",
+                "paddq {v}, {step}",
+                "movq qword ptr [{p} + {bs}*4], {v}",
+                "movhps qword ptr [{p} + {b5}], {v}",
+                "paddq {v}, {step}",
+                "movq qword ptr [{p} + {b3}*2], {v}",
+                "movhps qword ptr [{p} + {b7}], {v}",
+                "paddq {v}, {step}",
+                "lea {p}, [{p} + {bs}*8]",
+                "dec {g}",
+                "jnz 2b",
+                p = inout(reg) p => _,
+                bs = in(reg) bsize,
+                b3 = in(reg) 3 * bsize,
+                b5 = in(reg) 5 * bsize,
+                b7 = in(reg) 7 * bsize,
+                g = inout(reg) groups => _,
+                v = inout(xmm_reg) v => _,
+                step = in(xmm_reg) step,
+                options(nostack),
+            );
+        }
+        // Every block now points at its successor, the last one past the
+        // run: that one gets the list it is prepended to.
+        start.add((n - 1) * bsize).cast::<*mut Block>().write(tail);
+        start.cast()
+    }
+}
+
 /// Lazily extend the free list into never-used capacity (`mi_page_extend_free`).
 ///
 /// # Safety
@@ -1331,14 +1448,9 @@ pub unsafe fn page_extend(page: *mut Page, area: *mut u8) {
         // forward form makes each store depend on the previous address
         // computation, where the backward form's decrementing induction
         // variable does not. Left as it is.
-        let mut i = take;
-        let mut head: *mut Block = (*page).free;
-        while i > 0 {
-            i -= 1;
-            let b: *mut Block = start.add(i * bsize).cast();
-            block_set_next(page, b, head);
-            head = b;
-        }
+        //
+        // A third form WON, on x86-64: see `link_run`.
+        let head = link_run(page, start, bsize, take, (*page).free);
         (*page).free = head;
         (*page).capacity = (capacity + take) as u32;
     }
