@@ -822,6 +822,52 @@ pub(crate) fn corrupt_free_list_abort() -> ! {
 // workload where this function matters is one where every free reaches it, so
 // the call is paid every time AND the callee grows a frame of its own.
 pub unsafe fn remote_free(page: *mut Page, block: *mut Block) {
+    if crate::ONE_THREAD {
+        unreachable!("a cross-thread free on a build that asserted a single thread");
+    }
+    // THE COMMON STATE, STRAIGHT-LINE (census 4, vein 1). Nearly every
+    // cross-thread free finds the list's two flag bits NORMAL: a parked page
+    // goes back to NORMAL after the first remote free into it (see the
+    // DELAYED arm in `remote_free_general`), so on the `xthread` op 100,000
+    // of 100,000 take this. As one arm of the four-state match the same
+    // push cost a copy of the word, a mask, a jump table, a second mask to
+    // strip flag bits that are zero and an `or` to put them back.
+    //
+    // The other states are a CALL away, not a branch away, and that is
+    // measured: written as an early `if` inside the loop, LLVM folded it
+    // back into the same switch and nothing moved (free_slow 24.0 Ir per
+    // call before and after).
+    //
+    // SAFETY: `page` is live per the contract, so its atomic is readable
+    // from any thread; `block` is dead memory this thread owns until the
+    // exchange publishes it. With the flag bits zero, `x` IS the head
+    // pointer and the new word IS the block. A block that is already the
+    // head (a second free) and a lost race both go to the general path.
+    unsafe {
+        let x = (*page).xthread_free.load(Ordering::Acquire);
+        if x & XMASK == XFLAG_NORMAL && x != block as usize {
+            block_set_next(page, block, crate::ptr_with_addr(block, x));
+            if (*page)
+                .xthread_free
+                .compare_exchange(x, block as usize, Ordering::Release, Ordering::Relaxed)
+                .is_ok()
+            {
+                return;
+            }
+        }
+        remote_free_general(page, block);
+    }
+}
+
+/// [`remote_free`] in every state of the list word, as a retry loop: the
+/// parked page's DELAYED hand-off, a remote mid-flight, an abandoned page's
+/// NEVER, a second free of the head, and a NORMAL push that lost a race.
+///
+/// # Safety
+/// As [`remote_free`].
+#[cold]
+#[inline(never)]
+unsafe fn remote_free_general(page: *mut Page, block: *mut Block) {
     // Unreachable on a single-context build (`alloc::free` folds every free
     // to local there); if it runs anyway, the single-thread assertion the
     // target made was false.
