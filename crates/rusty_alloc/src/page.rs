@@ -465,7 +465,7 @@ pub struct Page {
     /// [`page_owner_clear`]), and the local free asserts it in debug builds.
     /// Written only by the owning thread; read by any thread, hence atomic.
     /// Measured: 6 -> 3 instructions on every local free (census 4, vein 1).
-    pub owner_plain: AtomicUsize,
+    pub owner_plain: OwnerWord,
     /// The un-extended tail AND current free list are known zero.
     pub free_is_zero: bool,
     /// This span's memory was PURGED (decommitted/reset) while free. It must
@@ -577,7 +577,7 @@ impl Page {
             slice_offset: 0,
             bin: 0,
             flags: AtomicU8::new(0),
-            owner_plain: AtomicUsize::new(0),
+            owner_plain: OwnerWord::new(0),
             free_is_zero: false,
             purged: false,
             heap_tag: 0,
@@ -1405,11 +1405,51 @@ pub unsafe fn page_purge_free_slots(
     }
 }
 
+/// The type of [`Page::owner_plain`]: a word, except where the segment header
+/// has no room for one.
+///
+/// The header must fit in slice 0, and at the default geometry that leaves
+/// 127 bytes per slice for a `Page` and its owner-table entry. A `secure` +
+/// `blockmap` page is 32 bytes larger than the plain one (two keys, a payload
+/// base, a reciprocal): 120 without this word, so it keeps the 2.4.0 layout —
+/// no owner word, and a `u32` owner-table entry
+/// ([`crate::segment::OwnerEntry`]). Either feature alone has the room.
+#[cfg(not(all(feature = "secure", feature = "blockmap")))]
+pub type OwnerWord = AtomicUsize;
+/// See the roomy definition: this build's page has no room for the word.
+#[cfg(all(feature = "secure", feature = "blockmap"))]
+pub type OwnerWord = NoOwnerWord;
+
+/// The zero-sized stand-in for the owner word, with the three calls its
+/// users make, so no use site carries a `cfg`. [`FAST_OWNER`] is false
+/// wherever this is the type, and every one of those calls is dead code.
+#[cfg(all(feature = "secure", feature = "blockmap"))]
+pub struct NoOwnerWord;
+
+#[cfg(all(feature = "secure", feature = "blockmap"))]
+impl NoOwnerWord {
+    /// Nothing to initialise.
+    #[inline(always)]
+    pub const fn new(_: usize) -> Self {
+        NoOwnerWord
+    }
+    /// Never a thread's id.
+    #[inline(always)]
+    pub fn load(&self, _: Ordering) -> usize {
+        0
+    }
+    /// Nothing to store.
+    #[inline(always)]
+    pub fn store(&self, _: usize, _: Ordering) {}
+}
+
 /// Whether pages carry a live [`Page::owner_plain`]. Not on a one-context
 /// build, where the owner test folds away, nor on wasm, which has one thread
-/// and a size budget.
-pub(crate) const FAST_OWNER: bool =
-    !crate::ONE_THREAD && cfg!(not(all(target_arch = "wasm32", not(miri))));
+/// and a size budget, nor where the page has no room for the word
+/// ([`OwnerWord`]) — derived from the type, so the two cannot disagree.
+pub(crate) const FAST_OWNER: bool = !crate::ONE_THREAD
+    && cfg!(not(all(target_arch = "wasm32", not(miri))))
+    && core::mem::size_of::<OwnerWord>() != 0;
 
 /// Set `page`'s owner word from its flags and its segment's owner: call after
 /// initialising a page, after CLEARING a slow flag, and when a segment

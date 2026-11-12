@@ -105,7 +105,15 @@ pub struct Segment {
     ///
     /// It duplicates state, which is a real hazard, so `debug_validate_segment`
     /// checks the two agree on every slice of every span it walks.
-    pub page_off: [u32; SLICES_PER_SEGMENT],
+    ///
+    /// Since 2.4.1 the entries are the page POINTERS themselves, not `u32`
+    /// offsets from the base: `mov off(%seg,%idx,4); lea (%seg,%off)` became
+    /// one load, on every `free` and every other block-to-page resolution
+    /// (census 4, vein 2). Twice the table (4 KiB of a 32 MiB segment's
+    /// header on a 64-bit target, the same 2 KiB on a 32-bit one). The name
+    /// is kept: it is still what each slice's owner is. One build keeps the
+    /// offsets, for want of header room: see [`OwnerEntry`].
+    pub page_off: [OwnerEntry; SLICES_PER_SEGMENT],
     /// One metadata slot per slice; a span's slot is its first slice.
     pub pages: [Page; SLICES_PER_SEGMENT],
 }
@@ -116,8 +124,57 @@ pub const PAGES_OFFSET: usize = core::mem::offset_of!(Segment, pages);
 
 /// The byte offset a slice owned by the span starting at `start` must record.
 #[inline(always)]
-pub const fn page_off_for(start: usize) -> u32 {
-    (PAGES_OFFSET + start * core::mem::size_of::<Page>()) as u32
+pub const fn page_off_for(start: usize) -> usize {
+    PAGES_OFFSET + start * core::mem::size_of::<Page>()
+}
+
+/// One [`Segment::page_off`] entry: the owning page's pointer, or, where the
+/// header has no room for 8 bytes a slice, its `u32` byte offset from the
+/// segment base (the 2.4.0 form, one `lea` dearer per resolution). The one
+/// build without the room is `secure` + `blockmap`, whose page is 32 bytes
+/// larger: see [`crate::page::OwnerWord`], which makes the same choice for
+/// the same reason. The assertion below is what holds both to the budget.
+#[cfg(not(all(feature = "secure", feature = "blockmap")))]
+pub type OwnerEntry = *mut Page;
+/// See the roomy definition: this build's header keeps the offsets.
+#[cfg(all(feature = "secure", feature = "blockmap"))]
+pub type OwnerEntry = u32;
+
+/// The entry a slice owned by the span starting at `start` must record: that
+/// span's page slot.
+///
+/// # Safety
+/// `seg` is a live segment and `start < SLICES_PER_SEGMENT`.
+#[inline(always)]
+unsafe fn owner_entry(seg: *mut Segment, start: usize) -> OwnerEntry {
+    #[cfg(not(all(feature = "secure", feature = "blockmap")))]
+    // SAFETY: per contract, the slot lies inside the header.
+    unsafe {
+        seg.cast::<u8>().add(page_off_for(start)).cast::<Page>()
+    }
+    #[cfg(all(feature = "secure", feature = "blockmap"))]
+    {
+        let _ = seg;
+        page_off_for(start) as u32
+    }
+}
+
+/// The page an owner-table entry of `seg` names.
+///
+/// # Safety
+/// `e` was read from `seg`'s owner table.
+#[inline(always)]
+unsafe fn entry_page(seg: *mut Segment, e: OwnerEntry) -> *mut Page {
+    #[cfg(not(all(feature = "secure", feature = "blockmap")))]
+    {
+        let _ = seg;
+        e
+    }
+    #[cfg(all(feature = "secure", feature = "blockmap"))]
+    // SAFETY: per contract, the offset names a slot inside the header.
+    unsafe {
+        seg.cast::<u8>().add(e as usize).cast::<Page>()
+    }
 }
 
 const _: () = assert!(
@@ -284,8 +341,8 @@ pub unsafe fn page_of(seg: *mut Segment, p: *mut u8) -> *mut Page {
         // offset from this segment's base to the page that owns it, so the
         // slot address, the `imul` by `size_of::<Page>()` and the
         // `slice_offset` follow-back all disappear — see `Segment::page_off`.
-        let tab: *const u32 = (&raw const (*seg).page_off).cast();
-        let off = *tab.add(idx) as usize;
+        let tab: *const OwnerEntry = (&raw const (*seg).page_off).cast();
+        let pg = entry_page(seg, *tab.add(idx));
         // The two representations must agree. This is the check that makes the
         // duplicated state safe to keep, and it is free in release.
         // (A Huge segment keeps `page_off` alone: its interior slots' offsets
@@ -296,12 +353,11 @@ pub unsafe fn page_of(seg: *mut Segment, p: *mut u8) -> *mut Page {
                 let slot = base.add(idx);
                 let back = (*slot).slice_offset as usize * slot_stride();
                 back <= idx * core::mem::size_of::<Page>()
-                    && slot.cast::<u8>().sub(back).cast::<Page>()
-                        == seg.cast::<u8>().add(off).cast::<Page>()
+                    && slot.cast::<u8>().sub(back).cast::<Page>() == pg
             },
             "page_of: page_off table disagrees with slice_offset"
         );
-        seg.cast::<u8>().add(off).cast::<Page>()
+        pg
     }
 }
 
@@ -446,7 +502,7 @@ unsafe fn wait_no_remote_in_flight(seg: *mut Segment) {
 unsafe fn scrub_recycled(seg: *mut Segment, slots: usize, owner_table: bool) {
     // SAFETY: per contract, both ranges lie inside the header.
     unsafe {
-        let tab = (&raw mut (*seg).page_off).cast::<u32>();
+        let tab = (&raw mut (*seg).page_off).cast::<OwnerEntry>();
         core::ptr::write_bytes(tab, 0, if owner_table { SLICES_PER_SEGMENT } else { 1 });
         core::ptr::write_bytes((&raw mut (*seg).pages).cast::<Page>(), 0, slots);
     }
@@ -661,8 +717,8 @@ unsafe fn span_mark(seg: *mut Segment, idx: usize, len: usize, from: usize) {
         // walks it constantly.
         // Every slice of this span resolves to the span's own slot, so the
         // table entry is one constant written across the run.
-        let owner = page_off_for(idx);
-        let tab: *mut u32 = (&raw mut (*seg).page_off).cast();
+        let owner = owner_entry(seg, idx);
+        let tab: *mut OwnerEntry = (&raw mut (*seg).page_off).cast();
         *tab.wrapping_add(idx) = owner;
         // NOTE (2026-09-24, REFUTED): splitting the owner-table stores into
         // their own `slice::fill` pass, away from the stride-88 `slice_offset`
@@ -1396,8 +1452,8 @@ pub fn huge_alloc(
         // their one reader was the `page_of` debug cross-check (which now
         // skips Huge segments). Nothing else reads a Huge segment's slots past
         // slot 1. With the strided stores gone, this is a contiguous 2 KB fill.
-        let owner = page_off_for(1);
-        let tab: *mut u32 = (&raw mut (*seg).page_off).cast();
+        let owner = owner_entry(seg, 1);
+        let tab: *mut OwnerEntry = (&raw mut (*seg).page_off).cast();
         let mut j = 1;
         while j < SLICES_PER_SEGMENT {
             *tab.add(j) = owner;
