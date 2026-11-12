@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Census 4: thirty measured wins across ten veins of the hot and slow
+  paths** (`docs/opps.md`, "Vein census 4"). Deterministic instruction
+  counts, same program output on every instrument, against 2.4.0:
+  allocator instructions perl **-14.9 %**, sqlite **-15.1 %**, lua
+  **-12.6 %**, python **-15.7 %**; Rust `GlobalAlloc` workloads boxed trees
+  -5.1 %, aligned buffers -4.9 %, hash maps -0.7 % whole-program. Per
+  operation: small alloc/free pair 52.25 -> 47.07 instructions, 256-byte
+  56.01 -> 48.07, `calloc` 93.01 -> 84.01, `realloc` growth 227.97 -> 203.92,
+  small `realloc` growth 364.28 -> 292.46, `operator new` batch
+  49.30 -> 43.45. What changed, in one line each:
+  - `free` is one compare: a per-page owner word answers "my segment" and
+    "plain page" together (21 -> 17 instructions with the next item).
+  - The per-slice owner table holds page pointers, and is the only record
+    of which span owns a slice (`Page::slice_offset` is gone).
+  - A dry page with frees on it swaps its lists in 20 instructions instead
+    of a trip round the generic path, for `malloc`, `calloc` and
+    `operator new`.
+  - A moving `realloc` of up to 64 bytes is a leaf: no call, no frame, the
+    copy straight-line. Rust's `realloc` lands with its four arguments in
+    place; an over-aligned one that stays pushes nothing.
+  - Carving links two blocks per SSE2 store (`grow_front` 856 -> 570
+    instructions per call on perl); re-marking a span is a paired fill.
+  - A segment's first commit covers the span it is created for, a heap's
+    later segments start a whole step in, and the default arena's
+    reservation is not trimmed: a small program makes three fewer memory
+    system calls at start, lua seven fewer commits.
+- **Recorded trades.** A 2 MiB alloc/free pair costs 147 instructions
+  where it cost 144 (the owner word is maintained on the span paths). A
+  `realloc` that copies more than 64 bytes pays about 4 more around its
+  `memcpy`. A dry small-size miss with nothing to swap pays 4 (perl
+  +0.02 %). A carve under 64 blocks pays one compare (sqlite +0.02 %).
+
+### Added
+
+- **`--cfg ra_tls_local_exec`**: for an x86-64 Linux EXECUTABLE that links
+  the allocator statically, the thread's heap pointer is loaded in one
+  instruction instead of two (local-exec TLS). `__rust_alloc` 16 -> 15
+  instructions; boxed-trees workload -1.24 % whole-program. Not for a
+  `cdylib`: there it is a link error (`R_X86_64_TPOFF32 ... cannot be used
+  with -shared`), never a wrong program. See the README's Rust section.
+- `alloc::realloc_rust`, `alloc::usable_size_plain`,
+  `segment::segment_alloc_for`, `segment::slice_owner`,
+  `os::reserve_aligned_forever`; opscan ops `calloc_batch`, `new_batch`,
+  `realloc_small`.
+
+### Removed
+
+- `Page::slice_offset` and `segment::slot_stride` (the owner table is the
+  one record now). `Segment::page_off` holds `OwnerEntry` (a page pointer;
+  a `u32` offset only when `secure` and `blockmap` are both on) and
+  `segment::page_off_for` returns `usize`. These are internals that happen
+  to be `pub`; nothing in the documented API changes.
+
 ## [2.4.0](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.3.1...rusty_alloc-v2.4.0) - 2026-11-01
 
 ### Added
