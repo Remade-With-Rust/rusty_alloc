@@ -1848,7 +1848,7 @@ unsafe fn free_local_plain(seg: *mut Segment, pg: *mut Page, p: *mut u8) {
                 if ((*pg).used as usize | (*pg).next.addr() | (*pg).prev.addr()) == 0 {
                     return;
                 }
-                return retire_or_abort(pg);
+                retire_or_abort(pg);
             }
         }
         #[cfg(not(all(target_arch = "x86_64", not(miri))))]
@@ -1860,7 +1860,7 @@ unsafe fn free_local_plain(seg: *mut Segment, pg: *mut Page, p: *mut u8) {
                 if (u as usize | (*pg).next.addr() | (*pg).prev.addr()) == 0 {
                     return;
                 }
-                return retire_or_abort(pg);
+                retire_or_abort(pg);
             }
         }
     }

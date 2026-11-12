@@ -1300,7 +1300,6 @@ unsafe fn link_run(
     // the `n` blocks. SSE2 is part of the x86-64 baseline.
     unsafe {
         let mut p = start;
-        let mut left = n;
         // A LONG run first takes sixteen blocks a pass: the second eight go
         // through a second base register, and the advance and the test are
         // shared by twice as many (28 instructions per 16 blocks, 1.75
@@ -1312,7 +1311,7 @@ unsafe fn link_run(
         // saved: perl -53,587 and lua -84,869 allocator Ir, but sqlite
         // +2,168 and python +218 (`grow_front` 78.2 -> 89.0 Ir per call on
         // sqlite's short runs). Gated, a short run pays one compare.
-        if n >= 64 {
+        let left = if n >= 64 {
             let v = _mm_set_epi64x(
                 p.add(2 * bsize).expose_provenance() as i64,
                 p.add(bsize).expose_provenance() as i64,
@@ -1359,8 +1358,10 @@ unsafe fn link_run(
                 step = in(xmm_reg) step,
                 options(nostack),
             );
-            left = n & 15;
-        }
+            n & 15
+        } else {
+            n
+        };
         let mut r = left & 7;
         while r > 0 {
             let next = p.add(bsize);
