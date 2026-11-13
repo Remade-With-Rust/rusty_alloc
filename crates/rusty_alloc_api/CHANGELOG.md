@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.0](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-api-v2.5.0...rusty_alloc-api-v2.6.0) - 2026-11-13
+
 ### Added
 
 - **`core::alloc::Allocator` for `RustyAlloc` and `Heap`**, behind the new
@@ -56,6 +58,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   align), and above. 64-bit targets were correct and gain the
   size-class path for a 16-byte alignment, which went through the
   aligned allocator before.
+- **`Heap::new_destroyable`: dropping the heap could unmap another thread's
+  live blocks.** A destroyable heap adopted the segments dead threads left
+  behind, and its teardown released them with whatever was still in use
+  inside. Fixed in `rusty_alloc` 2.6.0, whose changelog has the account: a
+  heap that can be destroyed never adopts.
 - **The crates now declare their minimum Rust version.** The workspace
   set `rust-version = "1.88"` but no crate inherited it, so both
   published crates carried none. CI now builds on 1.88.

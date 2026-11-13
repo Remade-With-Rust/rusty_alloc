@@ -50,3 +50,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          # `.cargo/config.toml` holds new dependency versions back for three
+          # days. A release publishes `rusty_alloc` and then, seconds later,
+          # `rusty_alloc-api`, whose packaging resolves the core from the
+          # registry at the version that was just published. Under the
+          # cooldown that version does not exist yet and the second publish
+          # would fail with the first already out. The cooldown is for other
+          # people's releases, not for the one this job is making.
+          CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE: allow

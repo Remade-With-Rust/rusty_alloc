@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.0](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.5.0...rusty_alloc-v2.6.0) - 2026-11-13
+
 ### Fixed
 
 - **Destroying a heap could unmap another thread's live blocks.** A heap
@@ -25,6 +27,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   release build: a segmentation fault in about one run in three, and in
   none of 60 after. `tests/destroy_no_adopt.rs` does not wait for the
   fault: it asks the heap whether it owns a dead thread's block.
+
+- **The crate declares its minimum Rust version, 1.88.** The workspace set
+  `rust-version` and no crate inherited it, so the published manifests
+  carried none. CI now builds on exactly 1.88, hosted, wasm32 and
+  bare-metal riscv32.
+
+### Changed
+
+- **Built and measured with Rust 1.100** (was 1.97.1; LLVM 22 to 23). Every
+  allocation and free fast path compiles to the same instructions under
+  both. Allocator-only on real programs moves by +0.003 % to +0.024 %;
+  three cold functions are a few instructions longer (`docs/opps.md`,
+  "Toolchain"). Nothing changes for a user's own compiler choice.
+- `heap::Heap` has a new last field, `no_reclaim` (the fix above). It is an
+  allocator internal that happens to be `pub`; a heap is made by
+  `init::create_heap`, not by a struct literal.
 
 ### Added
 
