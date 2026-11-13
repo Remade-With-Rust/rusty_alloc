@@ -9,8 +9,12 @@
 //! What only holds for this crate's impls (the dangling zero-sized block, the
 //! length returned) is tested separately, at the end.
 //!
-//! Runs under miri with smaller counts (`cargo +nightly miri test -p
-//! rusty_alloc-api --features allocator-api`).
+//! Runs under miri (`cargo +nightly miri test -p rusty_alloc-api --features
+//! allocator-api`) with smaller sizes and counts: the allocator is slow to
+//! interpret, and what miri adds is a verdict on each branch of the impls, not
+//! volume. Every check and all four arms still run there. Measured
+//! 2026-11-12: at larger sizes one arm took 14 minutes under miri on a busy
+//! machine, and CI's runners interpret several times slower.
 
 #![cfg(feature = "allocator-api")]
 // The feature under test is the one part of the crate above its
@@ -133,7 +137,7 @@ const ALIGNS: &[usize] = &[1, 2, 4, 8, 16, 32, 64, 128, 256, 4096, 65_536, 1 << 
 /// Sizes and alignments worth the time under miri.
 fn matrix() -> impl Iterator<Item = (usize, usize)> {
     let (max_size, max_align) = if cfg!(miri) {
-        (8192, 256)
+        (1024, 64)
     } else {
         (usize::MAX, usize::MAX)
     };
@@ -156,6 +160,9 @@ fn matrix() -> impl Iterator<Item = (usize, usize)> {
 /// shrink to zero, and deallocate of the zero-sized result.
 fn zero_sized_layouts<A: Allocator>(a: &A) {
     for &align in ALIGNS {
+        if cfg!(miri) && align > 4096 {
+            continue;
+        }
         let z = layout(0, align);
         for zeroed in [false, true] {
             let b = if zeroed {
@@ -237,12 +244,12 @@ fn layout_matrix<A: Allocator>(a: &A) {
 /// Live blocks never overlap, and none of them disturbs another.
 fn blocks_are_disjoint<A: Allocator>(a: &A) {
     let mut rng = Rng(0x00D1_5701);
-    let n = scale(600, 60);
+    let n = scale(600, 30);
     let mut live: Vec<(NonNull<u8>, usize, Layout, u64)> = Vec::new();
     for seed in 0..n as u64 {
         let cap = if rng.below(8) == 0 { 70_000 } else { 400 };
         let size = 1 + rng.below(cap);
-        let size = if cfg!(miri) { size.min(2000) } else { size };
+        let size = if cfg!(miri) { size.min(600) } else { size };
         let l = layout(size, 1 << rng.below(7));
         let b = a.allocate(l).expect("allocate");
         let p = check_block(b, l, "disjoint");
@@ -319,11 +326,11 @@ fn dirty<A: Allocator>(a: &A, size: usize, align: usize) {
 /// they must, and honour a new alignment.
 fn resizing<A: Allocator>(a: &A) {
     for &(small, large) in RESIZES {
-        if cfg!(miri) && large > 8192 {
+        if cfg!(miri) && large > 1024 {
             continue;
         }
         for &(align_a, align_b) in RESIZE_ALIGNS {
-            if cfg!(miri) && align_a.max(align_b) > 256 {
+            if cfg!(miri) && align_a.max(align_b) > 64 {
                 continue;
             }
             let (from, to) = (layout(small, align_a), layout(large, align_b));
@@ -440,7 +447,7 @@ fn model<A: Allocator>(a: &A, seed: u64) {
     let mut rng = Rng(seed | 1);
     let mut live: Vec<Live> = Vec::new();
     let mut next_seed = 0u64;
-    let steps = scale(20_000, 400);
+    let steps = scale(20_000, 150);
 
     let size = |rng: &mut Rng| -> usize {
         let cap = if cfg!(miri) { 3 } else { 5 };
@@ -547,7 +554,7 @@ fn collections<A: Allocator + Copy>(a: A) {
     struct Wide(u64);
 
     let mut v: Vec<u64, A> = Vec::new_in(a);
-    let n = scale(100_000, 2000) as u64;
+    let n = scale(100_000, 500) as u64;
     for i in 0..n {
         v.push(i);
     }
@@ -562,7 +569,7 @@ fn collections<A: Allocator + Copy>(a: A) {
     assert_eq!(v.capacity(), 0);
 
     let mut w: Vec<Wide, A> = Vec::with_capacity_in(3, a);
-    for i in 0..scale(1000, 100) as u64 {
+    for i in 0..scale(1000, 40) as u64 {
         w.push(Wide(i));
     }
     for (i, x) in w.iter().enumerate() {
@@ -583,7 +590,7 @@ fn collections<A: Allocator + Copy>(a: A) {
 
     // Nested: boxes inside a vector, all on the same allocator.
     let mut nested: Vec<Box<[u8; 100], A>, A> = Vec::new_in(a);
-    for i in 0..scale(500, 50) {
+    for i in 0..scale(500, 20) {
         nested.push(Box::new_in([i as u8; 100], a));
     }
     assert!(
@@ -730,7 +737,7 @@ fn the_global_handle_crosses_threads() {
     send_sync::<RustyAlloc>();
 
     let threads = scale(8, 2);
-    let per = scale(20_000, 300) as u64;
+    let per = scale(20_000, 100) as u64;
     // Collected on purpose: every worker is running before the first is
     // joined. Joining straight off the iterator would run them one by one.
     #[allow(clippy::needless_collect)]
@@ -851,7 +858,7 @@ fn short_blocks_keep_a_large_alignment() {
     for align in [2usize, 4, 8, 16, 32, 64, 4096] {
         for size in 1..=align.min(40) {
             let l = layout(size, align);
-            for _ in 0..8 {
+            for _ in 0..scale(8, 2) {
                 let a = heap.allocate(l).unwrap();
                 let b = RustyAlloc.allocate(l).unwrap();
                 check_block(a, l, "heap, short block");

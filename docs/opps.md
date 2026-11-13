@@ -777,6 +777,12 @@ differently (`hashbrown` inserts no longer inlined into `maps::main`, the
 thread spawn hooks, `u64` formatting). The README's Rust table is therefore a
 1.97.1 table, and its two columns must always come from one compiler.
 
+The wasm fixture, gzipped (`tools/wasm-size.sh`), same tree: 21,254 bytes on
+1.97.1, 21,432 on 1.100.0, so +178 (+0.84 %) from the compiler. The ratchet's
+baseline said 20,873: it had fallen 381 bytes behind `main` inside its 3 %
+tolerance, which left 67 bytes of headroom after the bump. Re-baselined to
+21,432 with this row, so the next real growth is seen as growth.
+
 **Open, from this row:** `malloc_generic_once` (+3) and
 `malloc_aligned_at_slow` (+5) are layout or register-allocation changes in
 functions whose source did not change, the kind `rusty-compiler-leverage`

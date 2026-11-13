@@ -1,8 +1,13 @@
 # rust1100-upgrades — getting the whole toolkit ready for Rust 1.100
 
-**Date opened:** 2026-11-12 (the day 1.100.0 shipped) · **Status:** survey and
-compatibility run complete, nothing landed · **Code surveyed:** `origin/main`
-at `b63cb14` (2.5.0)
+**Date opened:** 2026-11-12 (the day 1.100.0 shipped) · **Status:** P0, P1, P2
+and P5 built the same day on branch `chore/rust-1100` (local, not pushed);
+P4 is deferred by design · **Code surveyed:** `origin/main` at `b63cb14`
+(2.5.0)
+
+The sections from "Bottom line" down are the plan as surveyed, kept as
+written. **"Outcome" below is what building it found**, including where the
+plan was wrong.
 
 Rust 1.100.0 stabilises the core of the allocator API: the `Allocator` trait,
 and `Vec` and `Box` constructors that take one. This plan covers everything the
@@ -29,6 +34,115 @@ matters more to our numbers than anything in 1.100 itself.
    opt-in cargo feature so the minimum Rust version stays 1.88.
 5. **Every published instruction count is a 1.97.1 / LLVM 22 number.** The
    bump must be measured as its own step, with no code change beside it.
+
+## Outcome (2026-11-12)
+
+### What landed
+
+| Phase | Commit | What |
+|---|---|---|
+| P0 | `bf1fd3a` | Every crate inherits `rust-version` and `homepage`; the six libc allocation exports are `unsafe extern "C"`; the division scans find their `.s` under either Cargo layout and exit non-zero when they cannot run |
+| P1 | `afdfceb` | Pin 1.97.1 -> 1.100.0 in `rust-toolchain.toml`, `ci.yml`, `release.yml`, with the measurement in `docs/opps.md` ("Toolchain") |
+| P2, P3 | `bb87176` | `Allocator` for `RustyAlloc` and `Heap` behind `allocator-api`; the `Heap::alloc` alignment fix; the conformance suite; the no-unwind scan; the `msrv` job and the other CI steps |
+| P5 | `38d1222` | The three-day dependency cooldown; `unused_dependencies` denied |
+| Follow-up | the commit that added this section | The API crate under miri as its own CI job (`miri-api`) with trimmed sizes; the wasm size baseline; this outcome |
+
+### Where the plan was wrong, and what building it found
+
+1. **"A release build has no panic on these paths" was false.** The plan's
+   safety table said to audit `debug_assert!`s and assumed release was clean.
+   `tools/no-unwind-scan.sh` reads the machine code: the twelve trait methods
+   reach **28 panic sites in 18 allocator functions** (26 bounds checks, a
+   remainder by zero, an `expect`). None can fire with the allocator's state
+   intact, but the contract does not say "cannot fire". So the impls run every
+   method under a guard that aborts on an unwind, in every build, and the count
+   is a ratchet (`tools/no-unwind-baseline.txt`).
+2. **The direct route is at parity, not below.** `Vec::new_in(RustyAlloc)` is
+   1.0 % cheaper than the global route without the guard (2,507.89 against
+   2,533.37 instructions per step) and 0.08 % dearer with it (2,535.48). The
+   plan's target of "at or below" is met only when the 28 sites are gone.
+3. **`Heap::alloc` was wrong on every 32-bit target, in published 2.5.0.**
+   Its alignment test was written `<= 8`. On a 32-bit target a one-word block
+   is four bytes and four-aligned, so `Heap::alloc` of a 1-byte, 8-aligned
+   layout returned a misaligned block. Reproduced on `i686-pc-windows-msvc`
+   with the 2.5.0 routing (the conformance suite fails there) and fixed: the
+   three tiers are now `GlobalAlloc::alloc`'s. This is a soundness fix for
+   wasm32 and riscv32 users of `Heap`, and a reason to release.
+4. **CI's miri job never ran the API crate.** `tests/api_miri.rs` existed for
+   it and the hardening registry cited it, but the job runs `-p rusty_alloc`
+   only. It now runs `-p rusty_alloc-api --features allocator-api` as well.
+5. **Declaring the minimum version switched on a lint that enforces it.**
+   With `rust-version` inherited, clippy's `incompatible_msrv` checks every
+   item against 1.88. It found nothing in the existing code and all 40 uses in
+   the new module, which carries `#[clippy::msrv = "1.100"]`.
+6. **1.88 is real.** Both published crates build with Rust 1.88.0, hosted,
+   wasm32 and bare-metal riscv32. With the feature on, 1.88 stops at
+   `use of unstable library feature 'allocator_api'`, which is clear enough.
+7. **The toolchain is quieter than feared.** Every fast path compiles to the
+   same instructions under LLVM 22 and 23. Three cold functions grew
+   (`malloc_generic_once` +3 per call, `malloc_aligned_at_slow` +5,
+   `collect_inner` about +102).
+8. **Older Cargo warns about `[lints.cargo]`, it does not fail.** "unused
+   manifest key" per member when building this workspace on 1.88 or 1.97; it
+   is silent for consumers of the published crates.
+
+### Gates
+
+Run on the branch's final tree with Rust 1.100.0, unless a row says otherwise.
+
+| Gate | Result |
+|---|---|
+| Local CI mirror (WSL, Linux): fmt; clippy `-D warnings` in every CI configuration (all features, each feature alone, shared light heap, small profile, aligned region, 256k segments, `no_std`), and for the Windows and both macOS targets; both riscv32 targets in two geometries; wasm32 | all pass |
+| `cargo test --workspace --all-features` on Linux; the API crate's suite on Windows | pass; conformance 38 of 38 on both |
+| The conformance suite on a 32-bit target (`i686-pc-windows-msvc`) | 34 of 34; four checks are 64-bit only |
+| The same suite with the 2.5.0 `Heap::alloc` routing, 32-bit | fails, as it should: "misaligned for Layout { size: 1, align: 8 }" |
+| The no-unwind guard, debug and release, Linux and Windows | aborts in all four |
+| Rust 1.88.0: both published crates, hosted, wasm32, bare-metal riscv32 | build |
+| `no_std` with `allocator-api`, riscv32 | builds |
+| Poison: twelve breakages of the impls | twelve caught, none survived; six kept in `tools/gate-selftest.sh`, all six fire |
+| Miri (nightly 2026-11-09), the conformance suite and `tests/api_miri.rs` | 34 of 34 and 5 of 5: no undefined behaviour, no leak. Run twice: at larger sizes (32 minutes on a busy machine) and at the trimmed sizes the `miri-api` job uses (about a quarter of that) |
+| Unsafe census ratchet | 1,208, baseline and `UNSAFE.md` updated |
+| No-unwind ratchet (Linux) | 28 sites, baseline 28; the self-test fires |
+| Division scans under 1.97.1 and 1.100.0 | the same counts under both; the self-test fires under both |
+| Wasm size ratchet | 21,432 bytes gzipped; re-baselined, +178 of it the compiler |
+| Instruction census, 1.97.1 against 1.100.0 | every fast path identical (`docs/opps.md`, "Toolchain") |
+
+Miri said one more thing, about code this branch did not write: an
+integer-to-pointer cast in `init::box_of_xheap` (`xheap as *mut HeapBox`), on
+the path that frees a block of a first-class heap. It is a warning, not an
+error: with that cast in the program miri "might miss pointer bugs" there.
+The core's own miri job has the same line in its log.
+
+Not run here, and why:
+
+- **Miri on the core crate** (`cargo miri test -p rusty_alloc`, 4.4 hours on
+  CI). No file under `crates/rusty_alloc/src` changed on this branch, and the
+  full run passed earlier the same day on `main`'s code plus the vein 10
+  change. CI runs it on the pull request.
+- **macOS native tests, Kani, the fuzz smoke runs, `cargo deny` / `audit` /
+  `vet`, semgrep.** Not installed locally; CI runs them on the pull request.
+  No dependency was added, so the supply-chain jobs have nothing new to
+  judge.
+- **The twelve existing cases of `tools/gate-selftest.sh`.** Their code is
+  untouched; the six new cases were run.
+
+### Open after this, in order of value
+
+1. **Release 2.6.0.** It carries a soundness fix for 32-bit `Heap` users. The
+   push is the release, so it is the owner's call.
+2. **Take the 28 panic sites to zero** (`docs/opps.md`, "The `Allocator`
+   route"). Then the guard goes: 27.6 instructions per step back on the direct
+   route, and each bounds check removed is its own saving on
+   `malloc_generic_once`, `free_local_at` and `collect_inner`. The same sites
+   sit behind `GlobalAlloc`, which has the no-unwind rule and no guard.
+3. **A heap is 6.6 % behind the global handle** on the same collection work.
+   Nobody had measured that route before.
+4. **The three functions LLVM 23 made longer**, and a re-test of the largest
+   LLVM 22 refutations.
+5. **Vein 10** (`6fc177d`, branch `perf/vein10-collect`) rewrites
+   `collect_inner`: it will change that function's site count and its LLVM 23
+   number, so re-run the scan's `--update` when the two branches meet.
+6. P4 as written: nothing in it is needed.
 
 ## What was verified today, and what was not
 

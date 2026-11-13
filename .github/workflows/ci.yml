@@ -379,14 +379,30 @@ jobs:
           components: miri
       - name: miri (mock prim backend)
         run: cargo +nightly miri test -p rusty_alloc
-      # The safe surface. Until 2026-11 this job ran the core crate only, so
-      # `tests/api_miri.rs` ran under miri on a developer's machine or not at
-      # all. With `allocator-api` it also runs the `Allocator` conformance
-      # suite: every method of both impls under Stacked Borrows, with the
-      # leak check on, which is the one thing that catches a `shrink` to
-      # zero that forgets to free.
+
+  # The safe surface under miri. Until 2026-11 only the core crate ran there,
+  # so `tests/api_miri.rs` ran under miri on a developer's machine or not at
+  # all. With `allocator-api` this also runs the `Allocator` conformance suite:
+  # every method of both impls under Stacked Borrows, with the leak check on,
+  # which is the one thing that catches a `shrink` to zero that forgets to
+  # free. A job of its own, beside `miri`: that one already takes more than
+  # four of the six hours a job may run.
+  #
+  # Named targets, not the whole crate: `tests/natural_align.rs` walks 4,200
+  # sizes up to 4 MiB and reads every byte, and `tests/reentrancy.rs` counts
+  # allocator calls from process start. Both are native-speed tests of the
+  # core's arithmetic, and the first did not finish in ten minutes under miri
+  # here. The two suites below were written for it.
+  miri-api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: nightly
+          components: miri
       - name: miri (rusty_alloc-api, Allocator conformance)
-        run: cargo +nightly miri test -p rusty_alloc-api --features allocator-api
+        run: cargo +nightly miri test -p rusty_alloc-api --features allocator-api --lib --test allocator_conformance --test api_miri
 
   # wasm is a shipped target, so it gets a gate that EXECUTES rather than one
   # that only compiles: `cargo test` cannot run wasm32-unknown-unknown, so the
