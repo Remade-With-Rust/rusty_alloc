@@ -54,3 +54,16 @@ rustflags = [
 # a different mechanism: `[profile.release] debug = true` ships full DWARF,
 # so unwinders and profilers have CFI without reserving a register on the
 # hottest path in the process. Revisit if we ever ship stripped.
+
+# --- Supply chain: a cooldown on newly published dependencies (H-08) ---------
+# Cargo 1.100 can hold back a version until it has been public for a while
+# (RFC 3923). Most malicious releases are found and yanked within days, so a
+# resolve made here never picks one up in that window. It changes nothing for
+# a version already in `Cargo.lock`, and nothing for consumers of the published
+# crates, who resolve with their own configuration.
+#
+# What it does not cover: `cargo install` ignores it (CI pins those tools to
+# exact versions for that reason), and a registry entry without a publish time
+# is never held back. An older Cargo does not know the key and ignores it.
+[registry]
+global-min-publish-age = "3 days"

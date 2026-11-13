@@ -225,3 +225,15 @@ debug = true            # symbols for profiling; strip at distribution, not here
 [profile.bench-dist]    # distribution-shaped profile for A/B honesty checks
 inherits = "release"
 debug = false
+
+# Cargo's own lints (Cargo 1.100, the pinned toolchain). `unused_dependencies`
+# warns by default; a warning from Cargo is not a compiler warning, so CI's
+# `-D warnings` never sees it, and a dependency nothing uses is supply-chain
+# surface for nothing (H-08). Denied, so it fails the build that adds it.
+#
+# An older Cargo does not know this table and says `unused manifest key
+# lints.cargo` for each member when it builds THIS workspace, which the `msrv`
+# job does on 1.88: a warning there, by design. It says nothing when the
+# published crates are somebody's dependency.
+[workspace.lints.cargo]
+unused_dependencies = "deny"
