@@ -62,10 +62,20 @@ jobs:
           done
       - name: test (all features)
         run: cargo test --workspace --all-features
-      # The `Allocator` no-unwind guard where it matters: an optimised build,
-      # whose reachable panics are bounds checks and not debug assertions.
-      - name: test (release, the Allocator no-unwind guard)
-        run: cargo test --release -p rusty_alloc-api --features allocator-api --lib
+      # The API crate again, OPTIMISED. A debug build is not the program anyone
+      # ships, and this suite showed it twice in one day (2026-11-13): the
+      # destroyable-heap use-after-free (b49c533) crashed a release run one
+      # time in three and a debug run never, because the timing that lets a
+      # heap adopt a dead thread's segment only came up at release speed; and
+      # a test of the system allocator passed in debug on an allocation the
+      # optimiser deletes in release. It also covers the no-unwind guard
+      # where it matters: a build whose reachable panics are bounds checks.
+      - name: test (release, rusty_alloc-api with the Allocator suite)
+        run: cargo test --release -p rusty_alloc-api --features allocator-api
+      # And the destroyable-heap regression test in release, for the same
+      # reason it was missed.
+      - name: test (release, destroy never adopts)
+        run: cargo test --release -p rusty_alloc --test destroy_no_adopt
       # The shared light heap prototype (docs/plans/shared-light-heap.md) is a
       # cfg, so no step above builds it. Its gates are tests/shared_light_heap.rs;
       # the rest of the suite must also pass with it on, in both geometries.
