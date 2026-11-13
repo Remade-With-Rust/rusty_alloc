@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Destroying a heap could unmap another thread's live blocks.** A heap
+  that needs a span first adopts the segments dead threads left behind,
+  and so did a heap created to be destroyed (`mi_heap_new`,
+  `Heap::new_destroyable`). `heap_destroy` releases every segment the
+  heap owns, so an adopted one went with it, along with whatever of the
+  dead thread's blocks were still in use: handed to another thread, for
+  one. A use-after-free on the next touch. It takes three things in one
+  process: a destroyable heap, a block that outlives the thread that
+  allocated it, and the heap allocating after that thread has exited.
+  Such a heap now never adopts (`Heap::no_reclaim`, upstream's name and
+  upstream's rule), at either place adoption happens: when a span is
+  needed, and in a forced collect. Ordinary heaps adopt as before.
+  Found by the `Allocator` conformance suite the first time it ran in a
+  release build: a segmentation fault in about one run in three, and in
+  none of 60 after. `tests/destroy_no_adopt.rs` does not wait for the
+  fault: it asks the heap whether it owns a dead thread's block.
+
 ## [2.5.0](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.4.0...rusty_alloc-v2.5.0) - 2026-11-12
 
 ### Changed
