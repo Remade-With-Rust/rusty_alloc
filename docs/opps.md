@@ -804,8 +804,9 @@ Callgrind, two-point, instructions per step, identical checksum:
 | `vec_global`: `std::alloc::Global` through `#[global_allocator]` | 2,533.37 | |
 | `vec_direct`: `Vec::new_in(RustyAlloc)`, no guard | 2,507.89 | -1.0 % |
 | `vec_direct`: `Vec::new_in(RustyAlloc)`, **as shipped** | 2,535.48 | +0.08 % |
-| `vec_heap`: `Vec::new_in(&heap)`, no guard | 2,700.23 | +6.6 % |
-| `vec_heap`: `Vec::new_in(&heap)`, **as shipped** | 2,706.95 | +6.9 % |
+| `vec_heap`: `Vec::new_in(&heap)`, no guard, first cut | 2,700.23 | +6.6 % |
+| `vec_heap`: `Vec::new_in(&heap)`, first cut | 2,706.95 | +6.9 % |
+| `vec_heap`: `Vec::new_in(&heap)`, **as shipped** (2026-11-13, below) | **2,524.31** | **-0.36 %** |
 
 The direct route is cheaper than the global one before the guard: no
 `__rust_alloc` shim, and the layout is a constant at the call. It ships at
@@ -846,10 +847,41 @@ where the bound is a power of two, the bound carried in a type, or `get`
 with an abort (the allocator's corruption paths already abort) each work;
 which one costs nothing is a measurement per site.
 
-**Open: a heap is 6.6 % behind the global handle on the same work.** The
-global route has its fast path inline in the caller; `Heap::alloc` calls
-`heap_malloc`, which is out of line and checks the deferred-free hook first.
-Nobody had measured this route before, so nobody had shaped it.
+### A heap was 6.9 % behind the global handle. Closed 2026-11-13: 2,706.95 -> 2,524.31
+
+Nobody had measured this route before, so nobody had shaped it. By function
+(`cg.py`, 40,000 steps), the heap went through the old general entry points
+while the global handle had every tuned one:
+
+| | global handle | heap, first cut | heap, now |
+|---|---|---|---|
+| realloc | `__rust_realloc` 5.0 + `realloc_rust` 27.6, and `realloc_move_out` 36.7 on the 49 % that move | `heap_realloc` 64.5 on every call | `heap_realloc_fast` 25.3, and `heap_realloc_move_out` 36.3 on the 49 % |
+| allocate | the pop, inline in the caller | `Heap::alloc` 5.0 + `heap_malloc` 23.0, two calls | the pop, inline in the caller |
+| free | inline in the caller | `Heap::dealloc` 2.0 + `free` 18.2, two calls | inline in the caller |
+
+Three new entry points in the core, each the tuned body with the heap's box
+passed in where the original reads the thread's: `heap_malloc_fast`,
+`heap_zalloc_fast`, `heap_realloc_fast`. `Heap`'s methods in the API crate
+are `#[inline]` and call them, and `Heap::dealloc` uses the inline free
+`GlobalAlloc::dealloc` does. A moved block is allocated from the named heap,
+which is why the global realloc could not simply be reused.
+
+The net is 9 instructions per step under the global route. The realloc is
+cheaper than the global one by itself (no `__rust_realloc` shim, the box in
+a register), and the standard library's own code around it inlines a little
+differently in the two programs (`RawVecInner::shrink` is out of line in
+`vec_heap` and inline in `vec_global`), which takes some of that back.
+
+What it cost: nothing measurable anywhere else. No existing function was
+edited, and the LD_PRELOAD object's `.text` is byte-identical before and
+after (309,843 bytes, same hash), so every published number stands.
+`vec_global` and `vec_direct` are unchanged to the hundredth. The
+no-unwind count stays 28: the new paths add no bounds check.
+
+Not covered: the realloc leaf exists on x86-64 Linux only (`LEAF_MOVE`), as
+the global one does. Elsewhere `heap_realloc_fast` is the old
+`heap_realloc`, so Windows and macOS get the allocate and free halves and
+not the realloc half.
 
 ## Banked
 

@@ -30,6 +30,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RustyAlloc` is `Clone`, `Copy`, `Debug` and `Default`. It has no state;
   a collection with an allocator parameter needs `Clone` on it to be
   cloned.
+- `Heap::contains(ptr)`: whether an address lies in memory the heap owns
+  (`mi_heap_contains_block`). A diagnostic that answers by segment; the
+  test that a reallocated block stays in its heap is written with it.
+
+### Changed
+
+- **A first-class heap is as fast as the global handle.** `Heap::alloc`,
+  `alloc_zeroed` and `dealloc` are `#[inline]` and take the allocator's
+  inline fast paths; a `realloc` inside a heap takes the tuned body the
+  global one has. They went through the general entry points before, two
+  calls an operation. On the same collection work a `Vec` in a heap costs
+  2,524.31 instructions per step where it cost 2,706.95, against 2,533.37
+  on the global allocator: 6.9 % behind became 0.36 % ahead. Nothing else
+  moves (`docs/opps.md`, "The `Allocator` route").
 
 ### Fixed
 

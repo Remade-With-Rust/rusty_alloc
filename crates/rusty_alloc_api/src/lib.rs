@@ -95,6 +95,14 @@ impl Heap {
     }
 
     /// Allocate `layout`, borrowing the heap (so the block cannot outlive it).
+    ///
+    /// `#[inline]`, like the `GlobalAlloc` methods below and for their reason:
+    /// the fast path is a pop from the heap's direct table, and it belongs in
+    /// the caller. Out of line through `heap_malloc` it cost 28 instructions
+    /// and a call on every allocation, against the global handle's inline
+    /// pop, which is what put a `Vec` in a heap 6.6 % behind one on the global
+    /// allocator (`docs/opps.md`, "The `Allocator` route").
+    #[inline]
     pub fn alloc(&self, layout: core::alloc::Layout) -> Option<core::ptr::NonNull<u8>> {
         // SAFETY: hb live (we own it), called on the owning thread by the
         // !Send/!Sync nature of raw-pointer fields.
@@ -107,9 +115,9 @@ impl Heap {
         // once the request is two words long.
         let p = unsafe {
             if layout.align() <= WORD {
-                rusty_alloc::alloc::heap_malloc(self.hb, layout.size())
+                rusty_alloc::alloc::heap_malloc_fast(self.hb, layout.size())
             } else if layout.align() <= NATURAL_ALIGN {
-                rusty_alloc::alloc::heap_malloc(self.hb, layout.size().max(NATURAL_ALIGN))
+                rusty_alloc::alloc::heap_malloc_fast(self.hb, layout.size().max(NATURAL_ALIGN))
             } else {
                 rusty_alloc::alloc::heap_malloc_aligned_at(
                     self.hb,
@@ -123,13 +131,14 @@ impl Heap {
     }
 
     /// Zeroed variant of [`alloc`](Self::alloc).
+    #[inline]
     pub fn alloc_zeroed(&self, layout: core::alloc::Layout) -> Option<core::ptr::NonNull<u8>> {
         // SAFETY: as alloc.
         let p = unsafe {
             if layout.align() <= WORD {
-                rusty_alloc::alloc::heap_zalloc(self.hb, layout.size())
+                rusty_alloc::alloc::heap_zalloc_fast(self.hb, layout.size())
             } else if layout.align() <= NATURAL_ALIGN {
-                rusty_alloc::alloc::heap_zalloc(self.hb, layout.size().max(NATURAL_ALIGN))
+                rusty_alloc::alloc::heap_zalloc_fast(self.hb, layout.size().max(NATURAL_ALIGN))
             } else {
                 rusty_alloc::alloc::heap_zalloc_aligned_at(
                     self.hb,
@@ -146,9 +155,28 @@ impl Heap {
     ///
     /// # Safety
     /// `p` came from this heap's alloc methods and is freed exactly once.
+    #[inline]
     pub unsafe fn dealloc(&self, p: core::ptr::NonNull<u8>) {
-        // SAFETY: forwarded contract.
-        unsafe { rusty_alloc::alloc::free(p.as_ptr()) }
+        // The inline free `GlobalAlloc::dealloc` uses, for its reason: through
+        // `free` this was a call into a symbol that tests for null first, and
+        // a `NonNull` is not null.
+        // SAFETY: forwarded contract; a block is freed by its page's owner,
+        // whichever heap of this thread it came from.
+        unsafe { rusty_alloc::alloc::free_inline_flags_first(p.as_ptr()) }
+    }
+
+    /// Whether `p` points into memory this heap owns (`mi_heap_contains_block`).
+    ///
+    /// A diagnostic, and not a fast one: it walks the heap's segments. It
+    /// answers by segment, so it is true of any address inside one of them,
+    /// allocated or not, and false of a block of another heap or of the
+    /// global allocator. Any address may be asked about; nothing is read
+    /// through it.
+    pub fn contains(&self, p: core::ptr::NonNull<u8>) -> bool {
+        // SAFETY: hb live (we own it), on the owning thread as `alloc` is;
+        // the walk compares `p`'s segment address and dereferences only the
+        // heap's own lists.
+        unsafe { rusty_alloc::alloc::heap_contains_block(self.hb, p.as_ptr()) }
     }
 
     /// Drain cross-thread frees and retire empty pages.

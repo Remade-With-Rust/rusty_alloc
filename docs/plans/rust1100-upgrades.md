@@ -86,6 +86,17 @@ matters more to our numbers than anything in 1.100 itself.
    manifest key" per member when building this workspace on 1.88 or 1.97; it
    is silent for consumers of the published crates.
 
+9. **Destroying a heap could unmap another thread's live blocks** (found
+   2026-11-13, older than this branch). Running the conformance suite in a
+   release build on Linux, which nothing had done, crashed about one run
+   in three, and only when a destroyable heap and a block that outlived
+   its thread were in the same process. A destroyable heap adopted the
+   dead thread's abandoned segment when it needed a span, and its
+   teardown released the segment with the live blocks in it. Fixed in the
+   core: a heap that can be destroyed never adopts (`Heap::no_reclaim`,
+   as upstream). This affects `mi_heap_destroy` through the C API as well
+   as `Heap::new_destroyable`, in every release that has had them.
+
 ### Gates
 
 Run on the branch's final tree with Rust 1.100.0, unless a row says otherwise.
@@ -135,8 +146,11 @@ Not run here, and why:
    route, and each bounds check removed is its own saving on
    `malloc_generic_once`, `free_local_at` and `collect_inner`. The same sites
    sit behind `GlobalAlloc`, which has the no-unwind rule and no guard.
-3. **A heap is 6.6 % behind the global handle** on the same collection work.
-   Nobody had measured that route before.
+3. ~~A heap is 6.6 % behind the global handle on the same collection work.~~
+   **Closed 2026-11-13:** 2,706.95 -> 2,524.31 instructions per step, which
+   is 0.36 % *ahead* of the global handle, with every existing code path
+   byte-identical. `Heap` now takes the same inline fast paths
+   (`docs/opps.md`, "The `Allocator` route").
 4. **The three functions LLVM 23 made longer**, and a re-test of the largest
    LLVM 22 refutations.
 5. **Vein 10** (`6fc177d`, branch `perf/vein10-collect`) rewrites

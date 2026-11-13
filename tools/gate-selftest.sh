@@ -190,7 +190,7 @@ run_case "Allocator: a heap keeps an over-aligned block aligned when it moves" \
 # `align <= 8` this was wrong on every 32-bit target until 2.6.0.
 run_case "Heap::alloc raises a short two-word-aligned request" \
   "crates/rusty_alloc_api/src/lib.rs" \
-  's/heap_malloc\(self\.hb, layout\.size\(\)\.max\(NATURAL_ALIGN\)\)/heap_malloc(self.hb, layout.size())/' \
+  's/heap_malloc_fast\(self\.hb, layout\.size\(\)\.max\(NATURAL_ALIGN\)\)/heap_malloc_fast(self.hb, layout.size())/' \
   "--test allocator_conformance short_blocks_keep_a_large_alignment" "" "$API"
 
 # A debug build keeps the allocator's assertions, so the methods run under a
@@ -199,6 +199,36 @@ run_case "Allocator: a debug build aborts where a method would unwind" \
   "crates/rusty_alloc_api/src/allocator.rs" \
   's/panic!\("rusty_alloc: an Allocator method must not unwind; aborting"\);//' \
   "--lib allocator::tests" "" "$API"
+
+# --- the heap route's reallocation allocates from ITS heap -------------------
+# `heap_realloc_fast` exists because the global realloc takes a moved block
+# from the thread's own heap. Both of its moving arms, pointed back at the
+# thread's heap, must be caught: a block that left a destroyable heap that
+# way would survive the heap's teardown.
+run_case "heap realloc: an out-of-line move allocates from the named heap" \
+  "crates/rusty_alloc/src/alloc.rs" \
+  's/let np = unsafe \{ heap_malloc_impl::<false>\(hb, newsize\) \};/let np = malloc_impl::<false, false>(newsize);/' \
+  "--test allocator_conformance a_block_that_moves_stays_in_its_heap" "" "$API"
+
+run_case "heap realloc: the leaf move allocates from the named heap" \
+  "crates/rusty_alloc/src/alloc.rs" \
+  's/if newsize <= SMALL_SIZE_MAX \{\n            let h = \(\*hb\)\.heap\.get\(\);\n            let np = crate::page::page_pop/if newsize <= SMALL_SIZE_MAX {\n            let h = (*init::heap_box_fast()).heap.get();\n            let np = crate::page::page_pop/' \
+  "--test allocator_conformance a_block_that_moves_stays_in_its_heap" "" "$API"
+
+# --- a heap that can be destroyed never adopts an abandoned segment ----------
+# `heap_destroy` releases every segment the heap owns; an adopted one holds a
+# dead thread's live blocks. Both places a heap adopts carry the check, and
+# each is its own gate. (`--test-threads=1`: the tests share one abandoned
+# list, and the control test would take the orphans first.)
+run_case "a destroyable heap does not adopt when it needs a span" \
+  "crates/rusty_alloc/src/heap.rs" \
+  's/let adopt_budget = if self\.no_reclaim \{ 0 \} else \{ MAX_ADOPT \};/let adopt_budget = MAX_ADOPT;/' \
+  "--test destroy_no_adopt -- --test-threads=1"
+
+run_case "a destroyable heap does not adopt in a collect" \
+  "crates/rusty_alloc/src/heap.rs" \
+  's/if reclaim && !self\.no_reclaim \{/if reclaim {/' \
+  "--test destroy_no_adopt -- --test-threads=1"
 
 echo
 if ((fail > 0)); then

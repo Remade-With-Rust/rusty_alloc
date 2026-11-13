@@ -22,6 +22,7 @@
 #![allow(clippy::incompatible_msrv)]
 
 use core::alloc::{Allocator, Layout};
+use core::hint::black_box;
 use core::ptr::NonNull;
 use rusty_alloc_api::{Heap, RustyAlloc};
 use std::alloc::System;
@@ -390,13 +391,19 @@ fn resizing<A: Allocator>(a: &A) {
 /// and a failed `grow` or `shrink` leaves the old block exactly as it was.
 #[cfg(target_pointer_width = "64")]
 fn failure_is_an_error<A: Allocator>(a: &A) {
-    let impossible = layout(isize::MAX as usize - 4095, 1);
+    // `black_box` on both sides of every call here, and it is load-bearing.
+    // The optimiser knows the system allocator: an allocation whose result is
+    // only compared with null may be deleted and taken to have succeeded. A
+    // release build did exactly that to the control arm ("an impossible
+    // allocate succeeded", 2026-11-13). An opaque size and a result that
+    // escapes leave it nothing to assume.
+    let impossible = black_box(layout(isize::MAX as usize - 4095, 1));
     assert!(
-        a.allocate(impossible).is_err(),
+        black_box(a.allocate(impossible)).is_err(),
         "an impossible allocate succeeded"
     );
     assert!(
-        a.allocate_zeroed(impossible).is_err(),
+        black_box(a.allocate_zeroed(impossible)).is_err(),
         "an impossible allocate_zeroed succeeded"
     );
 
@@ -406,23 +413,23 @@ fn failure_is_an_error<A: Allocator>(a: &A) {
         // SAFETY: `p` is live and 96 bytes long.
         unsafe { fill(p, 77, 0, 96) };
 
-        let huge = layout(isize::MAX as usize - 4095, align);
+        let huge = black_box(layout(isize::MAX as usize - 4095, align));
         // SAFETY: `p` is live with layout `old`, and the new size is larger.
-        let grown = unsafe { a.grow(p, old, huge) };
+        let grown = black_box(unsafe { a.grow(p, old, huge) });
         assert!(grown.is_err(), "an impossible grow succeeded");
         // SAFETY: a failed grow leaves the block live and unchanged.
         unsafe { check(p, 77, 96, "after a failed grow") };
         // SAFETY: as above.
-        let grown = unsafe { a.grow_zeroed(p, old, huge) };
+        let grown = black_box(unsafe { a.grow_zeroed(p, old, huge) });
         assert!(grown.is_err(), "an impossible grow_zeroed succeeded");
         // SAFETY: as above.
         unsafe { check(p, 77, 96, "after a failed grow_zeroed") };
 
         // A shrink can only fail by needing a move it cannot make: a new
         // alignment nothing can satisfy.
-        let unalignable = layout(32, 1 << 46);
+        let unalignable = black_box(layout(32, 1 << 46));
         // SAFETY: `p` is live with layout `old`, and 32 <= 96.
-        if unsafe { a.shrink(p, old, unalignable) }.is_err() {
+        if black_box(unsafe { a.shrink(p, old, unalignable) }).is_err() {
             // SAFETY: a failed shrink leaves the block live and unchanged.
             unsafe {
                 check(p, 77, 96, "after a failed shrink");
@@ -811,6 +818,76 @@ fn heaps_own_borrow_and_drop() {
             }
         }
     }
+}
+
+/// What a heap allocates stays in that heap when it moves. This is the one
+/// thing the global handle's reallocation could not be reused for: it takes a
+/// moved block from the thread's own heap, and a block that left a
+/// destroyable heap that way would outlive the heap's teardown.
+///
+/// Three ways a block moves, since each is its own code: a copy of at most 64
+/// bytes into a block the size-class table can hand over, a small copy the
+/// table cannot serve, and a larger one.
+#[test]
+#[cfg_attr(
+    miri,
+    ignore = "the move under test is native code; miri takes the general path"
+)]
+fn a_block_that_moves_stays_in_its_heap() {
+    let outside = RustyAlloc.allocate(layout(64, 8)).unwrap().cast::<u8>();
+    for heap in [Heap::new(), Heap::new_destroyable()] {
+        assert!(
+            !heap.contains(outside),
+            "the check cannot tell this heap from the global allocator"
+        );
+
+        // By hand, across every size class boundary up to 64 KiB: each step
+        // is a grow that has to move, and each lands where it started.
+        let mut l = layout(16, 8);
+        let mut p = heap.allocate(l).unwrap().cast::<u8>();
+        assert!(heap.contains(p));
+        let mut moves = 0;
+        for size in [
+            24, 40, 64, 72, 129, 300, 700, 1500, 4000, 9000, 20_000, 65_536,
+        ] {
+            let new = layout(size, 8);
+            // SAFETY: `p` is live with layout `l`, and `size` is larger.
+            let q = unsafe { heap.grow(p, l, new) }.unwrap().cast::<u8>();
+            moves += usize::from(q != p);
+            assert!(
+                heap.contains(q),
+                "a block grown to {size} bytes left its heap"
+            );
+            (p, l) = (q, new);
+        }
+        assert!(
+            moves >= 8,
+            "only {moves} of 12 grows moved: the test lost its subject"
+        );
+        // And back down far enough that the shrink moves too.
+        let small = layout(16, 8);
+        // SAFETY: `p` is live with layout `l`, and 16 is smaller.
+        let q = unsafe { heap.shrink(p, l, small) }.unwrap().cast::<u8>();
+        assert!(heap.contains(q), "a shrunk block left its heap");
+        // SAFETY: `q` is live with layout `small`.
+        unsafe { heap.deallocate(q, small) };
+
+        // And as a collection does it.
+        let mut v: Vec<u64, &Heap> = Vec::new_in(&heap);
+        let mut cap = 0;
+        for i in 0..20_000u64 {
+            v.push(i);
+            if v.capacity() != cap {
+                cap = v.capacity();
+                assert!(
+                    heap.contains(NonNull::from(&v[0]).cast()),
+                    "a Vec's buffer left its heap at capacity {cap}"
+                );
+            }
+        }
+    }
+    // SAFETY: allocated above with this layout.
+    unsafe { RustyAlloc.deallocate(outside, layout(64, 8)) };
 }
 
 /// Blocks from different heaps and from the global handle never overlap.

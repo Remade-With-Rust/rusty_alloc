@@ -313,7 +313,7 @@ impl Heap {
             };
             // SAFETY: the heap is live and this is its thread (`Heap` is
             // neither `Send` nor `Sync`); `ptr` is a live block.
-            return unsafe { rusty_alloc::alloc::heap_realloc(self.hb, ptr.as_ptr(), size) };
+            return unsafe { rusty_alloc::alloc::heap_realloc_fast(self.hb, ptr, size) };
         }
         // Above `NATURAL_ALIGN` only the aligned path can make the block, so a
         // move has to go back through it. The block keeps its alignment if it

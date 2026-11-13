@@ -26,6 +26,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   none of 60 after. `tests/destroy_no_adopt.rs` does not wait for the
   fault: it asks the heap whether it owns a dead thread's block.
 
+### Added
+
+- **`alloc::heap_malloc_fast`, `heap_zalloc_fast` and `heap_realloc_fast`:**
+  the fast paths of `malloc`, `zalloc` and the Rust `realloc`, for a
+  first-class heap. Each is the tuned body with the heap's box passed in
+  where the original reads the thread's, so a caller that can inline them
+  (`rusty_alloc-api`'s `Heap`) pays for a heap what it pays for the global
+  allocator: `heap_realloc_fast` is 25.3 instructions a call where
+  `heap_realloc` is 64.5. `heap_malloc`, `heap_zalloc` and `heap_realloc`
+  are unchanged, and so is every existing entry point: the LD_PRELOAD
+  object's code is byte-identical before and after.
+
 ## [2.5.0](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.4.0...rusty_alloc-v2.5.0) - 2026-11-12
 
 ### Changed
