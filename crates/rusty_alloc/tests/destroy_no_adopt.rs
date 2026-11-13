@@ -48,7 +48,13 @@ fn orphans() -> Vec<Vec<Orphan>> {
             std::thread::spawn(move || {
                 (0..scale(64, 8))
                     .map(|i| {
-                        let size = 64 + 16 * i;
+                        // The first block is bigger than a thread may take from
+                        // the shared light heap (`--cfg ra_shared_light_heap`:
+                        // 64 KiB), so the worker has a heap and a segment of its
+                        // own in every configuration. With small blocks only it
+                        // stayed heapless there, left nothing behind when it
+                        // exited, and the control test had nothing to adopt.
+                        let size = if i == 0 { 80 * 1024 } else { 64 + 16 * i };
                         let p = alloc::malloc(size);
                         assert!(!p.is_null());
                         // SAFETY: a fresh block of `size` bytes.
