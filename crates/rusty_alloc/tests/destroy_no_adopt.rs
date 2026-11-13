@@ -11,6 +11,10 @@
 //! in three. This test does not wait for the fault. It asks the heap, before
 //! destroying it, whether it owns a dead thread's block; the answer has to be
 //! no. Alone in its test binary so nothing else takes the orphans first.
+//!
+//! Native only, as every adoption test here is: under miri's mock backend a
+//! thread's exit hook never runs, so no segment is ever abandoned and there is
+//! nothing to adopt or to refuse.
 
 use rusty_alloc::{alloc, init};
 use std::sync::Mutex;
@@ -93,6 +97,10 @@ fn owns_any(hb: *mut init::HeapBox, orphans: &[Vec<Orphan>]) -> Option<usize> {
 /// Needing a span is when a heap adopts: before it reserves fresh memory it
 /// takes what dead threads left. A destroyable heap must not.
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "the miri mock's thread-exit destructors never fire, so nothing is abandoned"
+)]
 fn a_destroyable_heap_does_not_adopt_when_it_needs_a_span() {
     let _serial = ONE_AT_A_TIME
         .lock()
@@ -117,6 +125,10 @@ fn a_destroyable_heap_does_not_adopt_when_it_needs_a_span() {
 
 /// A forced collect is the other place a heap adopts.
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "the miri mock's thread-exit destructors never fire, so nothing is abandoned"
+)]
 fn a_destroyable_heap_does_not_adopt_in_a_collect() {
     let _serial = ONE_AT_A_TIME
         .lock()
@@ -140,6 +152,10 @@ fn a_destroyable_heap_does_not_adopt_in_a_collect() {
 /// above would be vacuous without. If nothing ever adopted here, "it did not
 /// adopt" would prove nothing.
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "the miri mock's thread-exit destructors never fire, so nothing is abandoned"
+)]
 fn an_ordinary_heap_still_adopts() {
     let _serial = ONE_AT_A_TIME
         .lock()
