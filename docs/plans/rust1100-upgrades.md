@@ -44,7 +44,7 @@ matters more to our numbers than anything in 1.100 itself.
 | P0 | `bf1fd3a` | Every crate inherits `rust-version` and `homepage`; the six libc allocation exports are `unsafe extern "C"`; the division scans find their `.s` under either Cargo layout and exit non-zero when they cannot run |
 | P1 | `afdfceb` | Pin 1.97.1 -> 1.100.0 in `rust-toolchain.toml`, `ci.yml`, `release.yml`, with the measurement in `docs/opps.md` ("Toolchain") |
 | P2, P3 | `bb87176` | `Allocator` for `RustyAlloc` and `Heap` behind `allocator-api`; the `Heap::alloc` alignment fix; the conformance suite; the no-unwind scan; the `msrv` job and the other CI steps |
-| P5 | `38d1222` | The three-day dependency cooldown; `unused_dependencies` denied |
+| P5 | `38d1222` | The three-day dependency cooldown. (It also denied `unused_dependencies`; that was undone the next day: under miri `libc` is legitimately unused, and the denial stopped `cargo miri test -p rusty_alloc` before it compiled) |
 | Follow-up | the commit that added this section | The API crate under miri as its own CI job (`miri-api`) with trimmed sizes; the wasm size baseline; this outcome |
 
 ### Where the plan was wrong, and what building it found
