@@ -112,6 +112,7 @@ Run on the branch's final tree with Rust 1.100.0, unless a row says otherwise.
 | `no_std` with `allocator-api`, riscv32 | builds |
 | Poison: twelve breakages of the impls | twelve caught, none survived; six kept in `tools/gate-selftest.sh`, all six fire |
 | Miri (nightly 2026-11-09), the conformance suite and `tests/api_miri.rs` | 34 of 34 and 5 of 5: no undefined behaviour, no leak. Run twice: at larger sizes (32 minutes on a busy machine) and at the trimmed sizes the `miri-api` job uses (about a quarter of that) |
+| Miri on the core crate, full (`cargo miri test -p rusty_alloc`), on the final tree after the heap fast paths and the no-adopt fix | 29 test binaries, 134 passed, 0 failed, no undefined behaviour, no leak; 3 h 26 min on a busy machine (2026-11-13) |
 | Unsafe census ratchet | 1,208, baseline and `UNSAFE.md` updated |
 | No-unwind ratchet (Linux) | 28 sites, baseline 28; the self-test fires |
 | Division scans under 1.97.1 and 1.100.0 | the same counts under both; the self-test fires under both |
@@ -126,10 +127,6 @@ The core's own miri job has the same line in its log.
 
 Not run here, and why:
 
-- **Miri on the core crate** (`cargo miri test -p rusty_alloc`, 4.4 hours on
-  CI). No file under `crates/rusty_alloc/src` changed on this branch, and the
-  full run passed earlier the same day on `main`'s code plus the vein 10
-  change. CI runs it on the pull request.
 - **macOS native tests, Kani, the fuzz smoke runs, `cargo deny` / `audit` /
   `vet`, semgrep.** Not installed locally; CI runs them on the pull request.
   No dependency was added, so the supply-chain jobs have nothing new to
