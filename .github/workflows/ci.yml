@@ -379,7 +379,31 @@ jobs:
           RUSTFLAGS: --cfg ra_small_profile --cfg ra_single_threaded
 
   # G4: the os-layer logic must stay UB-free under miri against the mock prim.
+  #
+  # Three jobs, not one, and the split is by the clock. As one job this took
+  # 4 h 22 min of the 6 hours a job may run (2026-11-12), and on 2026-11-13 the
+  # same work on a slower runner was cancelled at 6 h 0 min with every test it
+  # had reached passing: the per-test interpreted time was identical to the
+  # green run's (404 s, 114 s, 381 s), the wall clock 1.25 to 1.9 times
+  # longer. Two tests are nearly all of it: `rss_churn` (3 h 23 min then,
+  # 4 h 14 min on the slow runner) and `stress_mt` (48 min then, unfinished
+  # after 90). Each has a job of its own; everything else is ten minutes.
+  # Run side by side, the longest of the three is what the suite takes, and
+  # none is near the limit.
   miri:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - part: all but the two long tests
+            args: >-
+              -- --skip cycling_rounds_should_not_carve_fresh_pages_every_round
+              --skip abandon_adopt_reuse_storm
+          - part: rss_churn
+            args: --test rss_churn
+          - part: stress_mt
+            args: --test stress_mt
+    name: miri (${{ matrix.part }})
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -388,7 +412,7 @@ jobs:
           toolchain: nightly
           components: miri
       - name: miri (mock prim backend)
-        run: cargo +nightly miri test -p rusty_alloc
+        run: cargo +nightly miri test -p rusty_alloc ${{ matrix.args }}
 
   # The safe surface under miri. Until 2026-11 only the core crate ran there,
   # so `tests/api_miri.rs` ran under miri on a developer's machine or not at
