@@ -729,6 +729,60 @@ reservation.
 - The commit step above 4 MiB is linear (seven calls from 4 to 32 MiB).
   Making it proportional trades commit charge for calls; not taken.
 
+## Toolchain: Rust 1.97.1 -> 1.100.0, 2026-11-12 (LLVM 22 -> 23)
+
+Not a win and not a loss of ours: the same source, compiled by two compilers.
+Recorded so that no later row is read as a code change when it is the
+compiler, and because users compile this crate with their own toolchain, so
+anyone on 1.100 has been running these numbers since the day it shipped.
+`docs/plans/rust1100-upgrades.md` (P1) has the method.
+
+Three arms, callgrind, identical program output on every instrument: 2.5.0 as
+released on 1.97.1; 2.5.0 with the two source changes 1.100 needs to build
+quietly (the `unsafe extern "C"` on the libc exports and the inherited
+`rust-version`) on 1.97.1; and that same tree on 1.100.0.
+
+The source changes cost nothing: perl and sqlite are identical to the
+instruction, whole program and allocator-only, and so is every op.
+
+| instrument | 1.97.1 | 1.100.0 | delta |
+|---|---:|---:|---:|
+| perl, allocator only | 20,636,725 | 20,640,869 | +4,144 (+0.020 %) |
+| sqlite, allocator only | 3,894,667 | 3,894,778 | +111 (+0.003 %) |
+| lua, allocator only | 47,125,827 | 47,137,359 | +11,532 (+0.024 %) |
+| python, allocator only | 154,142 | 154,480 | +338 (+0.22 %) |
+| op `small`, `med`, `big`, `calloc`, `batch_lifo`, `mixed`, `huge` | | | **identical** |
+| op `realloc` | 203.45 | 203.92 | +0.47 Ir/op |
+| op `aligned` | 79.13 | 79.63 | +0.50 Ir/op |
+
+**Every fast path is the same code under both compilers.** That includes the
+`asm!` goto blocks in `free`, the split bodies and the outlined cold arms,
+all of which were shaped against LLVM 22's inlining decisions.
+
+Where the instructions went, by function (`fdiff`, 1.100.0 minus 1.97.1):
+
+- `Heap::malloc_generic_once`: **+3 Ir per call** on the realloc and aligned
+  scans (+93,750 over 31,253 calls; +74,997 over 25,000), and +4,629 over
+  8,954 calls on perl, where `malloc_generic_walk` gives 492 back.
+- `Heap::malloc_aligned_at_slow`: **+5 Ir per call** (+125,000 over 25,000).
+- `Heap::collect_inner`: **about +102 Ir per call** (+20,400 over the 200
+  thread exits of `rust-threads`; +103 per call on the realloc scan). The
+  vein 10 sweep (`6fc177d`, not merged when this was measured) rewrites this
+  function, so its number is to be taken again on top of that.
+
+The Rust workloads moved more, and not in the allocator: whole-program
+`maps` +2.93 %, `threads` +1.70 %, `overaligned` +0.35 %, `trees` -0.05 %. By
+function that is the standard library and the workload being compiled
+differently (`hashbrown` inserts no longer inlined into `maps::main`, the
+thread spawn hooks, `u64` formatting). The README's Rust table is therefore a
+1.97.1 table, and its two columns must always come from one compiler.
+
+**Open, from this row:** `malloc_generic_once` (+3) and
+`malloc_aligned_at_slow` (+5) are layout or register-allocation changes in
+functions whose source did not change, the kind `rusty-compiler-leverage`
+says to re-test after an inlining boundary moves. Three refutations recorded
+above against LLVM 22 are worth one more run on 23 for the same reason.
+
 ## Banked
 
 ### 8. Collect-loop double `block_next` — LANDED 2026-08-20

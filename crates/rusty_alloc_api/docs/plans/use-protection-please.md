@@ -50,7 +50,7 @@ violated precondition; the core's double-free abort and Miri are the nets.
 
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
-| H-03 | Toolchain pinned (`rust-toolchain.toml`) | Completed | Workspace pin `1.97.1` | |
+| H-03 | Toolchain pinned (`rust-toolchain.toml`) | Completed | Workspace pin `1.100.0` | |
 | H-04 | Committed `.cargo/config.toml` hardening defaults | Completed | `.cargo/config.toml` (2026-08-19): full RELRO (`-z relro -z now`) + `-z noexecstack` on both Linux targets, `/NXCOMPAT /DYNAMICBASE /CETCOMPAT` on MSVC. VERIFIED IN THE ARTIFACT, not assumed — `readelf` on the shipped cdylib shows `GNU_RELRO`, `FLAGS: BIND_NOW`, and `GNU_STACK RW` (non-exec). Frame pointers DELIBERATELY excluded and measured: +6.14 Ir/op batch (+10.4%), +11.01 small (+14.0%) — they reinstate the prologues M13/M16/the 2026-08-19 campaign removed; the debuggability intent is met by `debug = true` shipping full DWARF instead. Deviation stated in the file | |
 | H-05 | ★ Release profile hardened (overflow-checks, LTO, panic policy) | Completed | Inherits the workspace profile; `overflow-checks` WAIVED by the owner (Tim) 2026-08-20 on the measured +7.1% batch / +11% mixed cost, time-bounded in the core plan Waivers table | |
 | H-06 | Security toolchain available to CI and developers | Completed | Workspace CI: version-pinned deny/audit/fuzz/miri/clippy/rustfmt | |
