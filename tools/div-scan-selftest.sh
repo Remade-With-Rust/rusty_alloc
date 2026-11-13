@@ -27,14 +27,18 @@ RS
 
 cd "$D" || exit 1
 export CARGO_TARGET_DIR=$D/target
+# A blind pattern or a missing file fails the self-test.
+fail=0
 
 probe() {
   local target="$1" pat="$2"
   rustup target add "$target" >/dev/null 2>&1
   cargo rustc --release --target "$target" -- --emit=asm >/dev/null 2>&1
   local f
-  f=$(find "$D/target/$target/release/deps" -name 'divprobe-*.s' 2>/dev/null | head -1)
-  if [ -z "$f" ]; then echo "  $target: NO ASM EMITTED (scan would be vacuous)"; return; fi
+  # By name under the profile directory, not under `deps/`: see the note
+  # in div-scan-targets.sh on Cargo 1.100's build-directory layout.
+  f=$(find "$D/target/$target/release" -name 'divprobe-*.s' 2>/dev/null | head -1)
+  if [ -z "$f" ]; then echo "  $target: NO ASM EMITTED (scan would be vacuous)"; fail=1; return; fi
   local n
   n=$(grep -cE "$pat" "$f")
   printf "  %-28s pattern hits in a KNOWN-dividing crate: %s\n" "$target" "$n"
@@ -42,6 +46,7 @@ probe() {
     grep -oE "$pat" "$f" | sort | uniq -c | sed 's/^/      /' | head -6
   else
     echo "      *** PATTERN IS BLIND — the real scan's zero is meaningless ***"
+    fail=1
     echo "      sample of what the file actually contains:"
     grep -iE 'div|rem' "$f" | head -5 | sed 's/^/        /'
   fi
@@ -51,3 +56,5 @@ echo "=== instrument self-test ==="
 probe x86_64-apple-darwin  '^[[:space:]]+(idiv|div)[qlbw]?[[:space:]]|^[[:space:]]+v?div[sp][sd][[:space:]]'
 probe aarch64-apple-darwin '^[[:space:]]+(udiv|sdiv|fdiv)[[:space:]]'
 probe wasm32-unknown-unknown '(i32|i64|f32|f64)\.(div_[us]|rem_[us]|div)([[:space:]]|$)'
+
+exit $fail

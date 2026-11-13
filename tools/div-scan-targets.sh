@@ -11,12 +11,18 @@
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$HOME/ra_xt}
+# A scan that could not run is a failure, never a clean result.
+fail=0
 
 scan() {
   local target="$1" pat="$2"
   echo "########## $target"
   rustup target add "$target" >/dev/null 2>&1
-  rm -f "$CARGO_TARGET_DIR/$target/release/deps/"*.s 2>/dev/null
+  # Searched by name under the whole profile directory: Cargo 1.100 moved
+  # intermediate artifacts from `release/deps/` to
+  # `release/build/<pkg>/<hash>/out/`, and says the layout is not a stable
+  # interface. A name search holds under both.
+  find "$CARGO_TARGET_DIR/$target/release" -name 'rusty_alloc-*.s' -delete 2>/dev/null
   # Cargo skips codegen for a crate it considers fresh, which yields NO .s at
   # all — so force it. Without this the scan reports "no asm" rather than a
   # count, which is at least loud, but it has to actually run.
@@ -24,11 +30,11 @@ scan() {
   local out
   out=$(cargo rustc --release -p rusty_alloc --target "$target" -- --emit=asm 2>&1)
   if echo "$out" | grep -qE '^error'; then
-    echo "  BUILD FAILED:"; echo "$out" | grep -E '^error' -A3 | head -6; echo; return
+    echo "  BUILD FAILED:"; echo "$out" | grep -E '^error' -A3 | head -6; echo; fail=1; return
   fi
   local f
-  f=$(find "$HOME/ra_xt/$target/release/deps" -name 'rusty_alloc-*.s' 2>/dev/null | head -1)
-  [ -z "$f" ] && { echo "  no .s emitted"; echo; return; }
+  f=$(find "$CARGO_TARGET_DIR/$target/release" -name 'rusty_alloc-*.s' 2>/dev/null | head -1)
+  [ -z "$f" ] && { echo "  no .s emitted"; echo; fail=1; return; }
   echo "  asm lines: $(wc -l < "$f")"
   local n
   n=$(grep -cE "$pat" "$f")
@@ -46,3 +52,5 @@ scan() {
 scan x86_64-apple-darwin  '^[[:space:]]+(idiv|div)[qlbw]?[[:space:]]|^[[:space:]]+v?div[sp][sd][[:space:]]'
 scan aarch64-apple-darwin '^[[:space:]]+(udiv|sdiv|fdiv)[[:space:]]'
 scan wasm32-unknown-unknown '(i32|i64|f32|f64)\.(div_[us]|rem_[us]|div)([[:space:]]|$)'
+
+exit $fail
