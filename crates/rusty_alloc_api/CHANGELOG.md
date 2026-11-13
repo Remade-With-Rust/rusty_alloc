@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`core::alloc::Allocator` for `RustyAlloc` and `Heap`**, behind the new
+  `allocator-api` feature (Rust 1.100, where the trait became stable).
+  `Vec::new_in(RustyAlloc)` puts one collection on this allocator without
+  replacing the program's global one; `Vec::new_in(&heap)` and
+  `Box::new_in(x, &heap)` put standard collections in a first-class heap
+  with no unsafe code, and the borrow stops them outliving it, which is
+  the safe form of a destroyable heap that this crate's docs promised.
+  Zero-sized layouts never reach the allocator, `grow` and `shrink`
+  accept a changed alignment, a failed `grow` leaves the old block as it
+  was, and no method unwinds: each runs under a guard that aborts.
+  `tests/allocator_conformance.rs` runs every check on the global handle,
+  both kinds of heap and the standard library's `System` as a control
+  arm, natively, on a 32-bit target and under miri; twelve deliberate
+  breakages of the impls were each caught by it, and six of them are now
+  permanent cases in `tools/gate-selftest.sh`. Measured on the same
+  collection work (`docs/opps.md`, "The `Allocator` route"):
+  `Vec::new_in(RustyAlloc)` costs 2,535.48 instructions per step where
+  the global allocator costs 2,533.37, and a heap 2,706.95.
+- `RustyAlloc` is `Clone`, `Copy`, `Debug` and `Default`. It has no state;
+  a collection with an allocator parameter needs `Clone` on it to be
+  cloned.
+
+### Fixed
+
+- **`Heap::alloc` could return a misaligned block on a 32-bit target.**
+  The alignment test was written `<= 8`. A one-word block is four bytes
+  there and only four-aligned, so an eight-aligned layout of four bytes
+  or fewer could land on an odd word. The three tiers are now
+  `GlobalAlloc::alloc`'s, stated in words: up to one word, up to two
+  (where the request is raised to two words, which the size classes
+  align), and above. 64-bit targets were correct and gain the
+  size-class path for a 16-byte alignment, which went through the
+  aligned allocator before.
+- **The crates now declare their minimum Rust version.** The workspace
+  set `rust-version = "1.88"` but no crate inherited it, so both
+  published crates carried none. CI now builds on 1.88.
+
 ## [2.5.0](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-api-v2.4.0...rusty_alloc-api-v2.5.0) - 2026-11-12
 
 ### Changed

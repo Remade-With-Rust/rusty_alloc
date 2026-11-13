@@ -783,6 +783,68 @@ functions whose source did not change, the kind `rusty-compiler-leverage`
 says to re-test after an inlining boundary moves. Three refutations recorded
 above against LLVM 22 are worth one more run on 23 for the same reason.
 
+## The `Allocator` route, 2026-11-12 (`docs/plans/rust1100-upgrades.md`, P2)
+
+Rust 1.100 made `core::alloc::Allocator` stable, and `rusty_alloc-api` now
+implements it for `RustyAlloc` and `Heap` (feature `allocator-api`). That is a
+third way into the allocator, beside the C exports and `GlobalAlloc`, and it
+had no instrument. It has one now: `bench/rust-globalalloc/src/alloc_work.rs`
+is one body of collection work (growth by doubling, exact shrinks, same-size
+box churn, a byte buffer) generic over the allocator, built three ways.
+Callgrind, two-point, instructions per step, identical checksum:
+
+| route | Ir per step | against `Global` |
+|---|---:|---:|
+| `vec_global`: `std::alloc::Global` through `#[global_allocator]` | 2,533.37 | |
+| `vec_direct`: `Vec::new_in(RustyAlloc)`, no guard | 2,507.89 | -1.0 % |
+| `vec_direct`: `Vec::new_in(RustyAlloc)`, **as shipped** | 2,535.48 | +0.08 % |
+| `vec_heap`: `Vec::new_in(&heap)`, no guard | 2,700.23 | +6.6 % |
+| `vec_heap`: `Vec::new_in(&heap)`, **as shipped** | 2,706.95 | +6.9 % |
+
+The direct route is cheaper than the global one before the guard: no
+`__rust_alloc` shim, and the layout is a constant at the call. It ships at
+parity because of the next finding.
+
+### 28 panic sites are reachable from an allocation in a release build
+
+The trait forbids any method to unwind. The plan assumed a release build had
+no panic on these paths. `tools/no-unwind-scan.sh` was written to check that
+against the machine code, and it refuted it: linked with fat LTO into one
+object, the twelve trait methods reach **28 sites in 18 functions**
+(`tools/no-unwind-baseline.txt`, x86_64 Linux, Rust 1.100):
+
+| where | sites | what |
+|---|---:|---|
+| `arena::chunk_alloc_n_inner`, `chunk_release`, `commit_claimed`, `chunk_alloc_inner` | 4, 3, 3, 1 | bounds check |
+| `Heap::free_local_at`, `Heap::try_guarded`, `init::init_thread_heap` | 2, 2, 2 | bounds check |
+| `Heap::malloc_generic_once`, `malloc_aligned_at_slow`, `collect_inner`, `adopt_segment` | 1 each | bounds check |
+| `alloc::retire_or_abort`, `segment::span_alloc`, `segment::schedule_purge` | 1 each | bounds check |
+| `init::init_thread_heap`, `options::ensure_init_slow` | 1 each | slice range check |
+| `page::page_purge_free_slots` | 1 | remainder by zero |
+| `options::out_fmt` | 1 | `expect` |
+
+None can fire while the allocator's own state is intact. Each is still an
+index the optimiser could not prove, a compare and a branch on the way past
+it, and a path on which a method would unwind. So the impls run every method
+under a guard that aborts on an unwind, in every build, and the count is a
+ratchet: it may only go down.
+
+The same sites sit behind `GlobalAlloc`, which has the same rule and no
+guard. Nothing new: that has been true of every release.
+
+**Open, and it pays twice.** Take the 28 to zero and (a) the guard can go,
+which is the 27.6 Ir per step on the direct route and 6.7 inside a heap, and
+(b) each bounds check removed is its own two instructions on a path that
+includes `malloc_generic_once`, `free_local_at` and `collect_inner`. A mask
+where the bound is a power of two, the bound carried in a type, or `get`
+with an abort (the allocator's corruption paths already abort) each work;
+which one costs nothing is a measurement per site.
+
+**Open: a heap is 6.6 % behind the global handle on the same work.** The
+global route has its fast path inline in the caller; `Heap::alloc` calls
+`heap_malloc`, which is out of line and checks the deferred-free hook first.
+Nobody had measured this route before, so nobody had shaped it.
+
 ## Banked
 
 ### 8. Collect-loop double `block_next` — LANDED 2026-08-20

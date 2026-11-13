@@ -12,7 +12,8 @@ publish = false
 [workspace]
 
 [dependencies]
-rusty_alloc-api = { path = "../../crates/rusty_alloc_api" }
+# `allocator-api` for the `vec_*` workloads (Rust 1.100).
+rusty_alloc-api = { path = "../../crates/rusty_alloc_api", features = ["allocator-api"] }
 
 [profile.release]
 debug = true

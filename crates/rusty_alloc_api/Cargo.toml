@@ -28,6 +28,15 @@ std = ["rusty_alloc/std"]
 debug_checks = ["rusty_alloc/debug_checks"]
 profile = ["rusty_alloc/profile"]
 secure = ["rusty_alloc/secure"]
+# `core::alloc::Allocator` for `RustyAlloc` and `Heap`. The trait is stable
+# from Rust 1.100, which is above this crate's `rust-version`, so it is opt-in:
+# without the feature the crate builds on its declared minimum, and with it an
+# older compiler stops at `use of unstable library feature 'allocator_api'`.
+# It becomes unconditional when the minimum reaches 1.100.
+allocator-api = []
+
+[package.metadata.docs.rs]
+features = ["allocator-api"]
 
 [lints]
 workspace = true

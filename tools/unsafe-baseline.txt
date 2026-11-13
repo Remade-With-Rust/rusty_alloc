@@ -16,9 +16,10 @@
    105  crates/rusty_alloc/src/segment.rs
      8  crates/rusty_alloc/src/shared_light.rs
      3  crates/rusty_alloc/src/stats.rs
+    38  crates/rusty_alloc_api/src/allocator.rs
     19  crates/rusty_alloc_api/src/lib.rs
     15  crates/rusty_alloc_bench/src/kernels.rs
     14  crates/rusty_alloc_bench/src/replay.rs
    358  crates/rusty_alloc_ffi/src/lib.rs
-    51  crates/rusty_alloc_override/src/lib.rs
+    57  crates/rusty_alloc_override/src/lib.rs
     26  crates/rusty_alloc_wasm/src/lib.rs

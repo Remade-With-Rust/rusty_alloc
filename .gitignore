@@ -11,3 +11,5 @@
 
 # Standalone bench crates (their own workspaces) build next to themselves.
 bench/*/target/
+# The no-unwind probe is a standalone crate too.
+tools/*/target/
