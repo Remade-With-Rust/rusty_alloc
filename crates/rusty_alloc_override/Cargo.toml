@@ -5,6 +5,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 # Not published: this is the LD_PRELOAD arm used to run the 1:1 corpus, not a
 # library anyone depends on. It ships as a built artifact, if at all.

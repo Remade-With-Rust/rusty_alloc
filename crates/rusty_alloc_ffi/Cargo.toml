@@ -5,6 +5,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 # Not published for 0.1.0-alpha: the C ABI ships as a built cdylib/staticlib,
 # and publishing a crate whose whole purpose is a native artifact adds a

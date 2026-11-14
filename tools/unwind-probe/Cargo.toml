@@ -1,0 +1,36 @@
+# The object `tools/no-unwind-scan.sh` reads. One exported function per
+# `Allocator` method of `RustyAlloc` and of `Heap`, linked with fat LTO into a
+# single module, so the emitted assembly holds exactly the code those twelve
+# methods can reach and nothing else. If no panic is reachable from them, that
+# assembly names no panic entry point; the scan counts the names.
+#
+# Standalone (its own workspace), like `bench/rust-globalalloc`: the main build
+# never compiles it. Needs Rust 1.100, where `Allocator` is stable.
+[package]
+name = "unwind-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+rusty_alloc-api = { path = "../../crates/rusty_alloc_api", features = ["allocator-api"] }
+
+[features]
+# Adds one export that can panic, for the scan to prove its pattern fires.
+selftest = []
+
+# The shape a release build of a user's program has: optimised, no debug
+# assertions, unwinding panics. `panic = "abort"` would make the scan vacuous,
+# since nothing unwinds there whatever the code does.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug-assertions = false
+overflow-checks = false
+panic = "unwind"

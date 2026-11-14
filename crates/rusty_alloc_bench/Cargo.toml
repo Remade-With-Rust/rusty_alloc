@@ -5,6 +5,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 # Not published: dev harness (Tier-B benches, trace record/replay, G1/G2 gates).
 publish = false

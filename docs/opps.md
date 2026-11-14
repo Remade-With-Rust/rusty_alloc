@@ -729,6 +729,160 @@ reservation.
 - The commit step above 4 MiB is linear (seven calls from 4 to 32 MiB).
   Making it proportional trades commit charge for calls; not taken.
 
+## Toolchain: Rust 1.97.1 -> 1.100.0, 2026-11-12 (LLVM 22 -> 23)
+
+Not a win and not a loss of ours: the same source, compiled by two compilers.
+Recorded so that no later row is read as a code change when it is the
+compiler, and because users compile this crate with their own toolchain, so
+anyone on 1.100 has been running these numbers since the day it shipped.
+`docs/plans/rust1100-upgrades.md` (P1) has the method.
+
+Three arms, callgrind, identical program output on every instrument: 2.5.0 as
+released on 1.97.1; 2.5.0 with the two source changes 1.100 needs to build
+quietly (the `unsafe extern "C"` on the libc exports and the inherited
+`rust-version`) on 1.97.1; and that same tree on 1.100.0.
+
+The source changes cost nothing: perl and sqlite are identical to the
+instruction, whole program and allocator-only, and so is every op.
+
+| instrument | 1.97.1 | 1.100.0 | delta |
+|---|---:|---:|---:|
+| perl, allocator only | 20,636,725 | 20,640,869 | +4,144 (+0.020 %) |
+| sqlite, allocator only | 3,894,667 | 3,894,778 | +111 (+0.003 %) |
+| lua, allocator only | 47,125,827 | 47,137,359 | +11,532 (+0.024 %) |
+| python, allocator only | 154,142 | 154,480 | +338 (+0.22 %) |
+| op `small`, `med`, `big`, `calloc`, `batch_lifo`, `mixed`, `huge` | | | **identical** |
+| op `realloc` | 203.45 | 203.92 | +0.47 Ir/op |
+| op `aligned` | 79.13 | 79.63 | +0.50 Ir/op |
+
+**Every fast path is the same code under both compilers.** That includes the
+`asm!` goto blocks in `free`, the split bodies and the outlined cold arms,
+all of which were shaped against LLVM 22's inlining decisions.
+
+Where the instructions went, by function (`fdiff`, 1.100.0 minus 1.97.1):
+
+- `Heap::malloc_generic_once`: **+3 Ir per call** on the realloc and aligned
+  scans (+93,750 over 31,253 calls; +74,997 over 25,000), and +4,629 over
+  8,954 calls on perl, where `malloc_generic_walk` gives 492 back.
+- `Heap::malloc_aligned_at_slow`: **+5 Ir per call** (+125,000 over 25,000).
+- `Heap::collect_inner`: **about +102 Ir per call** (+20,400 over the 200
+  thread exits of `rust-threads`; +103 per call on the realloc scan). The
+  vein 10 sweep (`6fc177d`, not merged when this was measured) rewrites this
+  function, so its number is to be taken again on top of that.
+
+The Rust workloads moved more, and not in the allocator: whole-program
+`maps` +2.93 %, `threads` +1.70 %, `overaligned` +0.35 %, `trees` -0.05 %. By
+function that is the standard library and the workload being compiled
+differently (`hashbrown` inserts no longer inlined into `maps::main`, the
+thread spawn hooks, `u64` formatting). The README's Rust table is therefore a
+1.97.1 table, and its two columns must always come from one compiler.
+
+The wasm fixture, gzipped (`tools/wasm-size.sh`), same tree: 21,254 bytes on
+1.97.1, 21,432 on 1.100.0, so +178 (+0.84 %) from the compiler. The ratchet's
+baseline said 20,873: it had fallen 381 bytes behind `main` inside its 3 %
+tolerance, which left 67 bytes of headroom after the bump. Re-baselined to
+21,432 with this row, so the next real growth is seen as growth.
+
+**Open, from this row:** `malloc_generic_once` (+3) and
+`malloc_aligned_at_slow` (+5) are layout or register-allocation changes in
+functions whose source did not change, the kind `rusty-compiler-leverage`
+says to re-test after an inlining boundary moves. Three refutations recorded
+above against LLVM 22 are worth one more run on 23 for the same reason.
+
+## The `Allocator` route, 2026-11-12 (`docs/plans/rust1100-upgrades.md`, P2)
+
+Rust 1.100 made `core::alloc::Allocator` stable, and `rusty_alloc-api` now
+implements it for `RustyAlloc` and `Heap` (feature `allocator-api`). That is a
+third way into the allocator, beside the C exports and `GlobalAlloc`, and it
+had no instrument. It has one now: `bench/rust-globalalloc/src/alloc_work.rs`
+is one body of collection work (growth by doubling, exact shrinks, same-size
+box churn, a byte buffer) generic over the allocator, built three ways.
+Callgrind, two-point, instructions per step, identical checksum:
+
+| route | Ir per step | against `Global` |
+|---|---:|---:|
+| `vec_global`: `std::alloc::Global` through `#[global_allocator]` | 2,533.37 | |
+| `vec_direct`: `Vec::new_in(RustyAlloc)`, no guard | 2,507.89 | -1.0 % |
+| `vec_direct`: `Vec::new_in(RustyAlloc)`, **as shipped** | 2,535.48 | +0.08 % |
+| `vec_heap`: `Vec::new_in(&heap)`, no guard, first cut | 2,700.23 | +6.6 % |
+| `vec_heap`: `Vec::new_in(&heap)`, first cut | 2,706.95 | +6.9 % |
+| `vec_heap`: `Vec::new_in(&heap)`, **as shipped** (2026-11-13, below) | **2,524.31** | **-0.36 %** |
+
+The direct route is cheaper than the global one before the guard: no
+`__rust_alloc` shim, and the layout is a constant at the call. It ships at
+parity because of the next finding.
+
+### 28 panic sites are reachable from an allocation in a release build
+
+The trait forbids any method to unwind. The plan assumed a release build had
+no panic on these paths. `tools/no-unwind-scan.sh` was written to check that
+against the machine code, and it refuted it: linked with fat LTO into one
+object, the twelve trait methods reach **28 sites in 18 functions**
+(`tools/no-unwind-baseline.txt`, x86_64 Linux, Rust 1.100):
+
+| where | sites | what |
+|---|---:|---|
+| `arena::chunk_alloc_n_inner`, `chunk_release`, `commit_claimed`, `chunk_alloc_inner` | 4, 3, 3, 1 | bounds check |
+| `Heap::free_local_at`, `Heap::try_guarded`, `init::init_thread_heap` | 2, 2, 2 | bounds check |
+| `Heap::malloc_generic_once`, `malloc_aligned_at_slow`, `collect_inner`, `adopt_segment` | 1 each | bounds check |
+| `alloc::retire_or_abort`, `segment::span_alloc`, `segment::schedule_purge` | 1 each | bounds check |
+| `init::init_thread_heap`, `options::ensure_init_slow` | 1 each | slice range check |
+| `page::page_purge_free_slots` | 1 | remainder by zero |
+| `options::out_fmt` | 1 | `expect` |
+
+None can fire while the allocator's own state is intact. Each is still an
+index the optimiser could not prove, a compare and a branch on the way past
+it, and a path on which a method would unwind. So the impls run every method
+under a guard that aborts on an unwind, in every build, and the count is a
+ratchet: it may only go down.
+
+The same sites sit behind `GlobalAlloc`, which has the same rule and no
+guard. Nothing new: that has been true of every release.
+
+**Open, and it pays twice.** Take the 28 to zero and (a) the guard can go,
+which is the 27.6 Ir per step on the direct route and 6.7 inside a heap, and
+(b) each bounds check removed is its own two instructions on a path that
+includes `malloc_generic_once`, `free_local_at` and `collect_inner`. A mask
+where the bound is a power of two, the bound carried in a type, or `get`
+with an abort (the allocator's corruption paths already abort) each work;
+which one costs nothing is a measurement per site.
+
+### A heap was 6.9 % behind the global handle. Closed 2026-11-13: 2,706.95 -> 2,524.31
+
+Nobody had measured this route before, so nobody had shaped it. By function
+(`cg.py`, 40,000 steps), the heap went through the old general entry points
+while the global handle had every tuned one:
+
+| | global handle | heap, first cut | heap, now |
+|---|---|---|---|
+| realloc | `__rust_realloc` 5.0 + `realloc_rust` 27.6, and `realloc_move_out` 36.7 on the 49 % that move | `heap_realloc` 64.5 on every call | `heap_realloc_fast` 25.3, and `heap_realloc_move_out` 36.3 on the 49 % |
+| allocate | the pop, inline in the caller | `Heap::alloc` 5.0 + `heap_malloc` 23.0, two calls | the pop, inline in the caller |
+| free | inline in the caller | `Heap::dealloc` 2.0 + `free` 18.2, two calls | inline in the caller |
+
+Three new entry points in the core, each the tuned body with the heap's box
+passed in where the original reads the thread's: `heap_malloc_fast`,
+`heap_zalloc_fast`, `heap_realloc_fast`. `Heap`'s methods in the API crate
+are `#[inline]` and call them, and `Heap::dealloc` uses the inline free
+`GlobalAlloc::dealloc` does. A moved block is allocated from the named heap,
+which is why the global realloc could not simply be reused.
+
+The net is 9 instructions per step under the global route. The realloc is
+cheaper than the global one by itself (no `__rust_realloc` shim, the box in
+a register), and the standard library's own code around it inlines a little
+differently in the two programs (`RawVecInner::shrink` is out of line in
+`vec_heap` and inline in `vec_global`), which takes some of that back.
+
+What it cost: nothing measurable anywhere else. No existing function was
+edited, and the LD_PRELOAD object's `.text` is byte-identical before and
+after (309,843 bytes, same hash), so every published number stands.
+`vec_global` and `vec_direct` are unchanged to the hundredth. The
+no-unwind count stays 28: the new paths add no bounds check.
+
+Not covered: the realloc leaf exists on x86-64 Linux only (`LEAF_MOVE`), as
+the global one does. Elsewhere `heap_realloc_fast` is the old
+`heap_realloc`, so Windows and macOS get the allocate and free halves and
+not the realloc half.
+
 ## Banked
 
 ### 8. Collect-loop double `block_next` — LANDED 2026-08-20

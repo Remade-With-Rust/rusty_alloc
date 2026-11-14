@@ -132,7 +132,7 @@ members = [
 # different files that never got the section. Fixed here, in both, and
 # verified by extracting the packaged `.crate` before publishing rather than
 # checking the live page afterwards.
-version = "2.5.0"
+version = "2.6.0"
 edition = "2024"
 # MSRV. Declared for the first time in 1.0.1 because this release genuinely
 # needs it: `asm!` label blocks (`asm_goto`, stable 1.87) carry the free path's
@@ -225,3 +225,22 @@ debug = true            # symbols for profiling; strip at distribution, not here
 [profile.bench-dist]    # distribution-shaped profile for A/B honesty checks
 inherits = "release"
 debug = false
+
+# Cargo's own lints (Cargo 1.100, the pinned toolchain). `unused_dependencies`
+# is named here so the choice is on the page, and the choice is WARN, which is
+# also Cargo's default.
+#
+# It was `deny` for one day (38d1222) and that was wrong for this workspace.
+# The lint reads one build's configuration, and this crate's dependencies are
+# chosen by configuration: under miri the OS layer is the mock backend, so
+# `libc` is unused in that build and only that build, and `cargo miri test -p
+# rusty_alloc` stopped at "unused dependency `libc`" before compiling a line.
+# Found by the first full gate run after the change. A lint that cannot see
+# `cfg` cannot be an error here.
+#
+# An older Cargo does not know this table and says `unused manifest key
+# lints.cargo` for each member when it builds THIS workspace, which the `msrv`
+# job does on 1.88: a warning there. It says nothing when the published
+# crates are somebody's dependency.
+[workspace.lints.cargo]
+unused_dependencies = "warn"

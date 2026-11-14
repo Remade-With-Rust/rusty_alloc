@@ -155,6 +155,10 @@ impl Default for Heap {
 pub const LARGE_CACHE_MAX_SLICES: usize = (4 << 20) / SEGMENT_SLICE_SIZE;
 
 /// The heap.
+// Four flags, and they stay four `bool`s: each is an independent fact read on
+// its own path, and `deferred_due` is read as a whole byte by the allocation
+// miss, which is one instruction because it is not a mask (census 4, vein 7).
+#[allow(clippy::struct_excessive_bools)]
 pub struct Heap {
     /// Page queues, indexed by bin; `pages[BIN_FULL]` parks full pages.
     pub pages: [PageQueue; BIN_COUNT],
@@ -229,6 +233,24 @@ pub struct Heap {
     pub guarded_max: usize,
     /// Counters.
     pub stats: Stats,
+    /// Never adopt an abandoned segment. Set for a heap that can be DESTROYED
+    /// (`mi_heap_new` with `allow_destroy`; `rusty_alloc-api`'s
+    /// `Heap::new_destroyable`), and it is what makes destroying one sound.
+    /// `heap_destroy` releases every segment the heap owns. An adopted
+    /// segment is a dead thread's, and it holds whatever of that thread's
+    /// blocks are still alive: handed to another thread, say, which is still
+    /// using them. Upstream calls this `no_reclaim` and sets it for the same
+    /// reason.
+    ///
+    /// Until 2.6.0 nothing checked. A destroyable heap adopted orphans like
+    /// any other the first time it needed a span, and its teardown unmapped
+    /// them under their owners. Found by the `Allocator` conformance suite the
+    /// first time it ran in a release build: a segmentation fault in 13 runs
+    /// of 40, only with a destroyable heap and a block that outlived its
+    /// thread in the same process.
+    ///
+    /// Last, so no other field moves.
+    pub no_reclaim: bool,
 }
 
 /// The page-queue table every heap starts from, with each bin's block size
@@ -301,6 +323,7 @@ impl Heap {
             guarded_min: 0,
             guarded_max: usize::MAX,
             stats: Stats::new(),
+            no_reclaim: false,
         }
     }
 
@@ -1113,7 +1136,10 @@ impl Heap {
             // soon as the request is met or the list is empty. The cap only
             // exists so a huge orphan backlog cannot stall one allocation; it
             // is not a reclaim budget (see MAX_ADOPT at the top of the fn).
-            for _ in 0..MAX_ADOPT {
+            //
+            // Never for a heap that can be destroyed: see `Heap::no_reclaim`.
+            let adopt_budget = if self.no_reclaim { 0 } else { MAX_ADOPT };
+            for _ in 0..adopt_budget {
                 let aseg = crate::init::abandoned_pop();
                 if aseg.is_null() {
                     break;
@@ -1669,7 +1695,8 @@ impl Heap {
             // does not). A forced purge needs the recommit path audited first.
             // `reclaim`, NOT `force`: a teardown collect is forced but must
             // never adopt (see `collect_for_teardown`).
-            if reclaim {
+            // Nor for a heap that can be destroyed (`Heap::no_reclaim`).
+            if reclaim && !self.no_reclaim {
                 // Bounded only as a stall guard; the list is normally short.
                 const MAX_RECLAIM: usize = 1024;
                 for _ in 0..MAX_RECLAIM {

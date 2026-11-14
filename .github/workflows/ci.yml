@@ -39,7 +39,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
-          toolchain: 1.97.1
+          toolchain: 1.100.0
           components: rustfmt, clippy
       - name: fmt
         run: cargo fmt --all --check
@@ -62,6 +62,20 @@ jobs:
           done
       - name: test (all features)
         run: cargo test --workspace --all-features
+      # The API crate again, OPTIMISED. A debug build is not the program anyone
+      # ships, and this suite showed it twice in one day (2026-11-13): the
+      # destroyable-heap use-after-free (b49c533) crashed a release run one
+      # time in three and a debug run never, because the timing that lets a
+      # heap adopt a dead thread's segment only came up at release speed; and
+      # a test of the system allocator passed in debug on an allocation the
+      # optimiser deletes in release. It also covers the no-unwind guard
+      # where it matters: a build whose reachable panics are bounds checks.
+      - name: test (release, rusty_alloc-api with the Allocator suite)
+        run: cargo test --release -p rusty_alloc-api --features allocator-api
+      # And the destroyable-heap regression test in release, for the same
+      # reason it was missed.
+      - name: test (release, destroy never adopts)
+        run: cargo test --release -p rusty_alloc --test destroy_no_adopt
       # The shared light heap prototype (docs/plans/shared-light-heap.md) is a
       # cfg, so no step above builds it. Its gates are tests/shared_light_heap.rs;
       # the rest of the suite must also pass with it on, in both geometries.
@@ -89,7 +103,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
-          toolchain: 1.97.1
+          toolchain: 1.100.0
       - name: install cargo-deny + cargo-audit + cargo-vet (pinned)
         run: |
           cargo install cargo-deny --version 0.20.2 --locked
@@ -133,9 +147,16 @@ jobs:
       # they existed to catch; this is what stops the fifth.
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
-          toolchain: 1.97.1
+          toolchain: 1.100.0
       - name: prove the gates are not vacuous
         run: bash tools/gate-selftest.sh
+      # `Allocator`'s contract: no method may unwind. The impls meet it with a
+      # guard, and this counts what the guard has to cover: the scan links the
+      # twelve methods into one object and holds the panic sites reachable from
+      # them to a baseline that may only go down. Its self-test proves the
+      # pattern can fire.
+      - name: panic sites reachable from an Allocator method (ratchet)
+        run: bash tools/no-unwind-scan.sh
 
   # H-30: the proofs must keep proving. Kani is slow, so this runs on a
   # schedule and on demand rather than blocking every PR — the harnesses
@@ -151,7 +172,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
-          toolchain: 1.97.1
+          toolchain: 1.100.0
       - name: install kani (pinned)
         run: cargo install --locked kani-verifier --version 0.67.0 && cargo kani setup
       # --ignore-global-asm: Kani cannot analyse the crate's `global_asm!`
@@ -185,7 +206,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
-          toolchain: 1.97.1
+          toolchain: 1.100.0
           targets: x86_64-pc-windows-msvc
       - name: check windows target from linux
         run: cargo check --workspace --target x86_64-pc-windows-msvc
@@ -211,7 +232,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
-          toolchain: 1.97.1
+          toolchain: 1.100.0
           components: clippy
           targets: riscv32imac-unknown-none-elf, riscv32imafc-unknown-none-elf
       # The second geometry is a full test run, not a build check: it changes
@@ -288,6 +309,12 @@ jobs:
         run: cargo build -p rusty_alloc-api --no-default-features --target riscv32imac-unknown-none-elf
         env:
           RUSTFLAGS: --cfg ra_small_profile --cfg ra_single_threaded
+      # The `Allocator` impls name nothing outside `core`, so a firmware can
+      # put a `Vec` in a heap too. Built, so that stays true.
+      - name: build rusty_alloc-api no_std with the Allocator impls
+        run: cargo build -p rusty_alloc-api --no-default-features --features allocator-api --target riscv32imac-unknown-none-elf
+        env:
+          RUSTFLAGS: --cfg ra_small_profile --cfg ra_single_threaded
 
   # The README quotes instruction-count ratios against mimalloc, jemalloc and
   # glibc. `bench/icount-arms.sh` is what produces every column of them, but
@@ -306,7 +333,7 @@ jobs:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
-          toolchain: 1.97.1
+          toolchain: 1.100.0
       - name: install valgrind and jemalloc
         run: |
           sudo apt-get update
@@ -326,8 +353,57 @@ jobs:
           name: icount-${{ github.sha }}
           path: icount.txt
 
+  # The crates declare `rust-version = "1.88"`. Until 2.6.0 that line sat in
+  # the workspace table with no crate inheriting it: nothing was declared, and
+  # nothing checked it. This builds the two published crates' libraries with
+  # exactly that compiler, hosted and bare metal, so the number is a
+  # measurement and not a memory. `cargo +1.88.0` because the repository's
+  # `rust-toolchain.toml` would otherwise choose the compiler. The
+  # `allocator-api` feature is left out on purpose: it is the one part of the
+  # crates above the floor (Rust 1.100), and its manifest comment says so.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.88.0
+          targets: riscv32imac-unknown-none-elf, wasm32-unknown-unknown
+      - name: the published crates build on the declared minimum
+        run: cargo +1.88.0 check --locked -p rusty_alloc -p rusty_alloc-api
+      - name: and for wasm32
+        run: cargo +1.88.0 check --locked -p rusty_alloc --target wasm32-unknown-unknown
+      - name: and bare metal
+        run: cargo +1.88.0 check --locked -p rusty_alloc-api --no-default-features --target riscv32imac-unknown-none-elf
+        env:
+          RUSTFLAGS: --cfg ra_small_profile --cfg ra_single_threaded
+
   # G4: the os-layer logic must stay UB-free under miri against the mock prim.
+  #
+  # Three jobs, not one, and the split is by the clock. As one job this took
+  # 4 h 22 min of the 6 hours a job may run (2026-11-12), and on 2026-11-13 the
+  # same work on a slower runner was cancelled at 6 h 0 min with every test it
+  # had reached passing: the per-test interpreted time was identical to the
+  # green run's (404 s, 114 s, 381 s), the wall clock 1.25 to 1.9 times
+  # longer. Two tests are nearly all of it: `rss_churn` (3 h 23 min then,
+  # 4 h 14 min on the slow runner) and `stress_mt` (48 min then, unfinished
+  # after 90). Each has a job of its own; everything else is ten minutes.
+  # Run side by side, the longest of the three is what the suite takes, and
+  # none is near the limit.
   miri:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - part: all but the two long tests
+            args: >-
+              -- --skip cycling_rounds_should_not_carve_fresh_pages_every_round
+              --skip abandon_adopt_reuse_storm
+          - part: rss_churn
+            args: --test rss_churn
+          - part: stress_mt
+            args: --test stress_mt
+    name: miri (${{ matrix.part }})
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -336,7 +412,31 @@ jobs:
           toolchain: nightly
           components: miri
       - name: miri (mock prim backend)
-        run: cargo +nightly miri test -p rusty_alloc
+        run: cargo +nightly miri test -p rusty_alloc ${{ matrix.args }}
+
+  # The safe surface under miri. Until 2026-11 only the core crate ran there,
+  # so `tests/api_miri.rs` ran under miri on a developer's machine or not at
+  # all. With `allocator-api` this also runs the `Allocator` conformance suite:
+  # every method of both impls under Stacked Borrows, with the leak check on,
+  # which is the one thing that catches a `shrink` to zero that forgets to
+  # free. A job of its own, beside `miri`: that one already takes more than
+  # four of the six hours a job may run.
+  #
+  # Named targets, not the whole crate: `tests/natural_align.rs` walks 4,200
+  # sizes up to 4 MiB and reads every byte, and `tests/reentrancy.rs` counts
+  # allocator calls from process start. Both are native-speed tests of the
+  # core's arithmetic, and the first did not finish in ten minutes under miri
+  # here. The two suites below were written for it.
+  miri-api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: nightly
+          components: miri
+      - name: miri (rusty_alloc-api, Allocator conformance)
+        run: cargo +nightly miri test -p rusty_alloc-api --features allocator-api --lib --test allocator_conformance --test api_miri
 
   # wasm is a shipped target, so it gets a gate that EXECUTES rather than one
   # that only compiles: `cargo test` cannot run wasm32-unknown-unknown, so the
@@ -347,7 +447,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
-          toolchain: 1.97.1
+          toolchain: 1.100.0
           targets: wasm32-unknown-unknown
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:

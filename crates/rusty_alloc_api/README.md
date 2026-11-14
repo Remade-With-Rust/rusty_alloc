@@ -20,7 +20,9 @@ performance evidence and its scope (instruction counts, not wall-clock).
 - **`GlobalAlloc`** — drop it in as `#[global_allocator]`.
 - **First-class heaps** — create independent heaps, allocate from them, destroy
   them wholesale.
-- **`Allocator`** — the unstable `allocator_api` trait, behind a feature.
+- **`Allocator`** — the standard allocator trait, stable since Rust 1.100,
+  for both the global handle and first-class heaps. Behind the
+  `allocator-api` feature, so the crate still builds on Rust 1.88.
 
 ```rust
 use rusty_alloc_api::RustyAlloc;
@@ -34,10 +36,38 @@ fn main() {
 }
 ```
 
+### Collections in a heap (Rust 1.100+)
+
+```toml
+rusty_alloc-api = { version = "2", features = ["allocator-api"] }
+```
+
+```rust
+use rusty_alloc_api::{Heap, RustyAlloc};
+
+// One collection on rusty_alloc, whatever the program's global allocator is.
+let mut v = Vec::new_in(RustyAlloc);
+v.push(1u64);
+
+// Collections inside a first-class heap: no unsafe, freed automatically,
+// and the borrow means none of them can outlive the heap.
+let heap = Heap::new_destroyable();
+let mut names = Vec::new_in(&heap);
+names.push(Box::new_in(String::from("in the heap"), &heap));
+```
+
+Rust 1.100 accepts an allocator in `Vec` and `Box`; the other collections
+have not been stabilised with one yet. A collection in a heap stays on the
+heap's thread (`Vec<T, &Heap>` is not `Send`), and it is a different type
+from a plain `Vec<T>`.
+
 ## Features
 
 `debug_checks`, `secure`, `profile` — each forwards to the identically-named
 feature on `rusty_alloc`.
+
+`allocator-api` — `core::alloc::Allocator` for `RustyAlloc` and `Heap`.
+Needs Rust 1.100; without it the crate's minimum is Rust 1.88.
 
 Security: [threat model](https://github.com/remade-with-rust/rusty_alloc/blob/main/docs/threat-model.md)
 · [disclosure policy](https://github.com/remade-with-rust/rusty_alloc/blob/main/SECURITY.md).

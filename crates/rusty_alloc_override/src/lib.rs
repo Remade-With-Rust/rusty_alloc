@@ -15,15 +15,22 @@ mod unix_override {
     use core::ffi::{c_char, c_int, c_void};
     use rusty_alloc::alloc;
 
+    // The allocating exports below are `unsafe extern "C"` although none of
+    // them has a precondition. A definition of a symbol the standard library
+    // itself links against is compared with that symbol's libc declaration
+    // (`suspicious_runtime_symbol_definitions`, Rust 1.99), and those are
+    // `unsafe extern "C"`. The qualifier is part of the function's Rust type
+    // only: the calling convention and the code generated are the same.
+
     /// `malloc`.
     #[unsafe(no_mangle)]
-    pub extern "C" fn malloc(size: usize) -> *mut c_void {
+    pub unsafe extern "C" fn malloc(size: usize) -> *mut c_void {
         alloc::malloc(size).cast()
     }
 
     /// `calloc`.
     #[unsafe(no_mangle)]
-    pub extern "C" fn calloc(count: usize, size: usize) -> *mut c_void {
+    pub unsafe extern "C" fn calloc(count: usize, size: usize) -> *mut c_void {
         alloc::calloc(count, size).cast()
     }
 
@@ -71,25 +78,25 @@ mod unix_override {
 
     /// `memalign`.
     #[unsafe(no_mangle)]
-    pub extern "C" fn memalign(align: usize, size: usize) -> *mut c_void {
+    pub unsafe extern "C" fn memalign(align: usize, size: usize) -> *mut c_void {
         alloc::malloc_aligned_c(align, size).cast()
     }
 
     /// `aligned_alloc`.
     #[unsafe(no_mangle)]
-    pub extern "C" fn aligned_alloc(align: usize, size: usize) -> *mut c_void {
+    pub unsafe extern "C" fn aligned_alloc(align: usize, size: usize) -> *mut c_void {
         alloc::malloc_aligned_c(align, size).cast()
     }
 
     /// `valloc`.
     #[unsafe(no_mangle)]
-    pub extern "C" fn valloc(size: usize) -> *mut c_void {
+    pub unsafe extern "C" fn valloc(size: usize) -> *mut c_void {
         alloc::malloc_aligned(size, rusty_alloc::os::page_size()).cast()
     }
 
     /// `pvalloc`.
     #[unsafe(no_mangle)]
-    pub extern "C" fn pvalloc(size: usize) -> *mut c_void {
+    pub unsafe extern "C" fn pvalloc(size: usize) -> *mut c_void {
         let ps = rusty_alloc::os::page_size();
         alloc::malloc_aligned(rusty_alloc::os::page_align_up(size), ps).cast()
     }

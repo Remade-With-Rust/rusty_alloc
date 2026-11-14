@@ -25,8 +25,13 @@ fail=0
 declare -a FAILED
 
 # name | file | perl -0pe substitution | cargo test filter | extra RUSTFLAGS
+#      | package arguments (default: the core crate)
+#
+# `GATE_ONLY=<regex>` runs only the cases whose name matches, for working on
+# one gate. CI sets nothing and runs them all.
 run_case() {
-  local name="$1" file="$2" subst="$3" filter="$4" flags="${5:-}"
+  local name="$1" file="$2" subst="$3" filter="$4" flags="${5:-}" pkg="${6:--p rusty_alloc}"
+  if [[ -n "${GATE_ONLY:-}" && ! "$name" =~ $GATE_ONLY ]]; then return; fi
   local backup
   backup="$(mktemp)"
   cp "$file" "$backup"
@@ -47,7 +52,7 @@ run_case() {
   fi
 
   local out
-  if out="$(RUSTFLAGS="$flags" cargo test -p rusty_alloc $filter 2>&1)"; then
+  if out="$(RUSTFLAGS="$flags" cargo test $pkg $filter 2>&1)"; then
     echo "  !! $name: VACUOUS — the suite is GREEN with the defect present"
     FAILED+=("$name")
     fail=$((fail + 1))
@@ -144,6 +149,86 @@ run_case "init_region refuses a misaligned exact region"   "crates/rusty_alloc/s
 # one segment. That is the arithmetic a firmware sizes its region with, and the
 # defect the rusty_zstd report measured as one block served from four segments.
 run_case "dedicated_segments prices the header slice"   "crates/rusty_alloc/src/prim/fixed.rs"   's/slice\.checked_add\(size\)/size.checked_add(0)/'   "--lib prim::fixed::tests::dedicated_segments"   "--cfg ra_single_threaded --cfg ra_small_profile"
+
+# --- rust1100-upgrades P2: the `Allocator` impls, clause by clause -----------
+# Each is a rule of `core::alloc::Allocator`'s contract that the impls meet by
+# a branch a careless edit could drop. The suite that owns them runs every
+# check on the standard library's `System` as well, so none of these can be a
+# test asserting something the contract does not say.
+API="-p rusty_alloc-api --features allocator-api"
+
+# A zero-sized layout is answered with a dangling pointer and never reaches
+# the allocator. (The first match is `RustyAlloc::allocate`.)
+run_case "Allocator: a zero-sized layout never reaches the allocator" \
+  "crates/rusty_alloc_api/src/allocator.rs" \
+  's/if layout\.size\(\) == 0 \{/if false {/' \
+  "--test allocator_conformance a_zero_sized_block_is_dangling" "" "$API"
+
+# `grow` may be handed a new alignment, which `GlobalAlloc::realloc` cannot
+# honour: sent there anyway, an 8-aligned block grown to a 64-byte alignment
+# comes back wherever the size class put it.
+run_case "Allocator: grow honours a changed alignment" \
+  "crates/rusty_alloc_api/src/allocator.rs" \
+  's/if old_layout\.align\(\) == new_layout\.align\(\) \{/if true {/' \
+  "--test allocator_conformance global_handle::resizing" "" "$API"
+
+# `grow_zeroed` over memory the test dirtied first.
+run_case "Allocator: grow_zeroed zeroes the tail" \
+  "crates/rusty_alloc_api/src/allocator.rs" \
+  's/unsafe \{ zero_tail\(grown, old_layout\.size\(\)\) \};/let _ = grown;/' \
+  "--test allocator_conformance global_handle::resizing" "" "$API"
+
+# A heap has to move an over-aligned block through the aligned path; the
+# plain one returns whatever alignment the size class has.
+run_case "Allocator: a heap keeps an over-aligned block aligned when it moves" \
+  "crates/rusty_alloc_api/src/allocator.rs" \
+  's/heap_malloc_aligned_at\(self\.hb, new_size, align, 0\)/heap_malloc(self.hb, new_size)/' \
+  "--test allocator_conformance heap::resizing" "" "$API"
+
+# `Heap::alloc`'s middle tier: a two-word alignment on a request shorter than
+# two words is only met once the request is raised to two words. Written as
+# `align <= 8` this was wrong on every 32-bit target until 2.6.0.
+run_case "Heap::alloc raises a short two-word-aligned request" \
+  "crates/rusty_alloc_api/src/lib.rs" \
+  's/heap_malloc_fast\(self\.hb, layout\.size\(\)\.max\(NATURAL_ALIGN\)\)/heap_malloc_fast(self.hb, layout.size())/' \
+  "--test allocator_conformance short_blocks_keep_a_large_alignment" "" "$API"
+
+# A debug build keeps the allocator's assertions, so the methods run under a
+# guard that aborts on an unwind. Disarmed, the panic reaches the caller.
+run_case "Allocator: a debug build aborts where a method would unwind" \
+  "crates/rusty_alloc_api/src/allocator.rs" \
+  's/panic!\("rusty_alloc: an Allocator method must not unwind; aborting"\);//' \
+  "--lib allocator::tests" "" "$API"
+
+# --- the heap route's reallocation allocates from ITS heap -------------------
+# `heap_realloc_fast` exists because the global realloc takes a moved block
+# from the thread's own heap. Both of its moving arms, pointed back at the
+# thread's heap, must be caught: a block that left a destroyable heap that
+# way would survive the heap's teardown.
+run_case "heap realloc: an out-of-line move allocates from the named heap" \
+  "crates/rusty_alloc/src/alloc.rs" \
+  's/let np = unsafe \{ heap_malloc_impl::<false>\(hb, newsize\) \};/let np = malloc_impl::<false, false>(newsize);/' \
+  "--test allocator_conformance a_block_that_moves_stays_in_its_heap" "" "$API"
+
+run_case "heap realloc: the leaf move allocates from the named heap" \
+  "crates/rusty_alloc/src/alloc.rs" \
+  's/if newsize <= SMALL_SIZE_MAX \{\n            let h = \(\*hb\)\.heap\.get\(\);\n            let np = crate::page::page_pop/if newsize <= SMALL_SIZE_MAX {\n            let h = (*init::heap_box_fast()).heap.get();\n            let np = crate::page::page_pop/' \
+  "--test allocator_conformance a_block_that_moves_stays_in_its_heap" "" "$API"
+
+# --- a heap that can be destroyed never adopts an abandoned segment ----------
+# `heap_destroy` releases every segment the heap owns; an adopted one holds a
+# dead thread's live blocks. Both places a heap adopts carry the check, and
+# each is its own gate. (`--test-threads=1`: the tests share one abandoned
+# list, and the control test would take the orphans first.)
+run_case "a destroyable heap does not adopt when it needs a span" \
+  "crates/rusty_alloc/src/heap.rs" \
+  's/let adopt_budget = if self\.no_reclaim \{ 0 \} else \{ MAX_ADOPT \};/let adopt_budget = MAX_ADOPT;/' \
+  "--test destroy_no_adopt -- --test-threads=1"
+
+run_case "a destroyable heap does not adopt in a collect" \
+  "crates/rusty_alloc/src/heap.rs" \
+  's/if reclaim && !self\.no_reclaim \{/if reclaim {/' \
+  "--test destroy_no_adopt -- --test-threads=1"
 
 echo
 if ((fail > 0)); then

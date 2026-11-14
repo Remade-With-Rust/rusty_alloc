@@ -2814,6 +2814,220 @@ pub unsafe fn heap_realloc(hb: *mut init::HeapBox, p: *mut u8, newsize: usize) -
     }
 }
 
+/// [`heap_malloc`] with [`malloc`]'s fast path, for a caller that can take
+/// it inline (`rusty_alloc-api`'s `Heap`, and through it `Vec::new_in(&heap)`).
+///
+/// `heap_malloc` is a call, a check of the deferred-free hook and then
+/// `Heap::malloc`: 23 instructions an allocation plus the call, where the
+/// global `malloc` is a pop from the direct table in its caller. Nothing about
+/// a first-class heap needs the difference. Its box is the same structure as
+/// a thread's, and here it arrives in a register, so this is `malloc_impl`
+/// without the thread-local read: the pop, and on a miss the same two cold
+/// symbols, which do the hook's check where `malloc` does it (measured on
+/// `bench/rust-globalalloc`'s `vec_heap`; `docs/opps.md`, "The `Allocator`
+/// route").
+///
+/// The medium bin's queue-front peek that `Heap::malloc` makes is not here,
+/// as it is not in `malloc`: see the note in [`malloc_slow_body`] on what
+/// that peek costs a caller that frees into `local_free`.
+///
+/// # Safety
+/// `hb` live and owned by the calling thread.
+#[inline]
+pub unsafe fn heap_malloc_fast(hb: *mut init::HeapBox, size: usize) -> *mut u8 {
+    // SAFETY: forwarded contract.
+    unsafe { heap_malloc_impl::<true>(hb, size) }
+}
+
+/// The body of [`heap_malloc_fast`]. `DRY` as in [`malloc_impl`]: false at the
+/// allocation inside a moving realloc, where the miss is a real call.
+///
+/// # Safety
+/// As [`heap_malloc_fast`].
+#[inline(always)]
+unsafe fn heap_malloc_impl<const DRY: bool>(hb: *mut init::HeapBox, size: usize) -> *mut u8 {
+    // SAFETY: `hb` is a live box owned by this thread (contract), so its
+    // `direct` entries are live pages of that heap or the immortal empty
+    // page, on which `page_pop` returns null before its first store. Raw
+    // reads only, as in `malloc`: no reference to the heap is formed here.
+    // The cold symbols take any live owned box: they test the heap's own
+    // `deferred_due` flag and call that heap's generic path; only the shared
+    // sentinel, which `hb` is not, sends them to thread initialisation.
+    unsafe {
+        #[cfg(debug_assertions)]
+        let _ = heap_of(hb);
+        if size <= SMALL_SIZE_MAX {
+            let w = crate::types::wsize_from_size(size);
+            let h = (*hb).heap.get();
+            let p = (*h).direct[w];
+            let b = crate::page::page_pop(p);
+            if !b.is_null() {
+                #[cfg(debug_assertions)]
+                {
+                    (*h).stats.allocs += 1;
+                }
+                return b;
+            }
+            if DRY {
+                return malloc_dry_hb_first(hb, size, p);
+            }
+        }
+        malloc_slow_hb_first(hb, size)
+    }
+}
+
+/// [`heap_zalloc`] with [`zalloc`]'s fast path: see [`heap_malloc_fast`].
+///
+/// # Safety
+/// As [`heap_malloc_fast`].
+#[inline]
+pub unsafe fn heap_zalloc_fast(hb: *mut init::HeapBox, size: usize) -> *mut u8 {
+    // SAFETY: as `heap_malloc_impl`; a popped block is a whole block of `p`,
+    // whose `block_size` is its usable extent.
+    unsafe {
+        #[cfg(debug_assertions)]
+        let _ = heap_of(hb);
+        if size <= SMALL_SIZE_MAX {
+            let w = crate::types::wsize_from_size(size);
+            let h = (*hb).heap.get();
+            let p = (*h).direct[w];
+            let b = crate::page::page_pop(p);
+            if !b.is_null() {
+                #[cfg(debug_assertions)]
+                {
+                    (*h).stats.allocs += 1;
+                }
+                if (*p).free_is_zero {
+                    b.cast::<usize>().write(0);
+                } else {
+                    ptr::write_bytes(b, 0, (*p).block_size);
+                }
+                return b;
+            }
+            return zalloc_dry(hb, size, p);
+        }
+        zalloc_slow(hb, size)
+    }
+}
+
+/// [`heap_realloc`] in the shape of [`realloc_live_body`], for a block the
+/// caller knows is live and was allocated with a layout of at most
+/// [`crate::types::NATURAL_ALIGN`].
+///
+/// `heap_realloc` asks `usable_size` the general way, allocates through
+/// `heap_malloc` and frees through `free`: 64.5 instructions a call on a
+/// growing `Vec`, where the global route's three symbols average 50. This is
+/// that route with the heap named instead of read from the thread: the same
+/// two size tests, the same leaf for a move of at most 64 bytes, and the same
+/// three tail calls for everything else, so the in-place return and the
+/// small move push nothing.
+///
+/// A moved block is allocated from `hb`, which is the one thing the global
+/// body cannot be reused for: it allocates from the thread's own heap, and a
+/// block of a destroyable heap has to stay in it.
+///
+/// # Safety
+/// `hb` live and owned by the calling thread; `p` a live block of this
+/// allocator, invalidated on a move.
+#[inline(never)]
+pub unsafe fn heap_realloc_fast(
+    hb: *mut init::HeapBox,
+    p: ptr::NonNull<u8>,
+    newsize: usize,
+) -> *mut u8 {
+    let p = p.as_ptr();
+    if !LEAF_MOVE {
+        // SAFETY: forwarded contract.
+        return unsafe { heap_realloc(hb, p, newsize) };
+    }
+    let seg = segment_of(p);
+    // SAFETY: as `realloc_live_body`, with `hb`'s direct table in place of
+    // the thread's: `p` is live, so `seg` and `pg` are its segment and page;
+    // a plain page's `block_size` is the block's usable size; a non-null pop
+    // is a fresh block of at least `newsize >= copy` bytes, distinct from `p`.
+    unsafe {
+        #[cfg(debug_assertions)]
+        let _ = heap_of(hb);
+        let pg = page_of(seg, p);
+        let flags = (*pg).flags.load(Ordering::Relaxed);
+        if flags & (pflags::HAS_ALIGNED | pflags::SINGLE_BLOCK | pflags::HUGE_SEGMENT) != 0 {
+            return heap_realloc_flagged(hb, p, newsize);
+        }
+        let usable = (*pg).block_size;
+        let copy = if newsize > usable {
+            usable
+        } else if newsize >= usable / 2 {
+            stat_realloc(true);
+            return p;
+        } else {
+            newsize
+        };
+        if copy > 64 {
+            return heap_realloc_move_out::<true>(hb, p, newsize, copy, pg);
+        }
+        if newsize <= SMALL_SIZE_MAX {
+            let h = (*hb).heap.get();
+            let np = crate::page::page_pop((*h).direct[crate::types::wsize_from_size(newsize)]);
+            if !np.is_null() {
+                #[cfg(debug_assertions)]
+                {
+                    (*h).stats.allocs += 1;
+                }
+                copy_small(p, np, copy);
+                stat_realloc(false);
+                return free_moved(p, pg, np);
+            }
+        }
+        heap_realloc_move_out::<false>(hb, p, newsize, copy, pg)
+    }
+}
+
+/// [`heap_realloc_fast`] for a block on a flagged page (aligned, single-block,
+/// huge), whose usable size is not its page's block size: the general body.
+///
+/// # Safety
+/// As [`heap_realloc_fast`].
+#[cold]
+#[inline(never)]
+unsafe fn heap_realloc_flagged(hb: *mut init::HeapBox, p: *mut u8, newsize: usize) -> *mut u8 {
+    // SAFETY: forwarded contract.
+    unsafe { heap_realloc(hb, p, newsize) }
+}
+
+/// The move [`heap_realloc_fast`] could not make as a leaf:
+/// [`realloc_move_out`], allocating from `hb`.
+///
+/// # Safety
+/// As [`heap_realloc_fast`], with `pg == page_of(segment_of(p), p)` a plain
+/// page and `copy` at most both the old block's usable size and `newsize`.
+#[inline(never)]
+unsafe fn heap_realloc_move_out<const BIG: bool>(
+    hb: *mut init::HeapBox,
+    p: *mut u8,
+    newsize: usize,
+    copy: usize,
+    pg: *mut Page,
+) -> *mut u8 {
+    // SAFETY: forwarded contract.
+    let np = unsafe { heap_malloc_impl::<false>(hb, newsize) };
+    if np.is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: `np` is a fresh block of at least `newsize >= copy` bytes and
+    // `p` a live one of at least `copy`; they cannot overlap. `p` is then
+    // freed once, through the page already resolved.
+    unsafe {
+        if BIG {
+            core::ptr::copy_nonoverlapping(p, np, copy);
+        } else {
+            copy_block(p, np, copy);
+        }
+        free_body::<true, true>(p, segment_of(p), pg);
+        stat_realloc(false);
+    }
+    np
+}
+
 /// `mi_heap_collect`.
 ///
 /// # Safety

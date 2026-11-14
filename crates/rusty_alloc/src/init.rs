@@ -740,6 +740,8 @@ fn create_heap_uninstalled(tag: i32, allow_destroy: bool, arena_id: i32) -> *mut
         (*(*hb).heap.get()).delayed = &raw const (*hb).delayed;
         (*(*hb).heap.get()).arena_id = arena_id;
         (*(*hb).heap.get()).tag = tag;
+        // What may be destroyed must never adopt: see `Heap::no_reclaim`.
+        (*(*hb).heap.get()).no_reclaim = allow_destroy;
         // A NEW HEAP HAS NOTHING TO COLLECT, so its periodic-collect
         // countdown starts full. `Heap::new` is `const` and leaves it 0,
         // and the generic path reads 0 as "the count ran out": every heap's

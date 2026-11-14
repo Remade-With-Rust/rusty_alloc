@@ -7,9 +7,13 @@
 //! static ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
 //! ```
 //!
-//! `Heap` and the `Allocator` trait impl land at M6. This crate stays a thin
-//! veneer over the same internals as the C ABI — no separate code path, so
-//! corpus numbers speak for Rust users too.
+//! [`Heap`] is a first-class heap. With the `allocator-api` feature (Rust
+//! 1.100 and later) both it and [`RustyAlloc`] implement
+//! [`core::alloc::Allocator`], so `Vec::new_in(&heap)` and
+//! `Box::new_in(x, RustyAlloc)` work; the `allocator` module's docs go through
+//! the trait's contract clause by clause. This crate stays a thin veneer over
+//! the same internals as the C ABI — no separate code path, so corpus numbers
+//! speak for Rust users too.
 
 #![cfg_attr(not(test), no_std)]
 #![deny(missing_docs)]
@@ -18,7 +22,19 @@ use core::alloc::{GlobalAlloc, Layout};
 
 pub use rusty_alloc::{MI_COMPAT_VERSION, VERSION, version};
 
+// The one module above the crate's `rust-version`, which is why it is a
+// feature. Telling clippy its real floor keeps `incompatible_msrv` checking
+// the rest of the crate against 1.88, and this module against 1.100.
+#[cfg(feature = "allocator-api")]
+#[clippy::msrv = "1.100"]
+mod allocator;
+
 /// The global allocator handle (zero-sized).
+///
+/// It holds no state: every `RustyAlloc` is the same allocator, so copying
+/// one, or making another, gives a handle that frees what any other
+/// allocated.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct RustyAlloc;
 
 /// One machine word: every block the allocator hands out is aligned this far.
@@ -39,9 +55,10 @@ const NATURAL_ALIGN: usize = 2 * WORD;
 /// A first-class heap (plan §5.14): `Drop` runs `mi_heap_delete` semantics
 /// (blocks migrate to the thread's backing heap and stay valid) unless built
 /// with [`Heap::new_destroyable`], where `Drop` releases every block at once.
-/// The destroyable form inherits C's contract: callers must not touch its
-/// blocks after drop (a lifetime-carrying `Allocator` impl that makes this
-/// unrepresentable is the planned follow-up once allocator_api stabilizes).
+/// The destroyable form inherits C's contract for the raw methods below:
+/// callers must not touch its blocks after drop. With the `allocator-api`
+/// feature that is unrepresentable in safe code: a collection made with
+/// `Vec::new_in(&heap)` borrows the heap and cannot outlive it.
 pub struct Heap {
     hb: *mut rusty_alloc::init::HeapBox,
     destroy_on_drop: bool,
@@ -78,12 +95,29 @@ impl Heap {
     }
 
     /// Allocate `layout`, borrowing the heap (so the block cannot outlive it).
+    ///
+    /// `#[inline]`, like the `GlobalAlloc` methods below and for their reason:
+    /// the fast path is a pop from the heap's direct table, and it belongs in
+    /// the caller. Out of line through `heap_malloc` it cost 28 instructions
+    /// and a call on every allocation, against the global handle's inline
+    /// pop, which is what put a `Vec` in a heap 6.6 % behind one on the global
+    /// allocator (`docs/opps.md`, "The `Allocator` route").
+    #[inline]
     pub fn alloc(&self, layout: core::alloc::Layout) -> Option<core::ptr::NonNull<u8>> {
         // SAFETY: hb live (we own it), called on the owning thread by the
         // !Send/!Sync nature of raw-pointer fields.
+        //
+        // The three tiers are `GlobalAlloc::alloc`'s. They are stated in
+        // words, not as `<= 8`: on a 32-bit target a one-word block is four
+        // bytes and only four-aligned, so `<= 8` handed an eight-aligned
+        // layout of four bytes or fewer a block that could sit on an odd
+        // word. Up to `NATURAL_ALIGN` the size classes carry the alignment
+        // once the request is two words long.
         let p = unsafe {
-            if layout.align() <= 8 {
-                rusty_alloc::alloc::heap_malloc(self.hb, layout.size())
+            if layout.align() <= WORD {
+                rusty_alloc::alloc::heap_malloc_fast(self.hb, layout.size())
+            } else if layout.align() <= NATURAL_ALIGN {
+                rusty_alloc::alloc::heap_malloc_fast(self.hb, layout.size().max(NATURAL_ALIGN))
             } else {
                 rusty_alloc::alloc::heap_malloc_aligned_at(
                     self.hb,
@@ -97,11 +131,14 @@ impl Heap {
     }
 
     /// Zeroed variant of [`alloc`](Self::alloc).
+    #[inline]
     pub fn alloc_zeroed(&self, layout: core::alloc::Layout) -> Option<core::ptr::NonNull<u8>> {
         // SAFETY: as alloc.
         let p = unsafe {
-            if layout.align() <= 8 {
-                rusty_alloc::alloc::heap_zalloc(self.hb, layout.size())
+            if layout.align() <= WORD {
+                rusty_alloc::alloc::heap_zalloc_fast(self.hb, layout.size())
+            } else if layout.align() <= NATURAL_ALIGN {
+                rusty_alloc::alloc::heap_zalloc_fast(self.hb, layout.size().max(NATURAL_ALIGN))
             } else {
                 rusty_alloc::alloc::heap_zalloc_aligned_at(
                     self.hb,
@@ -118,9 +155,28 @@ impl Heap {
     ///
     /// # Safety
     /// `p` came from this heap's alloc methods and is freed exactly once.
+    #[inline]
     pub unsafe fn dealloc(&self, p: core::ptr::NonNull<u8>) {
-        // SAFETY: forwarded contract.
-        unsafe { rusty_alloc::alloc::free(p.as_ptr()) }
+        // The inline free `GlobalAlloc::dealloc` uses, for its reason: through
+        // `free` this was a call into a symbol that tests for null first, and
+        // a `NonNull` is not null.
+        // SAFETY: forwarded contract; a block is freed by its page's owner,
+        // whichever heap of this thread it came from.
+        unsafe { rusty_alloc::alloc::free_inline_flags_first(p.as_ptr()) }
+    }
+
+    /// Whether `p` points into memory this heap owns (`mi_heap_contains_block`).
+    ///
+    /// A diagnostic, and not a fast one: it walks the heap's segments. It
+    /// answers by segment, so it is true of any address inside one of them,
+    /// allocated or not, and false of a block of another heap or of the
+    /// global allocator. Any address may be asked about; nothing is read
+    /// through it.
+    pub fn contains(&self, p: core::ptr::NonNull<u8>) -> bool {
+        // SAFETY: hb live (we own it), on the owning thread as `alloc` is;
+        // the walk compares `p`'s segment address and dereferences only the
+        // heap's own lists.
+        unsafe { rusty_alloc::alloc::heap_contains_block(self.hb, p.as_ptr()) }
     }
 
     /// Drain cross-thread frees and retire empty pages.

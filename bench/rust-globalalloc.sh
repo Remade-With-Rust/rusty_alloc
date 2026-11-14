@@ -12,7 +12,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 n=${1:-20000}
 tgt=${CARGO_TARGET_DIR:-$root/target/rust-globalalloc}
 CARGO_TARGET_DIR=$tgt cargo build --release -q --manifest-path "$root/bench/rust-globalalloc/Cargo.toml"
-for b in maps trees threads overaligned; do
+for b in maps trees threads overaligned vec_global vec_direct vec_heap; do
   bin=$tgt/release/$b
   ir() { local o; o=$(mktemp); valgrind --tool=callgrind --callgrind-out-file="$o" --cache-sim=no --branch-sim=no "$bin" "$1" >/dev/null 2>&1; grep -m1 '^summary:' "$o" | awk '{print $2}'; rm -f "$o"; }
   a=$(ir "$n"); c=$(ir $((n * 2)))

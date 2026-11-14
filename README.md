@@ -152,7 +152,13 @@ checksums between arms):
 | cache-line-aligned buffers (`realloc`) | 1,292,463 | 1,213,478 | **−6.1 %** |
 | short-lived threads | 2,769,878 | 2,560,766 | **−7.5 %** |
 
-Both columns measured 2026-11-12 with the same script and toolchain. Against
+Both columns measured 2026-11-12 with the same script and toolchain (Rust
+1.97.1, LLVM 22). The numbers in this section are that compiler's. Rust
+1.100 (LLVM 23) compiles every allocation and free fast path to the same
+instructions, and the allocator's total on the C programs above moves by
++0.003 % to +0.024 %; the Rust workloads themselves are compiled differently
+by it (`docs/opps.md`, "Toolchain"), so compare columns from one compiler
+only. Against
 2.2.0 (`c9631f4`, measured 2026-09-25) the boxed-trees workload has gone from
 23,357,670 to 17,477,878 (−25 %) and the hash-maps one from 28,220,088 to
 26,301,891 (−7 %).
